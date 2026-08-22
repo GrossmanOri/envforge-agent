@@ -74,6 +74,17 @@ timeout means for the verdict.
 `--cpus` and `no-new-privileges` are still unverified by observation. Both appear in the
 argv and have tests asserting that, which is a weaker claim than sitting 1's five flags.
 
+## CI, added 2026-08-22
+`.github/workflows/tests.yml` runs both suites on push to `main` and on pull requests.
+The docker half is the reason it exists: GitHub's Linux runners ship a real daemon, so
+the hardening flags stay checked on a machine that is not Ori's laptop. Steps are named
+separately so a red build says which half broke.
+
+Two consequences for later sittings. The suite must never need an API key, so the fake
+LLM planned for sitting 3 is a CI requirement and not a convenience. And this is signal,
+not enforcement: turning it into an actual gate needs branch protection on `main`, a
+repository setting nobody has flipped yet.
+
 ## Next
 Sitting 3: `envforge/llm.py` and its tests. One call, forced strict tool use, wire JSON
 kept for the trace module, a fake client in tests. Load the claude-api skill before
