@@ -1,0 +1,39 @@
+name: tests
+
+# The gate. Until this existed, "I ran the tests" was a habit someone had to
+# remember. Runs on push and on pull requests, so the check exists whichever
+# shape the work arrives in.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # A hung docker test should cost ten minutes, not the whole minute budget.
+    # The sandbox caps its own runs; this caps the thing that runs the sandbox.
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - run: pip install pytest
+
+      # Named so the log says which half broke. A failure here is our logic.
+      - name: unit tests, no daemon
+        run: python -m pytest -m "not docker"
+
+      # Proves the daemon is present before the tests blame themselves for its
+      # absence. GitHub's Linux runners ship one; a developer laptop may not.
+      - name: docker is present
+        run: docker version
+
+      # A failure here is the cage itself, or the runner's kernel disagreeing
+      # with the assumptions the cage was measured against.
+      - name: sandbox tests, real docker daemon
+        run: python -m pytest -m docker
