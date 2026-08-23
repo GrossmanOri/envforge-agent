@@ -1,8 +1,42 @@
 # Status
 
-Updated 2026-08-22, end of sitting 2.
+Updated 2026-08-23, end of sitting 3.
 
 ## Where we are
+Sitting 3 of 11 complete: `envforge/llm.py` and `tests/test_llm.py`.
+48 tests, 39 without Docker or any API key, 9 against the real daemon.
+The repository is public, and `main` rejects direct pushes: the ruleset requires a pull
+request and a green `test` check, verified on 2026-08-23 by a push that was refused.
+
+## What sitting 3 produced
+`LLM` Protocol, `AnthropicLLM` on the native SDK, `OpenAICompatLLM` covering OpenAI and
+Groq through `base_url`, `Tool`, `Call`, `validate`, and `make_llm("provider:model")`.
+Four failure types, because the loop has to tell them apart: `InvalidArguments` is
+repairable, `Refused` is not, `Truncated` means the ceiling was hit, and a bare `LLMError`
+means the response had no tool call at all.
+
+`build_request` is a pure function on each provider, the same move as sitting 2's
+`build_argv`, so the invariants are tested with no network: `strict` is asked for on
+Anthropic and OpenAI, deliberately not on Groq, and `tool_choice` names the single tool.
+
+Four decisions worth naming:
+
+1. `Tool` validates its own schema at construction. Strict mode requires
+   `additionalProperties: false` and a `required` list, and both providers enforce that at
+   request time. Without the check, a caller's malformed schema arrives as a 400 in the
+   middle of the repair loop and reads like a model failure.
+2. Groq reads `GROQ_API_KEY` and the key is passed explicitly. Handing the openai client a
+   `None` key makes it fall back to `OPENAI_API_KEY`, which would send an OpenAI secret to
+   Groq's servers and surface as a 401 from the wrong provider.
+3. The tool call is found by scanning `content`, never by index. Thinking is adaptive by
+   default on Sonnet 5, so the first block is usually a thinking block.
+4. `Call.model` is read off the response rather than copied from the request, so the trace
+   records what actually answered.
+
+The fakes build their canned responses through `anthropic.types.Message.model_validate`
+and `openai.types.chat.ChatCompletion.model_validate`. A payload that could not have come
+from the real API fails the test instead of passing it.
+
 Sitting 2 of 11 complete: `envforge/sandbox.py` and `tests/test_sandbox.py`.
 24 tests, 15 without Docker and 9 against the real daemon, all passing.
 A `.venv` with pytest exists in the repo directory and is gitignored.
@@ -64,6 +98,18 @@ that remains theory is the Docker Desktop VM running out of memory itself, which
 total container memory above the VM's own size to reach.
 
 ## Known gaps
+`llm.py` is 229 lines against a target of 100 to 140. Roughly 60 of those are docstrings
+carrying the reasoning, so the code is near 170, but it is still over and it is named here
+rather than squeezed. If sitting 4 needs to touch it, the two providers are the split.
+
+Nothing has hit a real provider. The request shape is asserted against our own builders and
+the responses are parsed through the SDKs' own models, which is stronger than a hand-rolled
+fake, but no test has proved the Anthropic API accepts the request we build. One live call
+would settle it and costs a few cents.
+
+`OpenAICompatLLM` sends no token ceiling. OpenAI and Groq disagree about the parameter name
+and neither has been exercised, so nothing was guessed. Anthropic sends `max_tokens`.
+
 126 and 127 are not distinguished from other script exit codes. Both mean the image's
 command cannot be executed, which is the model's fault and repairable, but nothing in the
 code treats them specially yet.
@@ -85,10 +131,34 @@ LLM planned for sitting 3 is a CI requirement and not a convenience. And this is
 not enforcement: turning it into an actual gate needs branch protection on `main`, a
 repository setting nobody has flipped yet.
 
+## Refusal policy, decided 2026-08-23
+The input is a script nobody trusts and the model has cybersecurity safeguards, so a
+refusal is an expected outcome rather than an edge case. Decided with Ori:
+
+Retry once, on a counter separate from the repair budget. The repair loop works because
+each attempt carries new evidence; a refusal retry resends identical text and hopes the
+sampler lands elsewhere, so letting the two share a counter spends repair attempts on
+something repair cannot fix.
+
+After a second refusal, stop asking and fall back to a Dockerfile we write ourselves. For
+Python and Bash that needs no model, so a refusal never kills the run. A loop that keeps
+asking after a refusal reads as a loop that asks until the classifier gives up, and the
+repository is public.
+
+Keep the reason. It arrives on the refusing response itself, `stop_details` on Anthropic
+and `message.refusal` on OpenAI, so it costs no extra call. `Refused.reason` carries it as
+a structure. It is recorded and shown beside the observed behaviour, labelled advisory.
+
+It is never the verdict. The script under test is inside the prompt, so it writes part of
+the text the model forms its opinion from: a hostile script can open with a comment
+claiming to be a course exercise and buy itself a clean explanation. The one case where
+the opinion is the whole story is when the fallback Dockerfile also fails to build, and
+then the honest report is that no run happened and here is what the model said.
+
 ## Next
-Sitting 3: `envforge/llm.py` and its tests. One call, forced strict tool use, wire JSON
-kept for the trace module, a fake client in tests. Load the claude-api skill before
-writing. Needs an API key.
+Sitting 4: the plain repair loop. It consumes `llm.py` and `sandbox.py`, defines the
+`write_dockerfile` tool against the schema `Tool` already enforces, and decides what each
+of the four failure types means for the next attempt.
 
 Default provider spec decided 2026-08-22: `anthropic:claude-sonnet-5`. Native SDK with
 strict tool use, which is the only path that gives a grammar guarantee for Claude, and
