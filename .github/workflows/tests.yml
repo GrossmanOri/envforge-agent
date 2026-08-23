@@ -22,7 +22,9 @@ jobs:
         with:
           python-version: "3.14"
 
-      - run: pip install pytest
+      # requirements.txt, not a bare pip install, so CI and a laptop
+      # disagree about SDK versions loudly rather than silently.
+      - run: pip install -r requirements.txt pytest
 
       # Named so the log says which half broke. A failure here is our logic.
       - name: unit tests, no daemon
