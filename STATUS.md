@@ -146,10 +146,6 @@ So the witness existed, and the mechanism now rests on it instead of on the exit
 Docker tests assert both directions, because a witness nobody checked against the real
 daemon is an assumption.
 
-The project is 722 lines of source against a target of roughly 650 including tests, so it
-is well over. `agent.py` is 261 of those. Named rather than squeezed, and the pattern is
-consistent enough now to be worth a decision rather than another note.
-
 `llm.py` is 229 lines against a target of 100 to 140. Roughly 60 of those are docstrings
 carrying the reasoning, so the code is near 170, but it is still over and it is named here
 rather than squeezed. If sitting 4 needs to touch it, the two providers are the split.
