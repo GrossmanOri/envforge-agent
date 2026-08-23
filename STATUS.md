@@ -146,14 +146,18 @@ So the witness existed, and the mechanism now rests on it instead of on the exit
 Docker tests assert both directions, because a witness nobody checked against the real
 daemon is an assumption.
 
-The project is 722 lines of source against a target of roughly 650 including tests, so it
-is well over. `agent.py` is 261 of those. Named rather than squeezed, and the pattern is
-consistent enough now to be worth a decision rather than another note.
+## Size, settled 2026-08-23
+There is no line budget any more. The old rule said roughly 650 including tests and was
+being compared against the source number alone, so it read as nearly met while the real
+total was 1483. Raising it would have kept the actual problem: the count was changing the
+code, trimming docstrings that carried the reasoning and opening three sittings in a row
+with a note about length instead of the work.
 
-`llm.py` is 229 lines against a target of 100 to 140. Roughly 60 of those are docstrings
-carrying the reasoning, so the code is near 170, but it is still over and it is named here
-rather than squeezed. If sitting 4 needs to touch it, the two providers are the split.
+What replaces it is not countable. A file whose responsibility cannot be stated in one
+sentence is doing two things and wants splitting, and a module that wants a subdirectory
+has outgrown the project.
 
+## Known gaps
 Nothing has hit a real provider. The request shape is asserted against our own builders and
 the responses are parsed through the SDKs' own models, which is stronger than a hand-rolled
 fake, but no test has proved the Anthropic API accepts the request we build. One live call
@@ -161,10 +165,6 @@ would settle it and costs a few cents.
 
 `OpenAICompatLLM` sends no token ceiling. OpenAI and Groq disagree about the parameter name
 and neither has been exercised, so nothing was guessed. Anthropic sends `max_tokens`.
-
-126 and 127 are not distinguished from other script exit codes. Both mean the image's
-command cannot be executed, which is the model's fault and repairable, but nothing in the
-code treats them specially yet.
 
 Timeout returns `exit_code=None` with `timed_out=True`. Nothing yet decides what a
 timeout means for the verdict.

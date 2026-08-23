@@ -8,10 +8,13 @@ builds and runs it in a hardened container, repairs on failure in a capped loop 
 bounded evidence, and reports what the script tried to do. Python and Bash only, claimed
 honestly.
 
-Size target is roughly 650 lines including tests, and it is a smell detector, not a
-limit: if a module needs the lines to be correct, it gets them, and a sudden jump of a
-few hundred is a signal to stop and ask what happened. Any module that wants a
-subdirectory has outgrown this project.
+There is no line budget. Write what the module needs to be correct and clear, and do
+not compress to hit a number: a shorter file that hides its reasoning is worse than a
+longer one that shows it, and the reasoning is the point here.
+
+What replaces the number is a question. If you cannot say in one sentence what a file
+is responsible for, it is doing two things and wants splitting. If a module wants a
+subdirectory, it has outgrown this project.
 
 ## Security constraints, not negotiable
 Host CLI. No Docker socket is mounted anywhere, and the agent itself is never
