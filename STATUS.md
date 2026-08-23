@@ -1,8 +1,44 @@
 # Status
 
-Updated 2026-08-23, end of sitting 3.
+Updated 2026-08-23, end of sitting 4.
 
 ## Where we are
+Sitting 4 of 11 complete: `envforge/agent.py` and `tests/test_agent.py`.
+68 tests, 58 needing neither Docker nor an API key, 10 against the real daemon.
+
+## What sitting 4 produced
+The plain repair loop. It defines `write_dockerfile` against the schema `Tool` already
+enforces, asks, gates, builds, runs, and decides one thing over and over: could a
+rewritten Dockerfile fix this. It yields `Event`s rather than printing, and the final
+event carries an `Outcome`, so sitting 5's graph engine and sitting 8's trace attach to
+the same seam. There is still no `__main__`, so nothing runs from a shell.
+
+Repairable, and each one spends an attempt: a gate rejection, a failed build, exit 126 or
+127, and a reply that was refused-adjacent rather than refused, meaning `InvalidArguments`,
+`Truncated`, or no tool call at all.
+
+Terminal, because the script ran and what it did is sitting 7's problem: exit 0, exit 1,
+exit 137, a 125 that came with a cidfile, and a timeout. A timeout is not a repair
+candidate. The run happened.
+
+Four decisions worth naming:
+
+1. `gate` is a required constructor argument with no default. Every Dockerfile reaching
+   the daemon was written by a model that just read untrusted text, so a loop that can be
+   constructed without a gate is a loop that can build one unchecked. Sitting 6 fills in
+   the real allowlist; the tests pass an explicit stub.
+2. Repair is decided by whether the container started, not by its exit code. `RunResult`
+   carries `start_error`, read from the daemon before the force-remove. This closes the
+   gap sitting 2 left open, and closes it better than the 126/127 test it replaced: those
+   codes can be produced by a script that wants to look like a broken image, and a script
+   that can choose an exit code has already started, so the field is empty for it.
+3. The fallback Dockerfile goes through the same gate. One path from a Dockerfile string
+   to the daemon, whoever wrote it. If our own fallback fails our own gate, the loop stops
+   and says so rather than asking the model again.
+4. The script text is bounded before it enters the prompt, for the same reason container
+   output is bounded in the sandbox. Both are attacker-controlled text on the way to a
+   model.
+
 Sitting 3 of 11 complete: `envforge/llm.py` and `tests/test_llm.py`.
 48 tests, 39 without Docker or any API key, 9 against the real daemon.
 The repository is public, and `main` rejects direct pushes: the ruleset requires a pull
@@ -97,7 +133,23 @@ candidate causes for a memory-test failure are therefore settled by observation.
 that remains theory is the Docker Desktop VM running out of memory itself, which needs
 total container memory above the VM's own size to reach.
 
-## Known gaps
+## The 126 witness, found by experiment 2026-08-23
+The loop first treated exit 126 and 127 as repairable outright, with the attempt cap as
+the only defence against a script exiting 126 to look like a broken image. A probe settled
+it: two images that both exit 127, one with a broken `ENTRYPOINT` and one whose script
+calls `exit 127`. The broken one leaves `State.Error` on the container with the full runc
+message naming the missing file, and the imitator leaves it empty. The docker CLI also
+writes its half to stderr, which the sandbox was already capturing without knowing what it
+had.
+
+So the witness existed, and the mechanism now rests on it instead of on the exit code. Two
+Docker tests assert both directions, because a witness nobody checked against the real
+daemon is an assumption.
+
+The project is 722 lines of source against a target of roughly 650 including tests, so it
+is well over. `agent.py` is 261 of those. Named rather than squeezed, and the pattern is
+consistent enough now to be worth a decision rather than another note.
+
 `llm.py` is 229 lines against a target of 100 to 140. Roughly 60 of those are docstrings
 carrying the reasoning, so the code is near 170, but it is still over and it is named here
 rather than squeezed. If sitting 4 needs to touch it, the two providers are the split.
@@ -156,9 +208,8 @@ the opinion is the whole story is when the fallback Dockerfile also fails to bui
 then the honest report is that no run happened and here is what the model said.
 
 ## Next
-Sitting 4: the plain repair loop. It consumes `llm.py` and `sandbox.py`, defines the
-`write_dockerfile` tool against the schema `Tool` already enforces, and decides what each
-of the four failure types means for the next attempt.
+Sitting 5: the LangGraph port. The same loop as graph nodes behind one interface, with the
+plain engine kept so the two can be compared rather than replaced.
 
 Default provider spec decided 2026-08-22: `anthropic:claude-sonnet-5`. Native SDK with
 strict tool use, which is the only path that gives a grammar guarantee for Claude, and

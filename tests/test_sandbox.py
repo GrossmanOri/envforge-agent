@@ -114,6 +114,8 @@ elif mode == "sleep":
     import time; time.sleep(120)
 elif mode == "exit125":
     sys.exit(125)
+elif mode == "exit127":
+    sys.exit(127)
 elif mode == "flood":
     sys.stdout.write("x" * 200000)
 print("uid", os.getuid(), "argv", sys.argv[1:])
@@ -134,6 +136,25 @@ def image(tmp_path_factory):
     assert result.ok, result.log
     yield "envforge-test:probe"
     sandbox.remove_image("envforge-test:probe")
+
+
+BROKEN_ENTRYPOINT = """\
+FROM python:3.12-slim
+COPY probe.py /app/probe.py
+ENTRYPOINT ["/does-not-exist"]
+"""
+
+
+@pytest.fixture(scope="module")
+def broken_image(tmp_path_factory):
+    """An image whose command cannot be executed. It builds fine; it cannot start."""
+    script = tmp_path_factory.mktemp("broken") / "probe.py"
+    script.write_text(PROBE)
+    sandbox = DockerSandbox(LIMITS)
+    result = sandbox.build(BROKEN_ENTRYPOINT, script, "envforge-test:broken")
+    assert result.ok, result.log
+    yield "envforge-test:broken"
+    sandbox.remove_image("envforge-test:broken")
 
 
 @pytest.fixture
@@ -218,3 +239,23 @@ def test_a_broken_dockerfile_fails_the_build_without_raising(sandbox, tmp_path):
     script.write_text(PROBE)
     result = sandbox.build("FROM python:3.12-slim\nRUN exit 7\n", script, "envforge-test:bad")
     assert not result.ok and result.exit_code != 0
+
+
+@pytest.mark.docker
+def test_a_broken_entrypoint_leaves_the_daemons_own_account_of_why(sandbox, broken_image):
+    """The witness that separates a broken image from a script imitating one.
+
+    Both exit 127. Only one of them has a start_error, because a script that can
+    choose its exit code has already started, and this field is written by the
+    daemon about a process that never did.
+    """
+    result = sandbox.run(broken_image)
+    assert result.exit_code == 127
+    assert "does-not-exist" in result.start_error
+
+
+@pytest.mark.docker
+def test_a_script_exiting_127_leaves_no_such_account(sandbox, image):
+    result = sandbox.run(image, ["exit127"])
+    assert result.exit_code == 127
+    assert result.start_error == ""

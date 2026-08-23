@@ -52,6 +52,10 @@ class RunResult:
     truncated: bool
     timed_out: bool
     seconds: float
+    # Why the container never started its process, straight from the daemon. Empty
+    # when the process did start, whatever it then did. A script cannot fake this,
+    # because a script that can write anything has already started.
+    start_error: str = ""
 
 
 class Sandbox(Protocol):
@@ -137,6 +141,24 @@ def _capture(argv: list[str], timeout: float) -> tuple[int | None, bytes, bytes,
         return None, out, err, True
 
 
+def _start_error(name: str) -> str:
+    """The daemon's own account of why the process never started.
+
+    This is the witness that separates an image whose command cannot be executed
+    from a script that exited 126 or 127 to look like one. It has to be read
+    before the container is removed, which is why the caller does both in order
+    inside one finally.
+    """
+    try:
+        done = subprocess.run(
+            ["docker", "inspect", name, "--format", "{{.State.Error}}"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return ""  # No witness is not the same as a witness saying nothing.
+    return done.stdout.strip() if done.returncode == 0 else ""
+
+
 def _force_remove(name: str) -> None:
     try:
         subprocess.run(
@@ -184,13 +206,19 @@ class DockerSandbox:
         with tempfile.TemporaryDirectory(prefix="envforge-cid-") as tmp:
             # docker refuses to overwrite a cidfile, so the path must not exist yet.
             cidfile = Path(tmp) / "cid"
+            start_error = ""
             try:
                 code, out, err, timed_out = _capture(
                     run_argv(image, name, cidfile, self.limits, args),
                     self.limits.run_timeout,
                 )
             finally:
-                _force_remove(name)
+                # Order matters and removal must still be unconditional: read the
+                # witness first, then remove whatever happened while reading it.
+                try:
+                    start_error = _start_error(name)
+                finally:
+                    _force_remove(name)
             created = cidfile.exists()
 
         stdout, cut_out = _bound(out)
@@ -207,6 +235,7 @@ class DockerSandbox:
             truncated=cut_out or cut_err,
             timed_out=timed_out,
             seconds=time.monotonic() - started,
+            start_error=start_error,
         )
 
     def remove_image(self, tag: str) -> None:
