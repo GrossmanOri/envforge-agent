@@ -221,16 +221,42 @@ def test_a_refusal_names_the_line_and_quotes_it():
 
 # --- where the gate and Docker could have read different files ---------------------------
 
-@pytest.mark.parametrize("character", ["\v", "\f", "\x1c", "\x1d", "\x1e", "\x85",
-                                       "\u2028", "\u2029"])
-def test_characters_python_calls_a_line_break_and_docker_does_not(character):
-    """Found 2026-08-24. Python's splitlines breaks on more characters than Docker, so
-    `RUN pip install a<form feed>ENTRYPOINT [...]` was read by the gate as two valid
-    instructions and by Docker as one broken one. Nothing executed, but the gate was
-    blessing a file Docker would never see. Refusing them is what makes one physical
-    line one instruction true rather than nearly true."""
+@pytest.mark.parametrize("character", ["\r", "\v", "\f", "\x1c", "\x1d", "\x1e",
+                                       "\x85", "\u2028", "\u2029", "\x00", "\x1b"])
+def test_only_printable_characters_newlines_and_tabs_are_allowed(character):
+    """A carriage return here was a real bypass, verified against the daemon on
+    2026-08-24. Python's splitlines treats a lone \r as a line break and Docker does
+    not, so the gate saw two valid exec-form instructions where Docker saw one line
+    that is not valid JSON. Docker fell back to shell form and ran it through
+    /bin/sh -c, and the injected command executed during the phase that has network.
+
+    The first fix enumerated the characters splitlines breaks on and omitted \r, which
+    is what a blocklist always eventually does. This asserts the property instead: the
+    gate splits on \n exactly as Docker does, and everything unprintable is refused
+    whether or not anybody thought of it."""
     dockerfile = f'FROM python:3.12-slim{character}ENTRYPOINT ["python", "/app/s.py"]\n'
-    assert "Docker does not" in gate(dockerfile)
+    assert "Only printable characters" in gate(dockerfile)
+
+
+def test_the_carriage_return_bypass_exactly_as_it_was_reported():
+    """The reported payload, kept verbatim. It reached the daemon and printed
+    INJECTED-AT-BUILD-TIME before the build failed, so the loop would have called it a
+    repairable build failure and tried again."""
+    payload = ('FROM python:3.12-slim\n'
+               'RUN ["pip", "install", "flask"]\r'
+               'CMD ["$(echo INJECTED-AT-BUILD-TIME >&2)"]\n')
+    assert gate(payload) is not None
+
+
+def test_windows_line_endings_are_refused_and_that_is_deliberate():
+    """Docker handles CRLF perfectly well, so this is a cost we are choosing.
+
+    Accepting it would mean telling a bare carriage return apart from one that
+    precedes a newline, and that distinction is exactly the subtlety that produced
+    the bypass. The model writes the Dockerfile as a JSON string and emits \n, so
+    the cost is a repair attempt in a case that should never arise."""
+    crlf = 'FROM python:3.12-slim\r\nENTRYPOINT ["python", "/app/s.py"]\r\n'
+    assert "Only printable characters" in gate(crlf)
 
 
 @pytest.mark.parametrize("directive", ["# escape=`", "#escape =`", "# syntax=docker/x"])
