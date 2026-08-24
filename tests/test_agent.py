@@ -16,8 +16,23 @@ from envforge.llm import Call, InvalidArguments, Refused, Truncated
 from envforge.sandbox import BuildResult, DockerSandbox, Limits, RunResult
 
 GOOD = "FROM python:3.12-slim\nCOPY s.py /app/s.py\nENTRYPOINT [\"python\", \"/app/s.py\"]\n"
-ALLOW = lambda dockerfile: None                     # the sitting 6 gate, stubbed open
-DENY = lambda dockerfile: "FROM is not pinned"
+def ALLOW(dockerfile, base_image, allowed_files):   # the sitting 6 gate, stubbed open
+    return None
+
+
+def DENY(dockerfile, base_image, allowed_files):
+    return "FROM is not pinned"
+
+
+class RecordingGate:
+    """Allows everything and remembers what it was handed."""
+
+    def __init__(self):
+        self.seen = []
+
+    def __call__(self, dockerfile, base_image, allowed_files):
+        self.seen.append((dockerfile, base_image, allowed_files))
+        return None
 
 
 def _call(dockerfile=GOOD, base="python:3.12-slim"):
@@ -101,7 +116,8 @@ def test_a_build_failure_is_repaired_with_the_bounded_log(script):
 def test_the_gate_rejection_is_the_evidence_and_nothing_was_built(script):
     llm = FakeLLM(_call("FROM python\n"), _call())
     sandbox = FakeSandbox()
-    events, kinds, outcome = drive(Agent(llm, sandbox, lambda d: DENY(d) if "\n" in d and "slim" not in d else None), script)
+    gate = lambda d, b, f: "FROM is not pinned" if "slim" not in d else None
+    events, kinds, outcome = drive(Agent(llm, sandbox, gate), script)
     assert kinds[:3] == ["asking", "wrote", "gate_rejected"]
     assert sandbox.built == [GOOD]          # the rejected one never reached the daemon
     assert "rejected before it was built" in llm.prompts[1]
@@ -149,10 +165,18 @@ def test_the_script_choosing_how_to_die_is_not_a_repair(script, exit_code, timed
     InvalidArguments("field 'dockerfile' should be string"),
     Truncated("hit the ceiling"),
 ])
-def test_an_unusable_reply_spends_an_attempt(script, failure):
+def test_an_unusable_reply_spends_an_attempt_and_says_why(script, failure):
+    """Bug found 2026-08-23. There is no previous Dockerfile to repair on the first
+    attempt, so the code fell back to the opening template, which has no slot for
+    the evidence. It was computed and then dropped, and the model got an identical
+    prompt twice."""
     llm = FakeLLM(failure, _call())
     events, kinds, outcome = drive(Agent(llm, FakeSandbox(), ALLOW), script)
     assert kinds[:2] == ["asking", "unusable_reply"] and outcome.attempts == 2
+    assert llm.prompts[0] != llm.prompts[1]
+    assert "could not be used" in llm.prompts[1]
+    assert str(failure) in llm.prompts[1]
+    assert "previous Dockerfile" not in llm.prompts[1]   # there was not one
 
 
 def test_the_loop_gives_up_honestly(script):
@@ -193,7 +217,54 @@ def test_the_fallback_is_gated_like_everything_else(script):
     events, kinds, outcome = drive(Agent(llm, sandbox, DENY), script)
     assert kinds[-2:] == ["gate_rejected", "finished"]
     assert sandbox.built == [] and outcome.ok is False
-    assert "our fallback was rejected" in outcome.reason
+    assert "our fallback Dockerfile was rejected" in outcome.reason
+
+
+# --- what the gate is handed -----------------------------------------------------------
+
+def test_the_gate_receives_the_declared_base_image_and_the_allowed_filenames(script):
+    """CLAUDE.md says base_image is declared separately so the gate can check it
+    without parsing. Until 2026-08-23 the gate was called with the dockerfile alone,
+    so a model could declare one image and write FROM another with nothing to notice."""
+    gate = RecordingGate()
+    llm = FakeLLM(_call(base="python:3.12-slim"))
+    drive(Agent(llm, FakeSandbox(), gate), script)
+    dockerfile, base_image, allowed = gate.seen[0]
+    assert base_image == "python:3.12-slim"
+    assert allowed == frozenset({"s.py"})
+
+
+def test_the_gate_can_catch_a_declared_image_that_is_not_the_one_written(script):
+    """The reason the field is passed at all: the two can disagree."""
+    def mismatch(dockerfile, base_image, allowed_files):
+        return None if f"FROM {base_image}" in dockerfile else "FROM does not match base_image"
+
+    llm = FakeLLM(_call("FROM ubuntu:22.04\nENTRYPOINT [\"true\"]\n", base="python:3.12-slim"),
+                  _call())
+    events, kinds, outcome = drive(Agent(llm, FakeSandbox(), mismatch), script)
+    assert kinds[2] == "gate_rejected" and outcome.ok and outcome.attempts == 2
+
+
+def test_the_gate_is_handed_the_fallbacks_own_base_image(script):
+    gate = RecordingGate()
+    llm = FakeLLM(Refused("no", reason="a"), Refused("no", reason="b"))
+    drive(Agent(llm, FakeSandbox(), gate), script)
+    assert gate.seen[0][1] == "python:3.12-slim"
+
+
+# --- the fallback has no next move ------------------------------------------------------
+
+def test_a_fallback_that_does_not_build_stops_instead_of_asking_again(script):
+    """Bug found 2026-08-23. This path used to set dockerfile to None and re-ask the
+    model, which the refusal policy rules out, and the gate check would then have
+    reported a model-written Dockerfile as our own."""
+    llm = FakeLLM(Refused("no", reason="a"), Refused("no", reason="b"))
+    sandbox = FakeSandbox(builds=[_build(ok=False, exit_code=1, log="no such image")])
+    events, kinds, outcome = drive(Agent(llm, sandbox, ALLOW), script)
+    assert kinds[-2:] == ["build_failed", "finished"]
+    assert outcome.ok is False and outcome.reason == "our fallback Dockerfile did not build"
+    assert llm.queue == []                  # never asked a third time
+    assert outcome.build is not None and outcome.used_fallback
 
 
 # --- the pieces ------------------------------------------------------------------------
