@@ -15,11 +15,16 @@ import re
 
 INSTRUCTIONS = ("FROM", "COPY", "RUN", "USER", "CMD", "ENTRYPOINT")
 
-# Characters Python's splitlines() treats as line breaks and Docker does not. With any
-# of them present the two disagree about what a line is, and every per-line rule below
-# is reasoning about a file Docker will never see. Refusing them outright is what makes
-# "one physical line is one instruction" true rather than nearly true.
-EXOTIC_BREAKS = "\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+# Docker breaks lines on \n and nothing else, so the gate does too, and the two cannot
+# disagree about what a line is. The first version of this used splitlines(), which
+# breaks on nine other characters, and was patched by listing them. That list was
+# missing \r, the most common member of its own category, which is what an enumeration
+# of bad characters always eventually is.
+#
+# So the remaining rule is an allowlist, like everything else here: a Dockerfile may
+# contain printable characters, newlines and tabs. Anything else is refused without
+# anyone needing to have thought of it first.
+ALLOWED_WHITESPACE = "\n\t"
 
 # RUN is exec form, so there is no shell and nothing to escape into. That is why this
 # is a list of argv heads rather than a list of string prefixes: `pip install` as a
@@ -166,15 +171,24 @@ def check(dockerfile: str, base_image: str,
     """
     if not dockerfile.strip():
         return "the Dockerfile is empty"
-    exotic = next((c for c in EXOTIC_BREAKS if c in dockerfile), None)
-    if exotic is not None:
-        return (f"the Dockerfile contains {exotic!r}, which Python counts as a line "
-                "break and Docker does not, so the two would read different files")
+    unprintable = next((c for c in dockerfile
+                        if not c.isprintable() and c not in ALLOWED_WHITESPACE), None)
+    if unprintable is not None:
+        # A carriage return here was a real bypass. The gate split the line, saw two
+        # valid exec-form instructions and allowed them; Docker kept it as one line,
+        # failed to parse it as JSON, fell back to shell form, and ran the whole thing
+        # through /bin/sh -c during the phase that has network.
+        return (f"the Dockerfile contains {unprintable!r}. Only printable characters, "
+                "newlines and tabs are allowed")
 
     seen_from = False
     seen_command = False
 
-    for number, line in enumerate(dockerfile.splitlines(), start=1):
+    # split("\n"), never splitlines(), so a line here is a line to Docker as well.
+    # The printable check above already refuses everything splitlines() would break on
+    # that Docker would not, so this is defence in depth rather than the only guard,
+    # and it cannot be tested through check() on its own.
+    for number, line in enumerate(dockerfile.split("\n"), start=1):
         if line.rstrip().endswith("\\"):
             return _reason(number, line, "no line continuations, one instruction per line")
         stripped = line.strip()

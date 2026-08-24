@@ -33,11 +33,36 @@ Four rules worth naming:
 A digest is refused even though it pins harder than a tag, because a digest pins to one
 architecture and the laptop is arm64 while CI is amd64.
 
-Characters that Python's `splitlines` treats as line breaks and Docker does not are
-refused outright. Without that, the gate and Docker can read different files from the
-same bytes, and every per-line rule is reasoning about a file that will never be built.
-Parser directives are refused for the same reason: `# escape=` changes which character
-continues a line.
+The gate splits on `\n` and nothing else, exactly as Docker does, and refuses any
+character that is not printable, a newline or a tab. Parser directives are refused too,
+since `# escape=` changes which character continues a line.
+
+## The carriage return, and why the first fix was the wrong shape
+Reported 2026-08-24 by a review session and reproduced against the daemon before anything
+changed. A lone `\r` is a line break to Python's `splitlines` and not to Docker, so this
+was allowed:
+
+    RUN ["pip", "install", "flask"]\rCMD ["$(echo INJECTED-AT-BUILD-TIME >&2)"]
+
+The gate split it into two valid exec-form instructions. Docker kept it as one line,
+failed to parse it as JSON, fell back to shell form, and ran the whole thing through
+`/bin/sh -c` during the phase that has network. The injected command printed before the
+build then failed with 127, which the loop would have called a repairable build failure
+and retried, so the attacker got their execution and the agent tried again.
+
+The reported fix was to add `\r` to the list of refused characters. That list was the
+bug. It was written the same day to enumerate what `splitlines` breaks on and Docker does
+not, and it omitted the most common member of its own category, which is what a blocklist
+eventually does.
+
+Replaced with two things that are properties rather than enumerations. The gate now splits
+on `\n`, so its notion of a line is Docker's by construction. And the only characters
+permitted anywhere are printable ones, newlines and tabs, which is an allowlist like every
+other rule in the file and refuses things nobody thought of.
+
+The cost is that CRLF Dockerfiles are refused, and that is chosen rather than accidental:
+accepting them means telling a bare carriage return from one before a newline, and that
+distinction is precisely what produced the bypass.
 
 ## What a second model found in the gate, 2026-08-24
 Three real findings, all reproduced against the function before anything changed.
@@ -66,7 +91,7 @@ as written. The registry-host rule stops the daemon pulling from a host the atta
 named; it does not make the image trustworthy.
 
 Sitting 4 of 11 complete: `envforge/agent.py` and `tests/test_agent.py`.
-159 tests, 146 needing neither Docker nor an API key, 13 against the real daemon.
+164 tests, 151 needing neither Docker nor an API key, 13 against the real daemon.
 
 ## What sitting 4 produced
 The plain repair loop. It defines `write_dockerfile` against the schema `Tool` already
