@@ -1,10 +1,10 @@
 # Status
 
-Updated 2026-08-23, end of the Sunday session.
+Updated 2026-08-24, three bugs fixed.
 
 ## Where we are
 Sitting 4 of 11 complete: `envforge/agent.py` and `tests/test_agent.py`.
-72 tests, 60 needing neither Docker nor an API key, 12 against the real daemon.
+76 tests, 64 needing neither Docker nor an API key, 12 against the real daemon.
 
 ## What sitting 4 produced
 The plain repair loop. It defines `write_dockerfile` against the schema `Tool` already
@@ -243,19 +243,24 @@ alone: a sibling file is a better injection vehicle than the script, and an opin
 from a fixed input is comparable across runs while one formed from whatever the model
 probed is not.
 
-## Three bugs found in the same review, not yet fixed
-`base_image` never reaches the gate. The schema comment and CLAUDE.md both say it is
-declared separately so the gate can check it without parsing, but the gate is called with
-the dockerfile string alone, so a model can declare one image and write `FROM` another.
+## Three bugs, found in review and fixed 2026-08-24
+`base_image` never reached the gate. The gate is now a `Gate` Protocol taking the
+dockerfile, the declared base image, and the set of filenames a `COPY` may name. All three
+are passed rather than inferred, and `allowed_files` holds only the script today so the
+manifest arriving in a later sitting grows the set instead of changing the signature. Two
+tests cover it, one asserting what the gate is handed and one where a gate catches a model
+declaring `python:3.12-slim` while writing `FROM ubuntu:22.04`.
 
-`used_fallback` is never reset. Two refusals, fallback, gate passes, build fails: the loop
-sets `dockerfile = None` and asks the model again, which is the re-asking the refusal
-policy rules out. If the gate then rejects that model-written Dockerfile, the run reports
-"our fallback Dockerfile failed our gate" about a file the model wrote. No test covers it.
+The fallback had no dead end on a failed build. Two refusals, fallback, gate passes, build
+fails, and the loop set `dockerfile = None` and asked the model again, which the refusal
+policy rules out. Worse, if the gate then rejected that model-written Dockerfile the run
+reported it as our own fallback failing our own gate. All three fallback dead ends now go
+through one `_dead_end` helper so they cannot drift apart again.
 
-Evidence from a first-attempt unusable reply is computed and dropped, because `previous`
-is still `None` so the FIRST template is chosen and it has no evidence slot. The model
-receives an identical prompt.
+Evidence from a first-attempt unusable reply was computed and dropped, because there is no
+previous Dockerfile and the opening template has no slot for it. There is now a third
+template, `RETRY`, for the case where the reply was unusable but there is nothing to
+correct. The test asserts the two prompts differ.
 
 ## Next
 Fix the three bugs above first. Then sitting 5: the deterministic gate, with a signature

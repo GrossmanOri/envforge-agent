@@ -13,7 +13,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterator, Sequence
+from typing import Any, Iterator, Protocol, Sequence
 
 from .llm import LLM, Call, InvalidArguments, LLMError, Refused, Tool, Truncated
 from .sandbox import BuildResult, RunResult, Sandbox
@@ -64,6 +64,19 @@ Script filename: {name}
 --- script ---
 {text}
 --- end script ---
+
+Write a Dockerfile that runs this script."""
+
+RETRY = """Language: {language}
+Script filename: {name}
+
+--- script ---
+{text}
+--- end script ---
+
+Your previous reply could not be used:
+
+{evidence}
 
 Write a Dockerfile that runs this script."""
 
@@ -136,25 +149,58 @@ def default_dockerfile(language: str, name: str) -> str:
     )
 
 
+class Gate(Protocol):
+    """Sitting 6 implements this. It returns a reason to refuse, or None to allow.
+
+    `base_image` and `allowed_files` are passed rather than inferred. The model
+    declares its base image as a separate field precisely so the gate can check it
+    without parsing the file it is about to check, and the set of filenames a COPY
+    may legally name is the caller's fact, not something the gate can know. Both
+    arguments exist now, with `allowed_files` holding only the script, so the
+    manifest that arrives later grows the set instead of changing this signature.
+    """
+
+    def __call__(self, dockerfile: str, base_image: str,
+                 allowed_files: frozenset[str]) -> str | None: ...
+
+
 class Agent:
     """gate has no default on purpose. Every Dockerfile reaching the daemon was
     written by a model that just read untrusted text, so a loop that can be built
     without a gate is a loop that can build one unchecked."""
 
-    def __init__(self, llm: LLM, sandbox: Sandbox, gate: Callable[[str], str | None],
+    def __init__(self, llm: LLM, sandbox: Sandbox, gate: Gate,
                  max_attempts: int = 3, max_refusals: int = 1) -> None:
         self.llm, self.sandbox, self.gate = llm, sandbox, gate
         self.max_attempts, self.max_refusals = max_attempts, max_refusals
 
     def _write(self, language: str, name: str, text: str,
                previous: str | None, evidence: str | None) -> Call:
-        """One forced tool call, whether this is the first attempt or a repair.
-        The repair carries the previous Dockerfile whole and only the latest
-        evidence, never an accumulated history."""
-        template = FIRST if previous is None else REPAIR
+        """One forced tool call, whether this is a first attempt, a retry after an
+        unusable reply, or a repair. A repair carries the previous Dockerfile whole
+        and only the latest evidence, never an accumulated history. A retry has no
+        previous Dockerfile to carry, so it needs its own template: reusing FIRST
+        would compute the evidence and then silently drop it."""
+        if previous is not None:
+            template = REPAIR          # there is a Dockerfile to correct
+        elif evidence is not None:
+            template = RETRY           # the reply was unusable, so there is not
+        else:
+            template = FIRST
         user = template.format(language=language, name=name, text=text,
                                previous=previous, evidence=evidence)
         return self.llm.call(SYSTEM, user, WRITE_DOCKERFILE)
+
+    @staticmethod
+    def _dead_end(reason: str, *, attempt: int, calls: list[Call], refusals: list[Any],
+                  dockerfile: str, build: BuildResult | None = None,
+                  run: RunResult | None = None) -> Event:
+        """The end of the road, always after the fallback. Three different things can
+        go wrong with a Dockerfile we wrote ourselves, and in all three the honest
+        move is to stop and say which, never to ask the model again."""
+        return Event("finished", reason, {"outcome": Outcome(
+            ok=False, reason=reason, dockerfile=dockerfile, build=build, run=run,
+            attempts=attempt, calls=calls, refusals=refusals, used_fallback=True)})
 
     def run(self, script: Path, language: str,
             args: Sequence[str] = ()) -> Iterator[Event]:
@@ -163,6 +209,7 @@ class Agent:
         calls: list[Call] = []
         refusals: list[Any] = []
         dockerfile: str | None = None
+        base_image: str = ""
         previous: str | None = None
         evidence: str | None = None
         used_fallback = False
@@ -181,6 +228,7 @@ class Agent:
                     if len(refusals) <= self.max_refusals:
                         continue  # the refusal counter, never the repair counter
                     dockerfile = default_dockerfile(language, script.name)
+                    base_image = DEFAULT_BASE[language]
                     used_fallback = True
                     yield Event("fell_back", "refused twice, using our own Dockerfile")
                 except (InvalidArguments, Truncated, LLMError) as exc:
@@ -191,23 +239,20 @@ class Agent:
                 else:
                     calls.append(call)
                     dockerfile = call.arguments["dockerfile"]
+                    base_image = call.arguments["base_image"]
                     yield Event("wrote", f"got {len(dockerfile)} characters",
-                                {"base_image": call.arguments["base_image"]})
+                                {"base_image": base_image})
 
             if dockerfile is None:
                 continue  # the unusable-reply path, having spent this attempt
 
-            rejection = self.gate(dockerfile)
+            rejection = self.gate(dockerfile, base_image, frozenset({script.name}))
             if rejection is not None:
                 yield Event("gate_rejected", rejection, {"dockerfile": dockerfile})
                 if used_fallback:
-                    # Our own default failed our own gate. That is our bug, and
-                    # asking the model again is exactly the nagging we ruled out.
-                    yield Event("finished", "our fallback Dockerfile failed our gate",
-                                {"outcome": Outcome(
-                                    ok=False, reason=f"our fallback was rejected: {rejection}",
-                                    dockerfile=dockerfile, attempts=attempt, calls=calls,
-                                    refusals=refusals, used_fallback=True)})
+                    yield self._dead_end(f"our fallback Dockerfile was rejected: {rejection}",
+                                         attempt=attempt, calls=calls, refusals=refusals,
+                                         dockerfile=dockerfile)
                     return
                 previous, dockerfile = dockerfile, None
                 evidence = f"the Dockerfile was rejected before it was built: {rejection}"
@@ -218,6 +263,15 @@ class Agent:
             build = self.sandbox.build(dockerfile, script, tag)
             if not build.ok:
                 yield Event("build_failed", f"build exited {build.exit_code}")
+                if used_fallback:
+                    # Bug found 2026-08-23: this branch used to ask the model again,
+                    # which is precisely the re-asking the refusal policy rules out,
+                    # and the gate check above would then have blamed us for a
+                    # Dockerfile the model wrote.
+                    yield self._dead_end("our fallback Dockerfile did not build",
+                                         attempt=attempt, calls=calls, refusals=refusals,
+                                         dockerfile=dockerfile, build=build)
+                    return
                 previous, dockerfile = dockerfile, None
                 evidence = bound(build.log, EVIDENCE_LIMIT)
                 continue
@@ -231,12 +285,9 @@ class Agent:
                 # and a script that can produce anything has already started.
                 yield Event("exec_failed", f"the container never started: {result.start_error}")
                 if used_fallback:
-                    yield Event("finished", "our fallback image could not run its command",
-                                {"outcome": Outcome(
-                                    ok=False, reason="the fallback image could not execute",
-                                    dockerfile=dockerfile, build=build, run=result,
-                                    attempts=attempt, calls=calls, refusals=refusals,
-                                    used_fallback=True)})
+                    yield self._dead_end("our fallback image could not run its command",
+                                         attempt=attempt, calls=calls, refusals=refusals,
+                                         dockerfile=dockerfile, build=build, run=result)
                     return
                 previous, dockerfile = dockerfile, None
                 evidence = ("the container never started its command. docker said:\n"
