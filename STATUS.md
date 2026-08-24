@@ -1,10 +1,10 @@
 # Status
 
-Updated 2026-08-23, end of sitting 4.
+Updated 2026-08-23, end of the Sunday session.
 
 ## Where we are
 Sitting 4 of 11 complete: `envforge/agent.py` and `tests/test_agent.py`.
-68 tests, 58 needing neither Docker nor an API key, 10 against the real daemon.
+72 tests, 60 needing neither Docker nor an API key, 12 against the real daemon.
 
 ## What sitting 4 produced
 The plain repair loop. It defines `write_dockerfile` against the schema `Tool` already
@@ -207,7 +207,65 @@ claiming to be a course exercise and buy itself a clean explanation. The one cas
 the opinion is the whole story is when the fallback Dockerfile also fails to build, and
 then the honest report is that no run happened and here is what the model said.
 
+## Reviewed 2026-08-23 by a second model, and the plan changed
+The question was whether this is an agent. It is not, by the usual definition: the model
+fills in one artifact and never chooses what happens next. A peer project held up as the
+counterexample turned out to have the same property, a fixed graph whose conditional edges
+are plain Python, one tool offered only when a regex on the build log allows it.
+
+What crosses the line is the model choosing which tools to call and when it has enough,
+so the plan now builds that. The boundary stays where it is: the model gains agency over
+what it learns, never over the gate, the sandbox flags, the decision to build or run, or
+the verdict.
+
+Five shapes have to be decided before the loop, because each is a rewrite otherwise:
+
+1. A `Workspace` protocol behind the tools. Tools never see a path; a Workspace lists
+   files by name and reads one bounded, populated by explicit ingestion, which is the
+   single place symlinks are resolved or refused. The hosted service and a Kubernetes
+   sandbox then become implementation swaps.
+2. `Sandbox.build` takes a manifest rather than one script. Once a tool reveals a
+   `requirements.txt`, the model writes `COPY requirements.txt` and the build fails on a
+   file the context does not hold, so the tools would manufacture the failure and then
+   spend repair attempts on it.
+3. The trace is a flat log whose every record carries a provenance field: model, tool
+   result, container output, or us. Without it a reader cannot tell which strings are
+   attacker-influenced, and a browser rendering them guesses wrong.
+4. `Outcome` slims to references and totals. It currently embeds raw request and response
+   JSON per call, which is harmless at four calls and megabytes at fifteen turns.
+5. The bound is a token budget, not a turn cap, with headroom reserved for the final
+   forced call. Input tokens grow every turn, so a turn count measures nothing.
+
+Two calls worth recording. The seam between the plain engine and LangGraph is the event
+vocabulary, not the node topology, because a topology-shaped interface cannot be honoured
+by a plain loop. And the semantic safety check stays outside the tool loop, on the script
+alone: a sibling file is a better injection vehicle than the script, and an opinion formed
+from a fixed input is comparable across runs while one formed from whatever the model
+probed is not.
+
+## Three bugs found in the same review, not yet fixed
+`base_image` never reaches the gate. The schema comment and CLAUDE.md both say it is
+declared separately so the gate can check it without parsing, but the gate is called with
+the dockerfile string alone, so a model can declare one image and write `FROM` another.
+
+`used_fallback` is never reset. Two refusals, fallback, gate passes, build fails: the loop
+sets `dockerfile = None` and asks the model again, which is the re-asking the refusal
+policy rules out. If the gate then rejects that model-written Dockerfile, the run reports
+"our fallback Dockerfile failed our gate" about a file the model wrote. No test covers it.
+
+Evidence from a first-attempt unusable reply is computed and dropped, because `previous`
+is still `None` so the FIRST template is chosen and it has no evidence slot. The model
+receives an identical prompt.
+
 ## Next
+Fix the three bugs above first. Then sitting 5: the deterministic gate, with a signature
+taking the dockerfile, the declared base image and the allowed filenames, so the manifest
+does not change it later. Sitting 6 is the five shapes, which needs no model at all.
+Sitting 7 is the tool loop, whose entry ticket is one live Anthropic call and whose exit
+ticket is a run where the investigation demonstrably changed the outcome. Sitting 8 is the
+LangGraph port as a real two-node cycle. The plan is twelve sittings now, not eleven.
+
+## Superseded
 Sitting 5: the LangGraph port. The same loop as graph nodes behind one interface, with the
 plain engine kept so the two can be compared rather than replaced.
 
