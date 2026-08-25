@@ -91,7 +91,7 @@ as written. The registry-host rule stops the daemon pulling from a host the atta
 named; it does not make the image trustworthy.
 
 Sitting 4 of 11 complete: `envforge/agent.py` and `tests/test_agent.py`.
-178 tests, 165 needing neither Docker nor an API key, 13 against the real daemon.
+190 tests, 177 needing neither Docker nor an API key, 13 against the real daemon.
 
 ## What sitting 4 produced
 The plain repair loop. It defines `write_dockerfile` against the schema `Tool` already
@@ -401,6 +401,35 @@ Evidence from a first-attempt unusable reply was computed and dropped, because t
 previous Dockerfile and the opening template has no slot for it. There is now a third
 template, `RETRY`, for the case where the reply was unusable but there is nothing to
 correct. The test asserts the two prompts differ.
+
+## Sitting 6, first of five
+`envforge/workspace.py`. The only code in the project that handles a path.
+
+Tools and the sandbox will ask for names and contents and never receive a path, so there
+is no path left for anything to manipulate. Everything that can go wrong with a filesystem
+happens once, at ingestion, rather than on every read. That is the whole design: a
+`requirements.txt` beside an untrusted script was discovered rather than chosen, and
+resolving it once and checking where it landed is a rule that holds forever, while
+checking a path at each use is a rule that holds until somebody adds a use.
+
+Three decisions worth naming:
+
+1. Resolve first, then check containment. A prefix check on the joined path passes a
+   `requirements.txt` symlinked to `~/.ssh/id_ed25519`, because the joined path is inside
+   the directory and only the target is not.
+2. The script and its siblings are treated differently. A symlinked script is followed,
+   because the user named that file and following it is doing what they asked, and the
+   root becomes wherever it actually lives. Siblings were discovered rather than named, so
+   they may not resolve outside that root.
+3. Siblings come from a fixed menu per language, held in the `LANGUAGES` table, rather
+   than from a caller-supplied path or a pattern. Traversal has nothing to traverse.
+
+`Files` holds contents rather than locations, which is what makes the later versions drop
+in without touching a caller: an upload has no directory, and a build running as a
+Kubernetes Job has no host filesystem to point at.
+
+Still to come in sitting 6: the manifest build context, the slimmed `Outcome`, the event
+names, and the token budget.
 
 ## Next
 Sitting 6 is the five shapes, which needs no model at all.
