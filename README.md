@@ -2,38 +2,58 @@
 
 Takes a script you do not trust, has an LLM write a Dockerfile for it, builds and runs it
 in a hardened container, repairs the Dockerfile when the run fails, and reports what the
-script tried to do while it ran. Python and Bash, one file at a time.
+script tried to do while it ran. Python and Bash, one file at a time. A language it does not handle is refused before the
+model is consulted.
 
 Built in the open, one piece at a time. This README separates what runs today from what is
 still design, so nothing here has to be taken on trust.
 
 ## What runs today
 
-`envforge/sandbox.py`, the part that holds the untrusted script.
-
-It builds an image from a Dockerfile and a script, runs the container, and returns the exit
-code with bounded output. The run has no network, a memory cap with swap pinned to the same
-value, a pids cap, a cpu cap, a read-only root with a tmpfs, every capability dropped,
-`no-new-privileges`, and a non-root user. No Docker socket is mounted anywhere, and the
-agent is never itself containerised, because that would put the socket back.
+**The sandbox**, `envforge/sandbox.py`, which holds the untrusted script. It builds an
+image and runs the container, returning the exit code with bounded output. The run has no
+network, a memory cap with swap pinned to the same value, a pids cap, a cpu cap, a
+read-only root with a tmpfs, every capability dropped, `no-new-privileges`, and a non-root
+user. No Docker socket is mounted anywhere, and the agent is never itself containerised,
+because that would put the socket back.
 
 Every container is named before it spawns and force-removed in a `finally`. Killing the
 docker client does not kill the container, which is measured behaviour rather than a
-precaution.
+precaution. Two ambiguous outcomes are separated by evidence rather than by an exit code:
+`--cidfile` tells our own malformed command apart from a script that exited 125 on purpose,
+and the daemon's `State.Error` tells an image that could not start its command apart from a
+script that chose 126 to look like one.
 
-Exit code 125 is separated from a script that exits 125 on purpose, using `--cidfile`:
-docker writes that file only once the container exists, so its absence means our own
-command was malformed and its presence means the script behaved that way. Without the
-split, a hostile script can spend the agent's repair budget on a Dockerfile that was never
-broken.
+**The model layer**, `envforge/llm.py`. One forced, schema-constrained tool call to
+Anthropic, OpenAI or Groq, so the Dockerfile arrives as validated arguments rather than
+prose we have to extract.
 
-24 tests, 9 of which build real images and run real containers. Both suites run on every
-push and every pull request.
+**The gate**, `envforge/gate.py`. An allowlist of six instructions and nothing else, run
+before every build including the fallback we write ourselves. `RUN` is exec form, so its
+arguments are checked one at a time rather than matched against a string prefix. What it
+does not do is stated plainly: `pip install <name>` runs that package's own code at build
+time, and no instruction allowlist can prevent that, because installing packages is the
+product.
+
+**The repair loop**, `envforge/agent.py`. It asks, gates, builds, runs, and decides one
+thing repeatedly: could a different Dockerfile have changed this. A failed build could. A
+script exiting 1 could not, because the script ran, and watching it run is the point.
+
+**The workspace**, `envforge/workspace.py`. The only code here that handles a path.
+Symlinks are resolved and then checked for containment, in that order.
+
+190 tests, 177 of which need neither Docker nor an API key. Both suites run on every push
+and every pull request.
 
 ## What is designed and not built
 
-The LLM layer, the Dockerfile gate, the repair loop, the verdict, and the command line
-entry point. There is no `__main__.py`, so there is nothing to run from a shell yet.
+The verdict, the trace, and the command line entry point. There is no `__main__.py`, so
+there is nothing to run from a shell yet, and nothing decides what a run means.
+
+The model has no tools. It reads the script once and writes a Dockerfile, so it cannot look
+anything up before deciding. That makes this a workflow with a feedback loop rather than an
+agent, which is stated here rather than glossed, and giving the model real tool choice is
+the next substantial piece of work.
 
 `ARCHITECTURE.md` holds the design. `STATUS.md` says where the build actually is, including
 which hardening flags are asserted in the argv but not yet verified by observation.

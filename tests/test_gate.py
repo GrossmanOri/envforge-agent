@@ -154,12 +154,28 @@ def test_copy_may_only_name_a_file_the_caller_allowed(source):
 
 
 @pytest.mark.parametrize("destination", ["/etc/passwd", "/usr/local/bin/python",
-                                         "/app", "s.py", "/"])
+                                         "s.py", "/", "/app/../escaped/s.py",
+                                         "/app/../../etc/x",
+                                         "/app/./../../root/.ssh/authorized_keys"])
 def test_copy_may_only_write_under_app(destination):
-    """Found 2026-08-24. Only the source was checked, so a file whose contents the
-    attacker controls could be written over /etc/passwd or shadow an interpreter."""
+    """Found 2026-08-24: only the source was checked, so a file whose contents the
+    attacker controls could be written over /etc/passwd or shadow an interpreter.
+
+    The `..` cases were found the day after, and they defeated the first fix. A prefix
+    test on the raw string passes `/app/../escaped/s.py`, and Docker writes it to
+    `/escaped/s.py` with `/app` never created, verified against the daemon. Normalising
+    before comparing is the difference between checking the string and checking the
+    destination."""
     reason = gate(body(f"COPY s.py {destination}", 'CMD ["x"]'))
-    assert "destination must be under" in reason
+    assert "COPY destination must be" in reason
+
+
+@pytest.mark.parametrize("destination", ["/app", "/app/s.py", "/app/sub/s.py",
+                                         "/app/./s.py"])
+def test_copy_may_write_anywhere_under_app_including_the_bare_directory(destination):
+    """`COPY s.py /app` is the idiomatic form and the first fix refused it, which would
+    have spent a repair attempt on every run that reached for the obvious thing."""
+    assert gate(body(f"COPY s.py {destination}", 'CMD ["x"]')) is None
 
 
 def test_copy_flags_are_refused():

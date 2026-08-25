@@ -81,9 +81,15 @@ rather than merely relaxed. Verified against a real build: exec-form `RUN` resol
 through `PATH` and `flask>=2.0,<4` installs as 3.1.3.
 
 `COPY` checked its source and ignored its destination, so `COPY s.py /etc/passwd` and
-`COPY s.py /usr/local/bin/python` both passed. The contents were attacker-controlled
-either way, so it granted nothing new, but there is no reason a build should choose
-where they land. Destinations must now be under `/app/`.
+`COPY s.py /usr/local/bin/python` both passed. Destinations are now confined to `/app`.
+
+That first fix was itself defeated, on 2026-08-25, by the first `..`. A prefix test on the
+raw string passes `COPY s.py /app/../escaped/s.py`, and Docker writes the file to
+`/escaped/s.py` with `/app` never created, verified against the daemon. The destination is
+now normalised with `posixpath.normpath` before the containment test, which is the
+difference between checking the string and checking the destination. The same change makes
+the idiomatic `COPY s.py /app` legal, which the first fix refused and which would have
+spent a repair attempt on every run that reached for the obvious form.
 
 One finding was not a bypass and is worth keeping in view: Docker Hub is not a trust
 boundary. Anyone can publish there, so `FROM eviluser/backdoor:1.0` is inside the rules
