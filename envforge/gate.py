@@ -11,6 +11,7 @@ repair evidence, so it says what is wrong rather than merely that something is.
 from __future__ import annotations
 
 import json
+import posixpath
 import re
 
 INSTRUCTIONS = ("FROM", "COPY", "RUN", "USER", "CMD", "ENTRYPOINT")
@@ -47,7 +48,7 @@ PACKAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*([<>=!~][^\s]*)?$")
 
 # Everything COPY writes lands here, so a Dockerfile cannot overwrite /etc/passwd or
 # shadow an interpreter on PATH with a file whose contents the attacker controls.
-COPY_DESTINATION = "/app/"
+COPY_DESTINATION = "/app"
 
 
 def _reason(number: int, line: str, problem: str) -> str:
@@ -94,12 +95,14 @@ def _check_copy(number: int, line: str, allowed_files: frozenset[str]) -> str | 
     if source not in allowed_files:
         return _reason(number, line,
                        f"COPY may only name {', '.join(sorted(allowed_files))}")
-    if not destination.startswith(COPY_DESTINATION):
-        # Only the source was checked until 2026-08-24, so `COPY s.py /etc/passwd` and
-        # `COPY s.py /usr/local/bin/python` both passed. The contents are attacker
-        # controlled either way, so this grants nothing new, but there is no reason a
-        # build should be able to choose where they land.
-        return _reason(number, line, f"COPY destination must be under {COPY_DESTINATION}")
+    # Normalise before comparing, never after. A prefix test on the raw string is
+    # defeated by the first `..`: `/app/../escaped/s.py` starts with `/app/` and Docker
+    # writes it to `/escaped/s.py`, verified against the daemon on 2026-08-25.
+    resolved = posixpath.normpath(destination)
+    if resolved != COPY_DESTINATION and not resolved.startswith(COPY_DESTINATION + "/"):
+        return _reason(number, line,
+                       f"COPY destination must be {COPY_DESTINATION} or under it, "
+                       f"and {destination!r} resolves to {resolved!r}")
     return None
 
 
