@@ -191,7 +191,14 @@ class DockerSandbox:
             (context / "Dockerfile").write_text(dockerfile, encoding="utf-8")
             for name, content in files.items():
                 if "/" in name or "\\" in name or name in (".", ".."):
-                    raise SandboxError(f"{name!r} is not a bare filename")
+                    # A precondition, not a second copy of the rule. The workspace owns
+                    # what a legal filename is, decides it once at ingestion and says so
+                    # to a person. This only states what `build` requires in order to be
+                    # correct, because it writes these names into a directory. If it
+                    # ever fires, nobody typed anything wrong and our own code broke a
+                    # contract, which is exactly what SandboxError means here.
+                    raise SandboxError(f"caller passed {name!r}, which is not a bare "
+                                       "filename. The workspace should have refused it")
                 (context / name).write_text(content, encoding="utf-8")
             code, out, err, timed_out = _capture(
                 build_argv(tag, context), self.limits.build_timeout

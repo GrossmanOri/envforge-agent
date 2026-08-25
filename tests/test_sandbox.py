@@ -260,10 +260,18 @@ def test_a_script_exiting_127_leaves_no_such_account(sandbox, image):
     assert result.start_error == ""
 
 
-def test_the_build_context_refuses_a_name_that_is_not_a_bare_filename():
-    """The workspace only ever produces bare names, so this is defence in depth rather
-    than the guard that matters. The sandbox writes these names into a directory, and it
-    should not need to trust the thing that handed them over."""
+def test_build_asserts_its_precondition_and_should_never_fire_in_practice():
+    """This is not a second copy of the workspace's rule, and the distinction matters.
+
+    The workspace owns what a legal filename is: it decides once at ingestion, raises
+    WorkspaceError, and its message is aimed at a person. `build` only states what it
+    requires to be correct, because it writes these names into a directory. Reaching
+    this line means our own code broke a contract, which is what SandboxError means
+    everywhere else in this file: our command was wrong, never anything the script did.
+
+    Two checks are fine when one is the rule and the other is a precondition. Two checks
+    are a problem when a reader cannot tell which is which, so the error type, the
+    message and this name all have to say so."""
     sandbox = DockerSandbox(LIMITS)
     for name in ["../escape.py", "sub/dir.py", "..", "."]:
         with pytest.raises(SandboxError, match="bare filename"):
