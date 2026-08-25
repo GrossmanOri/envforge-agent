@@ -91,7 +91,7 @@ as written. The registry-host rule stops the daemon pulling from a host the atta
 named; it does not make the image trustworthy.
 
 Sitting 4 of 11 complete: `envforge/agent.py` and `tests/test_agent.py`.
-164 tests, 151 needing neither Docker nor an API key, 13 against the real daemon.
+167 tests, 154 needing neither Docker nor an API key, 13 against the real daemon.
 
 ## What sitting 4 produced
 The plain repair loop. It defines `write_dockerfile` against the schema `Tool` already
@@ -255,6 +255,22 @@ written a Dockerfile against it yet. `apt-get update && apt-get install -y foo` 
 idiomatic form and is refused, so the model must write two RUN lines. The first live call
 will show whether that costs repair attempts. Excluding WORKDIR and ENV is the same
 question and follows CLAUDE.md's list exactly.
+
+## Languages, settled 2026-08-25
+Python and Bash, and now the code says so rather than only the README. Nothing validated
+the language before, so a Ruby script was simply passed to the model, which usually
+answered, and the run looked like it worked. Two refusals then reached
+`default_dockerfile`, which has no base image for Ruby and raised `ValueError` straight
+out of the generator.
+
+An unsupported language is now refused before the model is consulted at all, and the
+refusal is an `Outcome` like any other rather than an exception. Bash also gained its
+first test, having been claimed since the first commit and exercised by nothing.
+
+What a third language actually needs is not a `DEFAULT_BASE` entry. It is an entry in the
+gate's `RUN_COMMANDS`, which today permits `pip` and `apt-get` and nothing else, so a Ruby
+script with a gem dependency or a Node script with an npm dependency cannot be built no
+matter what the model writes.
 
 ## Known gaps
 Nothing has hit a real provider. The request shape is asserted against our own builders and

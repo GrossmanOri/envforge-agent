@@ -267,6 +267,45 @@ def test_a_fallback_that_does_not_build_stops_instead_of_asking_again(script):
     assert outcome.build is not None and outcome.used_fallback
 
 
+# --- languages we do not handle ----------------------------------------------------------
+
+def test_an_unsupported_language_is_refused_at_the_door(tmp_path):
+    """It used to run. Nothing validated the language, so the model was asked and
+    usually answered, and the README's claim of Python and Bash only was not enforced
+    anywhere in the code."""
+    script = tmp_path / "s.rb"
+    script.write_text('puts "hi"\n')
+    llm = FakeLLM()                       # never consulted
+    events = list(Agent(llm, FakeSandbox(), ALLOW).run(script, "ruby"))
+    outcome = events[-1].data["outcome"]
+    assert [e.kind for e in events] == ["finished"]
+    assert outcome.ok is False and "not 'ruby'" in outcome.reason
+    assert "bash, python" in outcome.reason
+
+
+def test_an_unsupported_language_used_to_crash_on_a_refusal(tmp_path):
+    """The specific bug: two refusals reached default_dockerfile, which raises for a
+    language it has no base image for, and the ValueError escaped the generator."""
+    script = tmp_path / "s.rb"
+    script.write_text('puts "hi"\n')
+    agent = Agent(FakeLLM(Refused("no", reason="a"), Refused("no", reason="b")),
+                  FakeSandbox(), ALLOW)
+    outcome = list(agent.run(script, "ruby"))[-1].data["outcome"]
+    assert outcome.ok is False           # an outcome, not an exception
+
+
+def test_bash_is_supported_and_says_so(tmp_path):
+    """Claimed in the README since the first commit and exercised by nothing until now."""
+    script = tmp_path / "s.sh"
+    script.write_text("echo hi\n")
+    dockerfile = default_dockerfile("bash", "s.sh")
+    assert "FROM debian:12-slim" in dockerfile
+    assert 'ENTRYPOINT ["bash", "/app/s.sh"]' in dockerfile
+    llm = FakeLLM(_call(dockerfile, base="debian:12-slim"))
+    outcome = list(Agent(llm, FakeSandbox(), ALLOW).run(script, "bash"))[-1].data["outcome"]
+    assert outcome.ok
+
+
 # --- the pieces ------------------------------------------------------------------------
 
 def test_bound_keeps_both_ends_and_says_how_much_it_cut():
