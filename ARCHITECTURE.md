@@ -57,11 +57,15 @@ same gate before any build.
     a fallback we wrote.
 15. A language not in the table is refused before the model is consulted at all.
 16. Only the workspace handles a path. Everything downstream receives names and contents.
+17. No file in a build context may be named something the build itself interprets. A
+    context file called `Dockerfile` replaces the gated one, and the container then runs
+    instructions nothing checked.
 
 Invariants 4 and 5 are asserted against the argv that `sandbox.py` actually builds, so
 dropping a flag from the code fails a test rather than passing review.
 
-Invariants 2, 3 and 12 each exist because an earlier version of them was bypassed. The
+Invariants 2, 3, 12 and 17 each exist because an earlier version was bypassed, or in 17's
+case because the absence of the rule was. The
 history is in STATUS.md and it is the same lesson three times: a rule that checks the text
 instead of the thing the text means is not a rule.
 

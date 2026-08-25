@@ -97,7 +97,7 @@ as written. The registry-host rule stops the daemon pulling from a host the atta
 named; it does not make the image trustworthy.
 
 Sitting 4 of 11 complete: `envforge/agent.py` and `tests/test_agent.py`.
-200 tests, 187 needing neither Docker nor an API key, 13 against the real daemon.
+205 tests, 192 needing neither Docker nor an API key, 13 against the real daemon.
 
 ## What sitting 4 produced
 The plain repair loop. It defines `write_dockerfile` against the schema `Tool` already
@@ -459,6 +459,24 @@ The sandbox refuses a name that is not a bare filename. The workspace only ever 
 bare names, so that is defence in depth rather than the guard that matters: the sandbox
 writes those names into a directory and should not have to trust whoever handed them over.
 
+A context file may not be named something the build itself interprets. Found in review
+before this piece merged and verified against the daemon: the files loop runs after the
+gated Dockerfile is written, so `{"Dockerfile": ...}` overwrote it and the container ran
+instructions the gate never saw. Both `Dockerfile` and `dockerfile` built and ran, the
+second because a case-insensitive filesystem collides them. Not a directory escape, a
+complete bypass of the only check there is. `.dockerignore` is refused on the same
+reasoning, and an empty name now raises `SandboxError` rather than `IsADirectoryError`.
+
+Reaching it required a workspace holding a file with that name, which today is impossible
+because the sibling menu is ours and the extension rule keeps a script called Dockerfile
+out. It becomes reachable the moment sitting 7 grows that menu, which is a plausible thing
+to want.
+
+A silent policy change worth naming: a script with a latin-1 comment used to run with
+replacement characters, because the agent read with `errors="replace"`. There is one
+reader now and it is strict, so such a script is refused at ingestion. Defensible, but a
+decision rather than a consequence.
+
 Still to come in sitting 6: the slimmed `Outcome`, the event names, and the token budget.
 
 Still to come in sitting 6: the manifest build context, the slimmed `Outcome`, the event
@@ -587,6 +605,22 @@ What actually holds instead is already built. The gate refuses URLs, git referen
 paths and `--index-url`, so a package can only arrive by name from the default index.
 Beyond that, containment is the container, which is the `pip install` argument in general,
 and the real fix is the offline install after pre-resolution recorded in LATER.
+
+## Before sitting 7, and blocking it
+Ori's request 2026-08-25. Go over the layout and the accounts before any of sitting 7 is
+written, because both have grown by accretion and neither has been looked at since the
+project changed shape.
+
+On disk: `~/Projects/envforge/` holds `v1`, `private` and `agent`. Decide what is still
+live, what is history worth keeping, and what is neither. `private` in particular has
+accumulated planning documents from a project this one no longer continues.
+
+On GitHub: two repositories nobody is using. Decide whether each is archived, deleted or
+kept, and say why in one line each so the decision is not remade later.
+
+Not a tidiness exercise. A directory nobody has audited is where a stale document sits
+quoting a design that no longer exists, which has already happened twice in this project
+with ARCHITECTURE.md and STATUS.md.
 
 ## Next
 Sitting 6 is the five shapes, which needs no model at all.

@@ -273,6 +273,23 @@ def test_build_asserts_its_precondition_and_should_never_fire_in_practice():
     are a problem when a reader cannot tell which is which, so the error type, the
     message and this name all have to say so."""
     sandbox = DockerSandbox(LIMITS)
-    for name in ["../escape.py", "sub/dir.py", "..", "."]:
+    for name in ["../escape.py", "sub/dir.py", "..", ".", ""]:
         with pytest.raises(SandboxError, match="bare filename"):
             sandbox.build("FROM python:3.12-slim\n", {name: "x"}, "envforge-test:never")
+
+
+@pytest.mark.parametrize("name", ["Dockerfile", "dockerfile", "DOCKERFILE",
+                                  ".dockerignore", ".DockerIgnore"])
+def test_a_context_file_may_not_be_one_the_build_itself_interprets(name):
+    """Found 2026-08-25 and verified against the daemon before this line existed.
+
+    The files loop runs after the gated Dockerfile is written into the context, so a
+    file called Dockerfile overwrote it and the container ran instructions the gate had
+    never seen. Both `Dockerfile` and `dockerfile` built and ran, the second because a
+    case-insensitive filesystem collides them.
+
+    This is not a directory escape, it is a complete bypass of the only check there is,
+    and it is exactly the failure the precondition above claims to prevent."""
+    sandbox = DockerSandbox(LIMITS)
+    with pytest.raises(SandboxError, match="build itself"):
+        sandbox.build("FROM python:3.12-slim\n", {name: "FROM evil"}, "envforge-test:never")
