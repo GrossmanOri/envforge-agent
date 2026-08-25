@@ -226,6 +226,18 @@ class Agent:
 
     def run(self, script: Path, language: str,
             args: Sequence[str] = ()) -> Iterator[Event]:
+        if language not in DEFAULT_BASE:
+            # Refused at the door rather than half-attempted. Without this the model is
+            # asked anyway and usually produces something, but there is no fallback
+            # Dockerfile for the language, so a refusal used to raise ValueError out of
+            # the generator. Half-working is also what the README promises not to do.
+            supported = ", ".join(sorted(DEFAULT_BASE))
+            yield Event("finished", f"{language} is not supported",
+                        {"outcome": Outcome(
+                            ok=False,
+                            reason=f"this agent handles {supported}, not {language!r}")})
+            return
+
         text = bound(script.read_text(errors="replace"), SCRIPT_LIMIT)
         run_id = uuid.uuid4().hex[:8]
         calls: list[Call] = []
