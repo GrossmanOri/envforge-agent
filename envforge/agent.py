@@ -17,6 +17,7 @@ from typing import Any, Iterator, Protocol, Sequence
 
 from .llm import LLM, Call, InvalidArguments, LLMError, Refused, Tool, Truncated
 from .sandbox import BuildResult, RunResult, Sandbox
+from .workspace import Workspace
 
 # The script is attacker-controlled text on its way into a prompt, so it is bounded
 # here for the same reason container output is bounded in the sandbox.
@@ -229,8 +230,9 @@ class Gate(Protocol):
     declares its base image as a separate field precisely so the gate can check it
     without parsing the file it is about to check, and the set of filenames a COPY
     may legally name is the caller's fact, not something the gate can know. Both
-    arguments exist now, with `allowed_files` holding only the script, so the
-    manifest that arrives later grows the set instead of changing this signature.
+    arguments exist now, and `allowed_files` is the set the workspace actually
+    gathered, so a COPY may name the script and any manifest beside it and nothing
+    else. The set grows with the workspace rather than by changing this signature.
     """
 
     def __call__(self, dockerfile: str, base_image: str,
@@ -275,8 +277,13 @@ class Agent:
             ok=False, reason=reason, dockerfile=dockerfile, build=build, run=run,
             attempts=attempt, calls=calls, refusals=refusals, used_fallback=True)})
 
-    def run(self, script: Path, language: str,
+    def run(self, workspace: Workspace, language: str,
             args: Sequence[str] = ()) -> Iterator[Event]:
+        """The agent never receives a path. The workspace read every file once, at
+        ingestion, and hands out names and contents from memory. Before this the script
+        was read twice, once here for the prompt and once from disk when the build
+        context was assembled, so the model could review one file while the container
+        ran another."""
         if language not in LANGUAGES:
             # Refused at the door rather than half-attempted. Without this the model is
             # asked anyway and usually produces something, but there is no fallback
@@ -289,7 +296,9 @@ class Agent:
                             reason=f"this agent handles {supported}, not {language!r}")})
             return
 
-        text = bound(script.read_text(errors="replace"), SCRIPT_LIMIT)
+        script = workspace.script
+        text = bound(workspace.read(script), SCRIPT_LIMIT)
+        files = {name: workspace.read(name) for name in workspace.names()}
         run_id = uuid.uuid4().hex[:8]
         calls: list[Call] = []
         refusals: list[Any] = []
@@ -306,13 +315,13 @@ class Agent:
             while dockerfile is None:
                 yield Event("asking", f"attempt {attempt}: asking for a Dockerfile")
                 try:
-                    call = self._write(language, script.name, text, previous, evidence)
+                    call = self._write(language, script, text, previous, evidence)
                 except Refused as exc:
                     refusals.append(exc.reason)
                     yield Event("refused", str(exc), {"reason": exc.reason})
                     if len(refusals) <= self.max_refusals:
                         continue  # the refusal counter, never the repair counter
-                    dockerfile = default_dockerfile(language, script.name)
+                    dockerfile = default_dockerfile(language, script)
                     base_image = LANGUAGES[language].base_image
                     used_fallback = True
                     yield Event("fell_back", "refused twice, using our own Dockerfile")
@@ -331,7 +340,9 @@ class Agent:
             if dockerfile is None:
                 continue  # the unusable-reply path, having spent this attempt
 
-            rejection = self.gate(dockerfile, base_image, frozenset({script.name}))
+            # The manifest, not a hardcoded singleton. A COPY may now name any file the
+            # workspace actually gathered, and nothing else.
+            rejection = self.gate(dockerfile, base_image, frozenset(files))
             if rejection is not None:
                 yield Event("gate_rejected", rejection, {"dockerfile": dockerfile})
                 if used_fallback:
@@ -345,7 +356,7 @@ class Agent:
 
             tag = f"envforge-{run_id}:attempt{attempt}"
             yield Event("building", f"building {tag}")
-            build = self.sandbox.build(dockerfile, script, tag)
+            build = self.sandbox.build(dockerfile, files, tag)
             if not build.ok:
                 yield Event("build_failed", f"build exited {build.exit_code}")
                 if used_fallback:

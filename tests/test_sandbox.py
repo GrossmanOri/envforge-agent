@@ -128,11 +128,11 @@ ENTRYPOINT ["python", "-u", "/app/probe.py"]
 """
 
 @pytest.fixture(scope="module")
-def image(tmp_path_factory):
-    script = tmp_path_factory.mktemp("probe") / "probe.py"
-    script.write_text(PROBE)
+def image():
+    """No file on disk anywhere. The build context is assembled from contents, which is
+    what makes the bytes the model saw and the bytes the container runs the same bytes."""
     sandbox = DockerSandbox(LIMITS)
-    result = sandbox.build(DOCKERFILE, script, "envforge-test:probe")
+    result = sandbox.build(DOCKERFILE, {"probe.py": PROBE}, "envforge-test:probe")
     assert result.ok, result.log
     yield "envforge-test:probe"
     sandbox.remove_image("envforge-test:probe")
@@ -146,12 +146,10 @@ ENTRYPOINT ["/does-not-exist"]
 
 
 @pytest.fixture(scope="module")
-def broken_image(tmp_path_factory):
+def broken_image():
     """An image whose command cannot be executed. It builds fine; it cannot start."""
-    script = tmp_path_factory.mktemp("broken") / "probe.py"
-    script.write_text(PROBE)
     sandbox = DockerSandbox(LIMITS)
-    result = sandbox.build(BROKEN_ENTRYPOINT, script, "envforge-test:broken")
+    result = sandbox.build(BROKEN_ENTRYPOINT, {"probe.py": PROBE}, "envforge-test:broken")
     assert result.ok, result.log
     yield "envforge-test:broken"
     sandbox.remove_image("envforge-test:broken")
@@ -237,7 +235,8 @@ def test_output_is_bounded(sandbox, image):
 def test_a_broken_dockerfile_fails_the_build_without_raising(sandbox, tmp_path):
     script = tmp_path / "probe.py"
     script.write_text(PROBE)
-    result = sandbox.build("FROM python:3.12-slim\nRUN exit 7\n", script, "envforge-test:bad")
+    result = sandbox.build("FROM python:3.12-slim\nRUN exit 7\n",
+                           {"probe.py": PROBE}, "envforge-test:bad")
     assert not result.ok and result.exit_code != 0
 
 
@@ -259,3 +258,13 @@ def test_a_script_exiting_127_leaves_no_such_account(sandbox, image):
     result = sandbox.run(image, ["exit127"])
     assert result.exit_code == 127
     assert result.start_error == ""
+
+
+def test_the_build_context_refuses_a_name_that_is_not_a_bare_filename():
+    """The workspace only ever produces bare names, so this is defence in depth rather
+    than the guard that matters. The sandbox writes these names into a directory, and it
+    should not need to trust the thing that handed them over."""
+    sandbox = DockerSandbox(LIMITS)
+    for name in ["../escape.py", "sub/dir.py", "..", "."]:
+        with pytest.raises(SandboxError, match="bare filename"):
+            sandbox.build("FROM python:3.12-slim\n", {name: "x"}, "envforge-test:never")

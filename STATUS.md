@@ -97,7 +97,7 @@ as written. The registry-host rule stops the daemon pulling from a host the atta
 named; it does not make the image trustworthy.
 
 Sitting 4 of 11 complete: `envforge/agent.py` and `tests/test_agent.py`.
-190 tests, 177 needing neither Docker nor an API key, 13 against the real daemon.
+200 tests, 187 needing neither Docker nor an API key, 13 against the real daemon.
 
 ## What sitting 4 produced
 The plain repair loop. It defines `write_dockerfile` against the schema `Tool` already
@@ -434,16 +434,32 @@ Three decisions worth naming:
 in without touching a caller: an upload has no directory, and a build running as a
 Kubernetes Job has no host filesystem to point at.
 
-Nothing calls `gather()` yet, and that matters more than it sounds. The script is still
-read from disk twice: once at `agent.py` for the prompt, and again by `shutil.copy` inside
-`sandbox.build` when the build context is assembled. Between those two reads the file can
-change, so the model can review one script while the container runs another, and the
-verdict would then describe a file that never executed. The two readers also disagree
-about encoding: the workspace refuses invalid UTF-8 and the agent silently replaces it.
+## Sitting 6, second of five
+`Sandbox.build` takes a mapping of names to contents instead of a `Path`, and `Agent.run`
+takes a `Workspace` instead of a script path. The agent no longer receives a path at all,
+and a test asserts that by reading the signature, because if a `Path` ever comes back the
+second read comes back with it.
 
-So "read once, held in memory" is a property this module makes possible and does not yet
-provide. Wiring `Sandbox.build` onto workspace contents instead of a `Path` is the next
-piece of sitting 6, and every sitting 7 decision assumes it.
+Three things landed together.
+
+The script is read exactly once. Before this it was read twice, at `agent.py` for the
+prompt and again by `shutil.copy` when the build context was assembled, so a file that
+changed between them meant the model reviewed one script and the container ran another.
+The test swaps the file on disk after `gather()` and asserts the build context still holds
+the original bytes.
+
+The build context can hold more than one file, so a manifest can be copied into an image.
+
+`allowed_files` reaching the gate is the set the workspace actually gathered rather than a
+hardcoded singleton, so a `COPY` may name the script and any manifest beside it and
+nothing else. That is the rule that stops the model writing `COPY requirements.txt` for a
+file the build cannot see, which the tools in sitting 7 would otherwise have manufactured.
+
+The sandbox refuses a name that is not a bare filename. The workspace only ever produces
+bare names, so that is defence in depth rather than the guard that matters: the sandbox
+writes those names into a directory and should not have to trust whoever handed them over.
+
+Still to come in sitting 6: the slimmed `Outcome`, the event names, and the token budget.
 
 Still to come in sitting 6: the manifest build context, the slimmed `Outcome`, the event
 names, and the token budget.

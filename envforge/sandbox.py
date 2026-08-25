@@ -6,14 +6,13 @@ comes back, and always removes the container. Judgement lives in gate.py and ver
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 import tempfile
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Mapping, Protocol, Sequence
 
 # Bytes kept per captured stream. Container output is attacker-controlled text and it
 # reaches an LLM prompt later, so it is bounded at the source, not at the prompt.
@@ -61,7 +60,7 @@ class RunResult:
 class Sandbox(Protocol):
     """The seam. DockerSandbox now, a fake in tests, a Kubernetes Job later."""
 
-    def build(self, dockerfile: str, script: Path, tag: str) -> BuildResult: ...
+    def build(self, dockerfile: str, files: Mapping[str, str], tag: str) -> BuildResult: ...
 
     def run(self, image: str, args: Sequence[str] = ()) -> RunResult: ...
 
@@ -178,14 +177,22 @@ class DockerSandbox:
     def __init__(self, limits: Limits | None = None) -> None:
         self.limits = limits or Limits()
 
-    def build(self, dockerfile: str, script: Path, tag: str) -> BuildResult:
-        """The script lands in the context root under its own basename, which is the
-        name the Dockerfile's COPY must use."""
+    def build(self, dockerfile: str, files: Mapping[str, str], tag: str) -> BuildResult:
+        """Every file lands in the context root under its own name, which is the name a
+        COPY must use.
+
+        Contents rather than paths, so the bytes the model reviewed and the bytes the
+        container runs are the same bytes. Copying from disk here would have been a
+        second read, and a file can change between two reads.
+        """
         started = time.monotonic()
         with tempfile.TemporaryDirectory(prefix="envforge-ctx-") as tmp:
             context = Path(tmp)
             (context / "Dockerfile").write_text(dockerfile, encoding="utf-8")
-            shutil.copy(script, context / script.name)
+            for name, content in files.items():
+                if "/" in name or "\\" in name or name in (".", ".."):
+                    raise SandboxError(f"{name!r} is not a bare filename")
+                (context / name).write_text(content, encoding="utf-8")
             code, out, err, timed_out = _capture(
                 build_argv(tag, context), self.limits.build_timeout
             )
