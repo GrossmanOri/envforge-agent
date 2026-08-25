@@ -91,6 +91,11 @@ def gather(script: Path, siblings: tuple[str, ...] = ()) -> Files:
     resolved = script.resolve()
     if not resolved.is_file():
         raise WorkspaceError(f"{script} is not a file")
+    if any(sep in name for name in siblings for sep in "/\\"):
+        # The menu is ours, so this is a mistake in our own table rather than an attack,
+        # but the sandbox writes these names into a directory and a separator would
+        # escape it. Fail where the mistake is, not where it lands.
+        raise WorkspaceError("sibling names must be bare filenames")
     root = resolved.parent
     contents = {resolved.name: _read(resolved, root, resolved.name)}
     for name in siblings:

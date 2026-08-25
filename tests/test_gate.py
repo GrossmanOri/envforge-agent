@@ -291,9 +291,11 @@ def test_the_loop_runs_against_the_real_gate(tmp_path):
     sys.path.insert(0, "tests")
     from test_agent import FakeLLM, FakeSandbox, _call
     from envforge.llm import Refused
+    from envforge.workspace import gather
 
-    script = tmp_path / "s.py"
-    script.write_text("print(1)\n")
+    path = tmp_path / "s.py"
+    path.write_text("print(1)\n")
+    script = gather(path)
 
     good = Agent(FakeLLM(_call(default_dockerfile("python", "s.py"))), FakeSandbox(), check)
     assert list(good.run(script, "python"))[-1].data["outcome"].ok
@@ -331,7 +333,8 @@ def test_a_gate_legal_dockerfile_builds_and_runs(tmp_path):
     assert gate(dockerfile) is None
 
     sandbox = DockerSandbox(Limits(run_timeout=60.0))
-    build = sandbox.build(dockerfile, script, "envforge-test:gatelegal")
+    build = sandbox.build(dockerfile, {"s.py": script.read_text()},
+                          "envforge-test:gatelegal")
     try:
         assert build.ok, build.log
         result = sandbox.run(build.image)

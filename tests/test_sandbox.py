@@ -128,11 +128,11 @@ ENTRYPOINT ["python", "-u", "/app/probe.py"]
 """
 
 @pytest.fixture(scope="module")
-def image(tmp_path_factory):
-    script = tmp_path_factory.mktemp("probe") / "probe.py"
-    script.write_text(PROBE)
+def image():
+    """No file on disk anywhere. The build context is assembled from contents, which is
+    what makes the bytes the model saw and the bytes the container runs the same bytes."""
     sandbox = DockerSandbox(LIMITS)
-    result = sandbox.build(DOCKERFILE, script, "envforge-test:probe")
+    result = sandbox.build(DOCKERFILE, {"probe.py": PROBE}, "envforge-test:probe")
     assert result.ok, result.log
     yield "envforge-test:probe"
     sandbox.remove_image("envforge-test:probe")
@@ -146,12 +146,10 @@ ENTRYPOINT ["/does-not-exist"]
 
 
 @pytest.fixture(scope="module")
-def broken_image(tmp_path_factory):
+def broken_image():
     """An image whose command cannot be executed. It builds fine; it cannot start."""
-    script = tmp_path_factory.mktemp("broken") / "probe.py"
-    script.write_text(PROBE)
     sandbox = DockerSandbox(LIMITS)
-    result = sandbox.build(BROKEN_ENTRYPOINT, script, "envforge-test:broken")
+    result = sandbox.build(BROKEN_ENTRYPOINT, {"probe.py": PROBE}, "envforge-test:broken")
     assert result.ok, result.log
     yield "envforge-test:broken"
     sandbox.remove_image("envforge-test:broken")
@@ -237,7 +235,8 @@ def test_output_is_bounded(sandbox, image):
 def test_a_broken_dockerfile_fails_the_build_without_raising(sandbox, tmp_path):
     script = tmp_path / "probe.py"
     script.write_text(PROBE)
-    result = sandbox.build("FROM python:3.12-slim\nRUN exit 7\n", script, "envforge-test:bad")
+    result = sandbox.build("FROM python:3.12-slim\nRUN exit 7\n",
+                           {"probe.py": PROBE}, "envforge-test:bad")
     assert not result.ok and result.exit_code != 0
 
 
@@ -259,3 +258,38 @@ def test_a_script_exiting_127_leaves_no_such_account(sandbox, image):
     result = sandbox.run(image, ["exit127"])
     assert result.exit_code == 127
     assert result.start_error == ""
+
+
+def test_build_asserts_its_precondition_and_should_never_fire_in_practice():
+    """This is not a second copy of the workspace's rule, and the distinction matters.
+
+    The workspace owns what a legal filename is: it decides once at ingestion, raises
+    WorkspaceError, and its message is aimed at a person. `build` only states what it
+    requires to be correct, because it writes these names into a directory. Reaching
+    this line means our own code broke a contract, which is what SandboxError means
+    everywhere else in this file: our command was wrong, never anything the script did.
+
+    Two checks are fine when one is the rule and the other is a precondition. Two checks
+    are a problem when a reader cannot tell which is which, so the error type, the
+    message and this name all have to say so."""
+    sandbox = DockerSandbox(LIMITS)
+    for name in ["../escape.py", "sub/dir.py", "..", ".", ""]:
+        with pytest.raises(SandboxError, match="bare filename"):
+            sandbox.build("FROM python:3.12-slim\n", {name: "x"}, "envforge-test:never")
+
+
+@pytest.mark.parametrize("name", ["Dockerfile", "dockerfile", "DOCKERFILE",
+                                  ".dockerignore", ".DockerIgnore"])
+def test_a_context_file_may_not_be_one_the_build_itself_interprets(name):
+    """Found 2026-08-25 and verified against the daemon before this line existed.
+
+    The files loop runs after the gated Dockerfile is written into the context, so a
+    file called Dockerfile overwrote it and the container ran instructions the gate had
+    never seen. Both `Dockerfile` and `dockerfile` built and ran, the second because a
+    case-insensitive filesystem collides them.
+
+    This is not a directory escape, it is a complete bypass of the only check there is,
+    and it is exactly the failure the precondition above claims to prevent."""
+    sandbox = DockerSandbox(LIMITS)
+    with pytest.raises(SandboxError, match="build itself"):
+        sandbox.build("FROM python:3.12-slim\n", {name: "FROM evil"}, "envforge-test:never")

