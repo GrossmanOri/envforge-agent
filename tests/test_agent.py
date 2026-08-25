@@ -10,7 +10,8 @@ from pathlib import Path
 import pytest
 
 from envforge.agent import (
-    EVIDENCE_LIMIT, SCRIPT_LIMIT, Agent, Event, Outcome, bound, default_dockerfile,
+    EVIDENCE_LIMIT, LANGUAGES, SCRIPT_LIMIT, Agent, Event, Outcome, bound,
+    default_dockerfile, language_for,
 )
 from envforge.llm import Call, InvalidArguments, Refused, Truncated
 from envforge.sandbox import BuildResult, DockerSandbox, Limits, RunResult
@@ -265,6 +266,38 @@ def test_a_fallback_that_does_not_build_stops_instead_of_asking_again(script):
     assert outcome.ok is False and outcome.reason == "our fallback Dockerfile did not build"
     assert llm.queue == []                  # never asked a third time
     assert outcome.build is not None and outcome.used_fallback
+
+
+# --- reading the language off the filename ------------------------------------------------
+
+@pytest.mark.parametrize("filename, expected", [
+    ("s.py", "python"), ("S.PY", "python"),
+    ("s.sh", "bash"), ("s.bash", "bash"),
+    ("s.c", None), ("s.rb", None), ("Makefile", None), ("s", None),
+    ("s.py.txt", None),          # the last suffix is what counts, as it does to a shell
+])
+def test_language_comes_from_the_extension_and_nothing_else(filename, expected):
+    """Only the extension, deliberately. A shebang would be more accurate and would
+    mean reading attacker-controlled content to make the decision, and the override
+    flag the CLI will carry covers the cases an extension cannot answer."""
+    assert language_for(Path(filename)) == expected
+
+
+def test_every_language_in_the_table_is_reachable_from_a_filename():
+    """A language nobody can name is a language nobody can run."""
+    for name, language in LANGUAGES.items():
+        assert language_for(Path("s" + language.extensions[0])) == name
+
+
+def test_the_table_is_the_only_place_a_language_is_defined():
+    """One table, so adding a language is one entry rather than three that can
+    disagree. The gate is not one of them on purpose: it decides what may run during
+    a build and has no business knowing what language anything is."""
+    from envforge import gate
+    assert "LANGUAGES" not in dir(gate)
+    for name, language in LANGUAGES.items():
+        dockerfile = default_dockerfile(name, "s" + language.extensions[0])
+        assert language.base_image in dockerfile and language.command in dockerfile
 
 
 # --- languages we do not handle ----------------------------------------------------------

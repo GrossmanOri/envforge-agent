@@ -91,7 +91,7 @@ as written. The registry-host rule stops the daemon pulling from a host the atta
 named; it does not make the image trustworthy.
 
 Sitting 4 of 11 complete: `envforge/agent.py` and `tests/test_agent.py`.
-167 tests, 154 needing neither Docker nor an API key, 13 against the real daemon.
+178 tests, 165 needing neither Docker nor an API key, 13 against the real daemon.
 
 ## What sitting 4 produced
 The plain repair loop. It defines `write_dockerfile` against the schema `Tool` already
@@ -267,10 +267,35 @@ An unsupported language is now refused before the model is consulted at all, and
 refusal is an `Outcome` like any other rather than an exception. Bash also gained its
 first test, having been claimed since the first commit and exercised by nothing.
 
-What a third language actually needs is not a `DEFAULT_BASE` entry. It is an entry in the
+Where the label comes from, decided 2026-08-25 after a second model reviewed it: the file
+extension, with a CLI flag to override, and never the model. `language_for()` reads the
+extension and nothing else. A shebang would be more accurate and would mean reading
+attacker-controlled content to make the decision.
+
+The honest form of that rule matters, because the first version of it was wrong. "The
+model may not decide the language" is not a security rule here. A model-decided label is
+still bounded by the door check, so it could only steer between python, bash and refusal,
+and the gate checks whatever follows either way. It survives as an engineering rule for
+two concrete reasons rather than as a principle. Asking the model would mean every run
+sends attacker text to a model before the door check, which is exactly what the door check
+was added to prevent. And the refusal boundary would become steerable by script content: a
+Ruby file opening with a comment claiming to be Python could flip itself from refused to
+attempted, so the same file would not be handled the same way twice.
+
+`DEFAULT_BASE` and `DEFAULT_COMMAND` are now one `LANGUAGES` table, so adding a language is
+one entry rather than three that can disagree. The gate deliberately does not import it: it
+decides what may run during a build and has no business knowing what language anything is.
+
+What a third language actually needs is not a `LANGUAGES` entry. It is an entry in the
 gate's `RUN_COMMANDS`, which today permits `pip` and `apt-get` and nothing else, so a Ruby
 script with a gem dependency or a Node script with an npm dependency cannot be built no
 matter what the model writes.
+
+A wrong label cannot cost a compromise, but it can cost an honest report, and that belongs
+to sitting 7. Label a bash script as python, the fallback runs `python /app/s.sh`, it exits
+1 on a syntax error, and the loop calls that terminal with `ok=True` because a nonzero exit
+is the verdict's problem rather than the loop's. The verdict would then be formed from a
+run in which the script's own logic never executed.
 
 ## Known gaps
 Nothing has hit a real provider. The request shape is asserted against our own builders and
