@@ -428,6 +428,17 @@ Three decisions worth naming:
 in without touching a caller: an upload has no directory, and a build running as a
 Kubernetes Job has no host filesystem to point at.
 
+Nothing calls `gather()` yet, and that matters more than it sounds. The script is still
+read from disk twice: once at `agent.py` for the prompt, and again by `shutil.copy` inside
+`sandbox.build` when the build context is assembled. Between those two reads the file can
+change, so the model can review one script while the container runs another, and the
+verdict would then describe a file that never executed. The two readers also disagree
+about encoding: the workspace refuses invalid UTF-8 and the agent silently replaces it.
+
+So "read once, held in memory" is a property this module makes possible and does not yet
+provide. Wiring `Sandbox.build` onto workspace contents instead of a `Path` is the next
+piece of sitting 6, and every sitting 7 decision assumes it.
+
 Still to come in sitting 6: the manifest build context, the slimmed `Outcome`, the event
 names, and the token budget.
 
