@@ -97,7 +97,7 @@ as written. The registry-host rule stops the daemon pulling from a host the atta
 named; it does not make the image trustworthy.
 
 Sitting 4 of 11 complete: `envforge/agent.py` and `tests/test_agent.py`.
-178 tests, 165 needing neither Docker nor an API key, 13 against the real daemon.
+190 tests, 177 needing neither Docker nor an API key, 13 against the real daemon.
 
 ## What sitting 4 produced
 The plain repair loop. It defines `write_dockerfile` against the schema `Tool` already
@@ -407,6 +407,170 @@ Evidence from a first-attempt unusable reply was computed and dropped, because t
 previous Dockerfile and the opening template has no slot for it. There is now a third
 template, `RETRY`, for the case where the reply was unusable but there is nothing to
 correct. The test asserts the two prompts differ.
+
+## Sitting 6, first of five
+`envforge/workspace.py`. The only code in the project that handles a path.
+
+Tools and the sandbox will ask for names and contents and never receive a path, so there
+is no path left for anything to manipulate. Everything that can go wrong with a filesystem
+happens once, at ingestion, rather than on every read. That is the whole design: a
+`requirements.txt` beside an untrusted script was discovered rather than chosen, and
+resolving it once and checking where it landed is a rule that holds forever, while
+checking a path at each use is a rule that holds until somebody adds a use.
+
+Three decisions worth naming:
+
+1. Resolve first, then check containment. A prefix check on the joined path passes a
+   `requirements.txt` symlinked to `~/.ssh/id_ed25519`, because the joined path is inside
+   the directory and only the target is not.
+2. The script and its siblings are treated differently. A symlinked script is followed,
+   because the user named that file and following it is doing what they asked, and the
+   root becomes wherever it actually lives. Siblings were discovered rather than named, so
+   they may not resolve outside that root.
+3. Siblings come from a fixed menu per language, held in the `LANGUAGES` table, rather
+   than from a caller-supplied path or a pattern. Traversal has nothing to traverse.
+
+`Files` holds contents rather than locations, which is what makes the later versions drop
+in without touching a caller: an upload has no directory, and a build running as a
+Kubernetes Job has no host filesystem to point at.
+
+Nothing calls `gather()` yet, and that matters more than it sounds. The script is still
+read from disk twice: once at `agent.py` for the prompt, and again by `shutil.copy` inside
+`sandbox.build` when the build context is assembled. Between those two reads the file can
+change, so the model can review one script while the container runs another, and the
+verdict would then describe a file that never executed. The two readers also disagree
+about encoding: the workspace refuses invalid UTF-8 and the agent silently replaces it.
+
+So "read once, held in memory" is a property this module makes possible and does not yet
+provide. Wiring `Sandbox.build` onto workspace contents instead of a `Path` is the next
+piece of sitting 6, and every sitting 7 decision assumes it.
+
+Still to come in sitting 6: the manifest build context, the slimmed `Outcome`, the event
+names, and the token budget.
+
+## Prompts move to a module, decided 2026-08-25
+Before the tool loop, and as `envforge/prompts.py` rather than as text files.
+
+The reason is not tidiness and is not tool descriptions. A tool description is glued to its
+JSON schema and the schema is code, so they change as a unit and stay together. The reason
+is the failure this sitting produced three times: the `/app` trap, the `--upgrade pip`
+reflex and the missing `-y` were all the prompt describing the gate by hand while nobody
+consulted the gate.
+
+A module can import `INSTRUCTIONS`, `RUN_COMMANDS` and `RUN_FLAGS` and render the prompt's
+lists from the gate's own constants, so that class of drift becomes impossible rather than
+repeatedly fixed. A text file cannot. The limit is worth stating: derivation covers the
+lists. The prose rules, the exec-form explanation and the `-y` build-time fact can still
+drift, and nothing mechanical prevents it.
+
+It must be a separate module rather than code inside `agent.py`, because `agent.py`
+deliberately does not import `gate.py`: the `Gate` Protocol is local and the concrete gate
+arrives as a constructor argument. `prompts.py` imports the gate constants and hands
+`agent.py` finished strings, and the seam survives.
+
+Deviation from CLAUDE.md, named rather than smuggled: it says prompts live as files
+parameterised by language. This is one module and no per-language split, because nothing is
+per-language yet. The gate is language-agnostic and the only per-language facts already
+live in `LANGUAGES`. A split now is scaffolding for a tenant who has not arrived.
+
+## The deterministic inspection layer, decided 2026-08-25
+Ori's proposal, closing the observability gap without the second model call Ben's design
+uses. Accepted with two corrections.
+
+It is a different thing rather than the same thing in a costume. Ben's intermediate is a
+decision made visible, and its flaw is that the decision binds the step with more context.
+This is evidence made visible, and evidence binds nothing. It is also the artifact the
+trace's provenance field wants: records whose author is us.
+
+The correction that matters: the proposal bundles two diffs of very different quality.
+Manifest against the Dockerfile is sound, because both sides are package names, needs PEP
+503 canonicalisation so `Flask` and `flask` do not read as a conflict, and is built first.
+Imports against the manifest is not sound and never can be, because `cv2` and
+`opencv-python-headless` are one dependency wearing two names. That half is two unmatched
+lists a reader pairs by eye, and the word "conflict" never appears on it. A record that
+calls an unmatched name a conflict is a record that lies, and it is the record an
+interviewer asks to see.
+
+The record is held back, never injected into the prompt. The strongest reason is not that
+injecting recreates Ben's early binding, though it does. It is that a diff computed against
+data we handed the model measures compliance rather than competence: agreement with a list
+it never saw is evidence, and agreement with a list we gave it is nothing. Two more: our
+list is incomplete by construction, since dynamic imports are exactly where `ast` fails, so
+an anchored model gets worse precisely where reading beats parsing. And sitting 7's exit
+ticket is a run where the model's investigation changed the outcome, which stops being
+attributable to the tools if a digest was injected.
+
+`ast.parse` executes nothing, the input is already bounded at 64KB by the workspace, and a
+parse failure is data rather than an error path. Walk the whole tree rather than the top
+level, since function-local imports are syntactically visible, and filter the standard
+library or every `import os` becomes noise. The honest claim is "import statements present
+in the source", never "what the script needs".
+
+The bonus nobody was looking for: an unparseable `.py` is a deterministic witness for the
+mislabel gap recorded above, catching a bash script labelled python at ingestion rather
+than after a container run is spent on it. Whether that refuses or merely records will be
+decided on real cases rather than in advance.
+
+Not to be built, written down because the machinery makes it tempting: once a deterministic
+manifest parser exists, a model-free fallback transcribing manifest lines into installs is
+one afternoon away. Today's fallback installs nothing, so a refusal degrades a run. A
+transcribing fallback would install attacker-named packages with no model involved, turning
+refusal from degrade into escalate.
+
+## Sitting 7 policy, decided 2026-08-25 before any of it is built
+The tools exist for one reason worth stating plainly: an import name is not a package name.
+`import cv2` needs `opencv-python-headless`, and no amount of reading the script reveals
+that while a `requirements.txt` states it. That single case is what makes the tools
+load-bearing rather than decorative, and a run where the manifest changed the outcome is
+the demo the whole sitting has to produce.
+
+What a manifest is here. It sits beside the script, we never write it, a developer did, so
+it is untrusted text exactly like the script. It is optional: only the script is required
+and a run without a manifest proceeds normally. Our product remains the Dockerfile, so a
+dependency the manifest states is expressed as a `RUN ["pip", "install", ...]` line rather
+than by copying the file.
+
+**One model call, not two.** Ben's project has an `identify_technologies` node producing a
+base image and package lists before a separate node writes the Dockerfile. We keep one
+call.
+
+The reason has to be stated correctly, because the first version of it was wrong. It is
+not that an intermediate summary discards information: his `generate_dockerfile` receives
+the full script content alongside the identified packages, so nothing is lost. What
+actually happens is that a decision is made early and then made binding. That node's system
+prompt says "Use the provided base image", so a wrong identification cannot be corrected by
+the step that has more context, and the `reasoning` field explaining the choice is dropped
+from state entirely. Verified by reading `identify_technologies.py` and
+`generate_dockerfile.py` rather than inferred from the graph.
+
+The tool loop makes the question mostly moot anyway, because the model reads the manifest
+instead of inferring from imports, which is a fact rather than a conclusion.
+
+**When the manifest and the model disagree, the file wins.** Not because the file is more
+trustworthy: it is the same untrusted text. Because somebody wrote it deliberately for this
+project while the model is generalising from other projects, and explicit intent beats a
+guess.
+
+The exception is an import in the script with no corresponding line in the manifest. The
+model adds it, because the file is silent rather than contradictory.
+
+Every conflict is recorded and reported: the file said X, the model wanted Y, X was
+installed. That record is also the evidence that the tools changed an outcome, which is
+exactly what an interviewer will ask to see.
+
+**A package the model believes is malicious does not stop anything.** It is written into
+the report, shown to the user, and gates nothing, which is the same shape as the refusal
+policy above.
+
+Two reasons rather than one. The manifest is attacker-controlled text entering a prompt, so
+a malicious package can arrive with a comment claiming it is an internal library. And
+typosquatting is invisible to a well-intentioned model: `reqeusts` looks like nothing at
+all.
+
+What actually holds instead is already built. The gate refuses URLs, git references, local
+paths and `--index-url`, so a package can only arrive by name from the default index.
+Beyond that, containment is the container, which is the `pip install` argument in general,
+and the real fix is the offline install after pre-resolution recorded in LATER.
 
 ## Next
 Sitting 6 is the five shapes, which needs no model at all.

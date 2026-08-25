@@ -37,10 +37,14 @@ class Language:
     extensions: tuple[str, ...]
     base_image: str
     command: str
+    # Filenames worth gathering from beside the script. A fixed menu rather than a
+    # path the caller supplies, so directory traversal has nothing to traverse.
+    siblings: tuple[str, ...] = ()
 
 
 LANGUAGES = {
-    "python": Language((".py",), "python:3.12-slim", "python"),
+    "python": Language((".py",), "python:3.12-slim", "python",
+                       siblings=("requirements.txt", "pyproject.toml", "Pipfile")),
     "bash": Language((".sh", ".bash"), "debian:12-slim", "bash"),
 }
 
