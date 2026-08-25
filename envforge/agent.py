@@ -23,8 +23,38 @@ from .sandbox import BuildResult, RunResult, Sandbox
 SCRIPT_LIMIT = 8_192
 EVIDENCE_LIMIT = 4_096
 
-DEFAULT_BASE = {"python": "python:3.12-slim", "bash": "debian:12-slim"}
-DEFAULT_COMMAND = {"python": "python", "bash": "bash"}
+@dataclass(frozen=True)
+class Language:
+    """One supported language, in one place.
+
+    Adding an entry here does not add a language. The gate decides what may run
+    during a build, and it permits pip and apt-get only, so a language whose
+    dependencies come from gem or npm cannot be built whatever this table says.
+    The gate deliberately does not import this table: it has no business knowing
+    what language anything is.
+    """
+
+    extensions: tuple[str, ...]
+    base_image: str
+    command: str
+
+
+LANGUAGES = {
+    "python": Language((".py",), "python:3.12-slim", "python"),
+    "bash": Language((".sh", ".bash"), "debian:12-slim", "bash"),
+}
+
+
+def language_for(script: Path) -> str | None:
+    """The language a filename claims, or None.
+
+    Deliberately only the extension. A shebang would be more accurate and would
+    mean reading attacker-controlled content to decide, and the override exists
+    for the cases an extension cannot answer.
+    """
+    suffix = script.suffix.lower()
+    return next((name for name, language in LANGUAGES.items()
+                 if suffix in language.extensions), None)
 
 WRITE_DOCKERFILE = Tool(
     name="write_dockerfile",
@@ -161,13 +191,13 @@ def default_dockerfile(language: str, name: str) -> str:
     Its existence is what makes a refusal survivable without asking again. It goes
     through the same gate as anything the model wrote: one path to the daemon.
     """
-    if language not in DEFAULT_BASE:
+    if language not in LANGUAGES:
         raise ValueError(f"no fallback Dockerfile for {language!r}")
     return (
-        f"FROM {DEFAULT_BASE[language]}\n"
+        f"FROM {LANGUAGES[language].base_image}\n"
         f"COPY {name} /app/{name}\n"
         f"USER 65534:65534\n"
-        f'ENTRYPOINT ["{DEFAULT_COMMAND[language]}", "/app/{name}"]\n'
+        f'ENTRYPOINT ["{LANGUAGES[language].command}", "/app/{name}"]\n'
     )
 
 
@@ -226,12 +256,12 @@ class Agent:
 
     def run(self, script: Path, language: str,
             args: Sequence[str] = ()) -> Iterator[Event]:
-        if language not in DEFAULT_BASE:
+        if language not in LANGUAGES:
             # Refused at the door rather than half-attempted. Without this the model is
             # asked anyway and usually produces something, but there is no fallback
             # Dockerfile for the language, so a refusal used to raise ValueError out of
             # the generator. Half-working is also what the README promises not to do.
-            supported = ", ".join(sorted(DEFAULT_BASE))
+            supported = ", ".join(sorted(LANGUAGES))
             yield Event("finished", f"{language} is not supported",
                         {"outcome": Outcome(
                             ok=False,
@@ -262,7 +292,7 @@ class Agent:
                     if len(refusals) <= self.max_refusals:
                         continue  # the refusal counter, never the repair counter
                     dockerfile = default_dockerfile(language, script.name)
-                    base_image = DEFAULT_BASE[language]
+                    base_image = LANGUAGES[language].base_image
                     used_fallback = True
                     yield Event("fell_back", "refused twice, using our own Dockerfile")
                 except (InvalidArguments, Truncated, LLMError) as exc:
