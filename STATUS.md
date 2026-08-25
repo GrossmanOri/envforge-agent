@@ -442,6 +442,75 @@ piece of sitting 6, and every sitting 7 decision assumes it.
 Still to come in sitting 6: the manifest build context, the slimmed `Outcome`, the event
 names, and the token budget.
 
+## Prompts move to a module, decided 2026-08-25
+Before the tool loop, and as `envforge/prompts.py` rather than as text files.
+
+The reason is not tidiness and is not tool descriptions. A tool description is glued to its
+JSON schema and the schema is code, so they change as a unit and stay together. The reason
+is the failure this sitting produced three times: the `/app` trap, the `--upgrade pip`
+reflex and the missing `-y` were all the prompt describing the gate by hand while nobody
+consulted the gate.
+
+A module can import `INSTRUCTIONS`, `RUN_COMMANDS` and `RUN_FLAGS` and render the prompt's
+lists from the gate's own constants, so that class of drift becomes impossible rather than
+repeatedly fixed. A text file cannot. The limit is worth stating: derivation covers the
+lists. The prose rules, the exec-form explanation and the `-y` build-time fact can still
+drift, and nothing mechanical prevents it.
+
+It must be a separate module rather than code inside `agent.py`, because `agent.py`
+deliberately does not import `gate.py`: the `Gate` Protocol is local and the concrete gate
+arrives as a constructor argument. `prompts.py` imports the gate constants and hands
+`agent.py` finished strings, and the seam survives.
+
+Deviation from CLAUDE.md, named rather than smuggled: it says prompts live as files
+parameterised by language. This is one module and no per-language split, because nothing is
+per-language yet. The gate is language-agnostic and the only per-language facts already
+live in `LANGUAGES`. A split now is scaffolding for a tenant who has not arrived.
+
+## The deterministic inspection layer, decided 2026-08-25
+Ori's proposal, closing the observability gap without the second model call Ben's design
+uses. Accepted with two corrections.
+
+It is a different thing rather than the same thing in a costume. Ben's intermediate is a
+decision made visible, and its flaw is that the decision binds the step with more context.
+This is evidence made visible, and evidence binds nothing. It is also the artifact the
+trace's provenance field wants: records whose author is us.
+
+The correction that matters: the proposal bundles two diffs of very different quality.
+Manifest against the Dockerfile is sound, because both sides are package names, needs PEP
+503 canonicalisation so `Flask` and `flask` do not read as a conflict, and is built first.
+Imports against the manifest is not sound and never can be, because `cv2` and
+`opencv-python-headless` are one dependency wearing two names. That half is two unmatched
+lists a reader pairs by eye, and the word "conflict" never appears on it. A record that
+calls an unmatched name a conflict is a record that lies, and it is the record an
+interviewer asks to see.
+
+The record is held back, never injected into the prompt. The strongest reason is not that
+injecting recreates Ben's early binding, though it does. It is that a diff computed against
+data we handed the model measures compliance rather than competence: agreement with a list
+it never saw is evidence, and agreement with a list we gave it is nothing. Two more: our
+list is incomplete by construction, since dynamic imports are exactly where `ast` fails, so
+an anchored model gets worse precisely where reading beats parsing. And sitting 7's exit
+ticket is a run where the model's investigation changed the outcome, which stops being
+attributable to the tools if a digest was injected.
+
+`ast.parse` executes nothing, the input is already bounded at 64KB by the workspace, and a
+parse failure is data rather than an error path. Walk the whole tree rather than the top
+level, since function-local imports are syntactically visible, and filter the standard
+library or every `import os` becomes noise. The honest claim is "import statements present
+in the source", never "what the script needs".
+
+The bonus nobody was looking for: an unparseable `.py` is a deterministic witness for the
+mislabel gap recorded above, catching a bash script labelled python at ingestion rather
+than after a container run is spent on it. Whether that refuses or merely records will be
+decided on real cases rather than in advance.
+
+Not to be built, written down because the machinery makes it tempting: once a deterministic
+manifest parser exists, a model-free fallback transcribing manifest lines into installs is
+one afternoon away. Today's fallback installs nothing, so a refusal degrades a run. A
+transcribing fallback would install attacker-named packages with no model involved, turning
+refusal from degrade into escalate.
+
 ## Sitting 7 policy, decided 2026-08-25 before any of it is built
 The tools exist for one reason worth stating plainly: an import name is not a package name.
 `import cv2` needs `opencv-python-headless`, and no amount of reading the script reveals
