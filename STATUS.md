@@ -431,6 +431,61 @@ Kubernetes Job has no host filesystem to point at.
 Still to come in sitting 6: the manifest build context, the slimmed `Outcome`, the event
 names, and the token budget.
 
+## Sitting 7 policy, decided 2026-08-25 before any of it is built
+The tools exist for one reason worth stating plainly: an import name is not a package name.
+`import cv2` needs `opencv-python-headless`, and no amount of reading the script reveals
+that while a `requirements.txt` states it. That single case is what makes the tools
+load-bearing rather than decorative, and a run where the manifest changed the outcome is
+the demo the whole sitting has to produce.
+
+What a manifest is here. It sits beside the script, we never write it, a developer did, so
+it is untrusted text exactly like the script. It is optional: only the script is required
+and a run without a manifest proceeds normally. Our product remains the Dockerfile, so a
+dependency the manifest states is expressed as a `RUN ["pip", "install", ...]` line rather
+than by copying the file.
+
+**One model call, not two.** Ben's project has an `identify_technologies` node producing a
+base image and package lists before a separate node writes the Dockerfile. We keep one
+call.
+
+The reason has to be stated correctly, because the first version of it was wrong. It is
+not that an intermediate summary discards information: his `generate_dockerfile` receives
+the full script content alongside the identified packages, so nothing is lost. What
+actually happens is that a decision is made early and then made binding. That node's system
+prompt says "Use the provided base image", so a wrong identification cannot be corrected by
+the step that has more context, and the `reasoning` field explaining the choice is dropped
+from state entirely. Verified by reading `identify_technologies.py` and
+`generate_dockerfile.py` rather than inferred from the graph.
+
+The tool loop makes the question mostly moot anyway, because the model reads the manifest
+instead of inferring from imports, which is a fact rather than a conclusion.
+
+**When the manifest and the model disagree, the file wins.** Not because the file is more
+trustworthy: it is the same untrusted text. Because somebody wrote it deliberately for this
+project while the model is generalising from other projects, and explicit intent beats a
+guess.
+
+The exception is an import in the script with no corresponding line in the manifest. The
+model adds it, because the file is silent rather than contradictory.
+
+Every conflict is recorded and reported: the file said X, the model wanted Y, X was
+installed. That record is also the evidence that the tools changed an outcome, which is
+exactly what an interviewer will ask to see.
+
+**A package the model believes is malicious does not stop anything.** It is written into
+the report, shown to the user, and gates nothing, which is the same shape as the refusal
+policy above.
+
+Two reasons rather than one. The manifest is attacker-controlled text entering a prompt, so
+a malicious package can arrive with a comment claiming it is an internal library. And
+typosquatting is invisible to a well-intentioned model: `reqeusts` looks like nothing at
+all.
+
+What actually holds instead is already built. The gate refuses URLs, git references, local
+paths and `--index-url`, so a package can only arrive by name from the default index.
+Beyond that, containment is the container, which is the `pip install` argument in general,
+and the real fix is the offline install after pre-resolution recorded in LATER.
+
 ## Next
 Sitting 6 is the five shapes, which needs no model at all.
 Sitting 7 is the tool loop, whose entry ticket is one live Anthropic call and whose exit
