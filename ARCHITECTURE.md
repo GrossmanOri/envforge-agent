@@ -149,6 +149,19 @@ wherever it actually lives; siblings were discovered rather than named and may n
 that root. Not yet wired: the script is still read twice, once for the prompt and once when
 the build context is assembled.
 
+### ADR-013: the outcome carries totals, the event stream carries the bodies
+Decided 2026-08-25, revised 2026-08-27. `Outcome` held every `Call`, and a `Call` holds the
+full request and response JSON. Harmless at four small calls and megabytes once a tool loop
+runs fifteen turns, on the one event every consumer must hold. It now carries a `Usage` of
+counts and token totals plus a full UUID `run_id`; the whole `Call` rides the `wrote` event,
+which carries the same `run_id`. `Usage.calls` counts every request sent to the model, while
+its token totals count only replies that returned usage. Rejected: dropping the bodies until
+the trace module exists, which would lose the wire JSON the trace is being built to record.
+
+Raw provider bodies for refusals, truncations and invalid replies are not yet preserved.
+They need error types that retain provider wire data, so the trace module in sitting 8 owns
+that design rather than adding half a trace to the repair loop.
+
 ## What crosses each boundary
 
 | from | to | payload |

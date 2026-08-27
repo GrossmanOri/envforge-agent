@@ -97,7 +97,7 @@ as written. The registry-host rule stops the daemon pulling from a host the atta
 named; it does not make the image trustworthy.
 
 Sitting 4 of 11 complete: `envforge/agent.py` and `tests/test_agent.py`.
-205 tests, 192 needing neither Docker nor an API key, 13 against the real daemon.
+207 tests, 194 needing neither Docker nor an API key, 13 against the real daemon.
 
 ## What sitting 4 produced
 The plain repair loop. It defines `write_dockerfile` against the schema `Tool` already
@@ -477,7 +477,31 @@ replacement characters, because the agent read with `errors="replace"`. There is
 reader now and it is strict, so such a script is refused at ingestion. Defensible, but a
 decision rather than a consequence.
 
-Still to come in sitting 6: the slimmed `Outcome`, the event names, and the token budget.
+## Sitting 6, third of five
+`Outcome` carries totals rather than payloads. It held every `Call`, and a `Call` holds the
+full request and response JSON, which is harmless at four small calls and megabytes once a
+tool loop runs fifteen turns, on the one event every consumer has to hold.
+
+It now carries a `Usage` of call count and token totals, plus a `run_id`. The whole `Call`
+rides the `wrote` event instead, where a consumer reads it and lets it go, which is what
+the event stream was for. `run_id` is what ties the summary back to the bodies once they
+are elsewhere.
+
+The alternative was dropping the bodies until the trace module exists, which would have
+thrown away the wire JSON the trace is being built to record.
+
+Review correction, 2026-08-27: a 5.6 Sol review found that the `wrote` event carried a
+`Call` but no `run_id`, and that the old eight-character ID could collide across long-lived
+traces. `run_id` is now a full UUID, created before every terminal path including an
+unsupported language, and carried on `wrote`. `Usage.calls` now counts every request sent,
+including a refusal, while token totals remain limited to replies that returned usage.
+Two new tests cover the full ID and the unsupported-language path. 207 tests pass.
+
+The same review asked for raw request and response bodies on failed provider replies. That
+needs the provider error types to retain wire data, so it is deferred explicitly to sitting
+8's trace design and recorded in `private/LATER.md` rather than half-built here.
+
+Still to come in sitting 6: the event names, and the token budget.
 
 Still to come in sitting 6: the manifest build context, the slimmed `Outcome`, the event
 names, and the token budget.
