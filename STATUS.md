@@ -490,6 +490,17 @@ are elsewhere.
 The alternative was dropping the bodies until the trace module exists, which would have
 thrown away the wire JSON the trace is being built to record.
 
+Review correction, 2026-08-27: a 5.6 Sol review found that the `wrote` event carried a
+`Call` but no `run_id`, and that the old eight-character ID could collide across long-lived
+traces. `run_id` is now a full UUID, created before every terminal path including an
+unsupported language, and carried on `wrote`. `Usage.calls` now counts every request sent,
+including a refusal, while token totals remain limited to replies that returned usage.
+Two new tests cover the full ID and the unsupported-language path. 207 tests pass.
+
+The same review asked for raw request and response bodies on failed provider replies. That
+needs the provider error types to retain wire data, so it is deferred explicitly to sitting
+8's trace design and recorded in `private/LATER.md` rather than half-built here.
+
 Still to come in sitting 6: the event names, and the token budget.
 
 Still to come in sitting 6: the manifest build context, the slimmed `Outcome`, the event

@@ -117,8 +117,10 @@ def test_the_outcome_carries_totals_and_the_stream_carries_the_bodies(script):
 
 def test_the_run_id_ties_the_summary_back_to_the_stream(script):
     """The outcome no longer holds the bodies, so it has to say which run they belong to."""
-    _, _, outcome = drive(Agent(FakeLLM(_call()), FakeSandbox(), ALLOW), script)
-    assert outcome.run_id and len(outcome.run_id) == 8
+    events, _, outcome = drive(Agent(FakeLLM(_call()), FakeSandbox(), ALLOW), script)
+    assert outcome.run_id and len(outcome.run_id) == 32
+    wrote = [event for event in events if event.kind == "wrote"]
+    assert all(event.data["run_id"] == outcome.run_id for event in wrote)
 
 
 def test_one_attempt_when_nothing_fails(script):
@@ -225,7 +227,8 @@ def test_a_refusal_retries_without_spending_a_repair_attempt(script):
     # Three asks, two attempts. The refusal cost a model call and nothing else;
     # the build failure is the only thing that consumed an attempt.
     assert kinds.count("asking") == 3 and kinds.count("refused") == 1
-    assert outcome.attempts == 2 and outcome.usage.calls == 2 and outcome.ok
+    assert outcome.attempts == 2 and outcome.usage == Usage(calls=3, input_tokens=2,
+                                                             output_tokens=2) and outcome.ok
     assert outcome.refusals == [{"category": "cyber"}]
 
 
@@ -390,6 +393,7 @@ def test_an_unsupported_language_is_refused_at_the_door(tmp_path):
     assert [e.kind for e in events] == ["finished"]
     assert outcome.ok is False and "not 'ruby'" in outcome.reason
     assert "bash, python" in outcome.reason
+    assert outcome.run_id and len(outcome.run_id) == 32
 
 
 def test_an_unsupported_language_used_to_crash_on_a_refusal(tmp_path):
