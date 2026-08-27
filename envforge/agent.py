@@ -182,10 +182,26 @@ class Event:
 
 
 @dataclass(frozen=True)
+class Usage:
+    """What a run cost, as numbers rather than payloads."""
+
+    calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+@dataclass(frozen=True)
 class Outcome:
     """Carried on the final event rather than returned, because a generator's return
-    value is invisible to anything that does not drive it by hand, and the graph
-    engine in sitting 5 will not reproduce that shape."""
+    value is invisible to anything that does not drive it by hand, and a graph engine
+    will not reproduce that shape.
+
+    Totals rather than payloads. This used to hold every `Call`, and a `Call` holds the
+    full request and response JSON. At four small calls that was harmless; a tool loop
+    makes it megabytes on the one event every consumer has to hold. The bodies ride the
+    event stream instead, where each is consumed and released, and `run_id` is what ties
+    them back to this summary.
+    """
 
     ok: bool
     reason: str
@@ -193,9 +209,10 @@ class Outcome:
     build: BuildResult | None = None
     run: RunResult | None = None
     attempts: int = 0
-    calls: list[Call] = field(default_factory=list)
+    usage: Usage = field(default_factory=Usage)
     refusals: list[Any] = field(default_factory=list)
     used_fallback: bool = False
+    run_id: str = ""
 
 
 def bound(text: str, limit: int) -> str:
@@ -267,15 +284,16 @@ class Agent:
         return self.llm.call(SYSTEM, user, WRITE_DOCKERFILE)
 
     @staticmethod
-    def _dead_end(reason: str, *, attempt: int, calls: list[Call], refusals: list[Any],
-                  dockerfile: str, build: BuildResult | None = None,
+    def _dead_end(reason: str, *, attempt: int, usage: Usage, refusals: list[Any],
+                  dockerfile: str, run_id: str, build: BuildResult | None = None,
                   run: RunResult | None = None) -> Event:
         """The end of the road, always after the fallback. Three different things can
         go wrong with a Dockerfile we wrote ourselves, and in all three the honest
         move is to stop and say which, never to ask the model again."""
         return Event("finished", reason, {"outcome": Outcome(
             ok=False, reason=reason, dockerfile=dockerfile, build=build, run=run,
-            attempts=attempt, calls=calls, refusals=refusals, used_fallback=True)})
+            attempts=attempt, usage=usage, refusals=refusals, used_fallback=True,
+            run_id=run_id)})
 
     def run(self, workspace: Workspace, language: str,
             args: Sequence[str] = ()) -> Iterator[Event]:
@@ -300,8 +318,12 @@ class Agent:
         text = bound(workspace.read(script), SCRIPT_LIMIT)
         files = {name: workspace.read(name) for name in workspace.names()}
         run_id = uuid.uuid4().hex[:8]
-        calls: list[Call] = []
+        calls = input_tokens = output_tokens = 0
         refusals: list[Any] = []
+
+        def usage() -> Usage:
+            return Usage(calls, input_tokens, output_tokens)
+
         dockerfile: str | None = None
         base_image: str = ""
         previous: str | None = None
@@ -331,11 +353,16 @@ class Agent:
                     evidence = str(exc)   # RETRY's own heading already says what it is
                     break
                 else:
-                    calls.append(call)
+                    calls += 1
+                    input_tokens += call.input_tokens
+                    output_tokens += call.output_tokens
                     dockerfile = call.arguments["dockerfile"]
                     base_image = call.arguments["base_image"]
+                    # The whole Call, bodies included, goes on the event rather than
+                    # into the outcome. A consumer that wants the wire JSON reads it
+                    # here and lets it go; the trace module is one such consumer.
                     yield Event("wrote", f"got {len(dockerfile)} characters",
-                                {"base_image": base_image})
+                                {"base_image": base_image, "call": call})
 
             if dockerfile is None:
                 continue  # the unusable-reply path, having spent this attempt
@@ -347,7 +374,8 @@ class Agent:
                 yield Event("gate_rejected", rejection, {"dockerfile": dockerfile})
                 if used_fallback:
                     yield self._dead_end(f"our fallback Dockerfile was rejected: {rejection}",
-                                         attempt=attempt, calls=calls, refusals=refusals,
+                                         attempt=attempt, usage=usage(), refusals=refusals,
+                                         run_id=run_id,
                                          dockerfile=dockerfile)
                     return
                 previous, dockerfile = dockerfile, None
@@ -365,7 +393,8 @@ class Agent:
                     # and the gate check above would then have blamed us for a
                     # Dockerfile the model wrote.
                     yield self._dead_end("our fallback Dockerfile did not build",
-                                         attempt=attempt, calls=calls, refusals=refusals,
+                                         attempt=attempt, usage=usage(), refusals=refusals,
+                                         run_id=run_id,
                                          dockerfile=dockerfile, build=build)
                     return
                 previous, dockerfile = dockerfile, None
@@ -382,7 +411,8 @@ class Agent:
                 yield Event("exec_failed", f"the container never started: {result.start_error}")
                 if used_fallback:
                     yield self._dead_end("our fallback image could not run its command",
-                                         attempt=attempt, calls=calls, refusals=refusals,
+                                         attempt=attempt, usage=usage(), refusals=refusals,
+                                         run_id=run_id,
                                          dockerfile=dockerfile, build=build, run=result)
                     return
                 previous, dockerfile = dockerfile, None
@@ -394,12 +424,14 @@ class Agent:
             yield Event("finished", f"the script ran and exited {result.exit_code}",
                         {"outcome": Outcome(
                             ok=True, reason="the script ran", dockerfile=dockerfile,
-                            build=build, run=result, attempts=attempt, calls=calls,
-                            refusals=refusals, used_fallback=used_fallback)})
+                            build=build, run=result, attempts=attempt, usage=usage(),
+                            refusals=refusals, used_fallback=used_fallback,
+                            run_id=run_id)})
             return
 
         yield Event("finished", f"gave up after {attempt} attempts",
                     {"outcome": Outcome(
                         ok=False, reason=f"no Dockerfile worked in {attempt} attempts",
-                        dockerfile=previous, attempts=attempt, calls=calls,
-                        refusals=refusals, used_fallback=used_fallback)})
+                        dockerfile=previous, attempts=attempt, usage=usage(),
+                        refusals=refusals, used_fallback=used_fallback,
+                        run_id=run_id)})

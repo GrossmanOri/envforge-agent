@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from envforge.agent import (
-    EVIDENCE_LIMIT, LANGUAGES, SCRIPT_LIMIT, Agent, Event, Outcome, bound,
+    EVIDENCE_LIMIT, LANGUAGES, SCRIPT_LIMIT, Agent, Event, Outcome, Usage, bound,
     default_dockerfile, language_for,
 )
 from envforge.llm import Call, InvalidArguments, Refused, Truncated
@@ -97,13 +97,37 @@ def drive(agent, workspace, args=(), language="python"):
 
 # --- the happy path -------------------------------------------------------------------
 
+def test_the_outcome_carries_totals_and_the_stream_carries_the_bodies(script):
+    """It used to hold every Call, and a Call holds the full request and response JSON.
+    Harmless at four small calls, megabytes at fifteen loop turns, and it rides on the
+    one event every consumer has to hold."""
+    llm = FakeLLM(_call(), _call())
+    sandbox = FakeSandbox(builds=[_build(ok=False, exit_code=1, log="boom"), _build()])
+    events, kinds, outcome = drive(Agent(llm, sandbox, ALLOW), script)
+
+    assert outcome.usage == Usage(calls=2, input_tokens=2, output_tokens=2)
+    assert not hasattr(outcome, "calls")
+    assert "request" not in repr(outcome) and "response" not in repr(outcome)
+
+    wrote = [e for e in events if e.kind == "wrote"]
+    assert len(wrote) == 2
+    assert all("call" in e.data for e in wrote)          # bodies, consumed and released
+    assert wrote[0].data["call"].request == {}
+
+
+def test_the_run_id_ties_the_summary_back_to_the_stream(script):
+    """The outcome no longer holds the bodies, so it has to say which run they belong to."""
+    _, _, outcome = drive(Agent(FakeLLM(_call()), FakeSandbox(), ALLOW), script)
+    assert outcome.run_id and len(outcome.run_id) == 8
+
+
 def test_one_attempt_when_nothing_fails(script):
     llm = FakeLLM(_call())
     agent = Agent(llm, FakeSandbox(), ALLOW)
     events, kinds, outcome = drive(agent, script)
     assert kinds == ["asking", "wrote", "building", "running", "finished"]
     assert outcome.ok and outcome.attempts == 1 and outcome.used_fallback is False
-    assert outcome.dockerfile == GOOD and len(outcome.calls) == 1
+    assert outcome.dockerfile == GOOD and outcome.usage.calls == 1
 
 
 # --- what spends an attempt, and what does not ---------------------------------------
@@ -151,7 +175,7 @@ def test_a_script_exiting_126_to_look_broken_does_not_buy_a_repair(script, exit_
     sandbox = FakeSandbox(runs=[_run(exit_code=exit_code, start_error="")])
     events, kinds, outcome = drive(Agent(llm, sandbox, ALLOW), script)
     assert "exec_failed" not in kinds
-    assert outcome.attempts == 1 and outcome.ok and len(outcome.calls) == 1
+    assert outcome.attempts == 1 and outcome.ok and outcome.usage.calls == 1
 
 
 @pytest.mark.parametrize("exit_code, timed_out", [(0, False), (1, False), (137, False), (None, True)])
@@ -201,7 +225,7 @@ def test_a_refusal_retries_without_spending_a_repair_attempt(script):
     # Three asks, two attempts. The refusal cost a model call and nothing else;
     # the build failure is the only thing that consumed an attempt.
     assert kinds.count("asking") == 3 and kinds.count("refused") == 1
-    assert outcome.attempts == 2 and len(outcome.calls) == 2 and outcome.ok
+    assert outcome.attempts == 2 and outcome.usage.calls == 2 and outcome.ok
     assert outcome.refusals == [{"category": "cyber"}]
 
 
