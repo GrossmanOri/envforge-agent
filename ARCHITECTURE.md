@@ -146,8 +146,8 @@ checked for containment, in that order, because a prefix test on the joined path
 `requirements.txt` symlinked to a private key. The script and its siblings are treated
 differently: a symlinked script is followed, since the user named it, and the root becomes
 wherever it actually lives; siblings were discovered rather than named and may not leave
-that root. Not yet wired: the script is still read twice, once for the prompt and once when
-the build context is assembled.
+that root. `Sandbox.build` takes those contents rather than a path, so the script is read
+exactly once and the bytes the model reviewed are the bytes the container runs.
 
 ### ADR-013: the outcome carries totals, the event stream carries the bodies
 Decided 2026-08-25, revised 2026-08-27. `Outcome` held every `Call`, and a `Call` holds the

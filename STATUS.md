@@ -503,9 +503,6 @@ needs the provider error types to retain wire data, so it is deferred explicitly
 
 Still to come in sitting 6: the event names, and the token budget.
 
-Still to come in sitting 6: the manifest build context, the slimmed `Outcome`, the event
-names, and the token budget.
-
 ## Prompts move to a module, decided 2026-08-25
 Before the tool loop, and as `envforge/prompts.py` rather than as text files.
 
