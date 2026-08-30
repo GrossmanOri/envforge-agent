@@ -510,7 +510,7 @@ contrast between `calls` and tokens that this paragraph draws no longer exists.
 
 The same review asked for raw request and response bodies on failed provider replies. That
 needs the provider error types to retain wire data, so it is deferred explicitly to sitting
-8's trace design and recorded in `private/LATER.md` rather than half-built here.
+8's trace design rather than half-built here.
 
 ## Sitting 6, fourth of five
 `envforge/events.py`. The twelve kinds an engine may yield, and who wrote every string in
@@ -760,8 +760,18 @@ On disk: `~/Projects/envforge/` holds `v1`, `private` and `agent`. Decide what i
 live, what is history worth keeping, and what is neither. `private` in particular has
 accumulated planning documents from a project this one no longer continues.
 
-On GitHub: two repositories nobody is using. Decide whether each is archived, deleted or
-kept, and say why in one line each so the decision is not remade later.
+On GitHub, corrected 2026-08-30: this was written as "two repositories nobody is using" and
+both halves of that were wrong. `GrossmanOri/envforge-private` is the remote of the notes
+directory and is in daily use. `GrossmanOri/envforge` is v1's remote, so it is not in use
+but is history worth keeping rather than clutter. The decision left is archive or keep for
+v1, one line of reasoning either way so it is not remade later.
+
+Also found the same day: this repository is public, while the operating rules described it
+as private. No note file has ever been committed here, so the rule held in substance, but
+one paragraph above did name a notes file by path when deferring a piece of work. That
+reference is gone in the same commit as this line. The rule it breaks is not only about
+leaking: a pointer a reader cannot follow is a broken link, so a public record should say
+what was decided and never where the decision is filed.
 
 Not a tidiness exercise. A directory nobody has audited is where a stale document sits
 quoting a design that no longer exists, which has already happened twice in this project
