@@ -361,8 +361,12 @@ def main(argv: Sequence[str] | None = None, environ=None) -> int:
                 # daemon that stops mid-run makes every build fail with exit 1, which
                 # the loop reads as a repairable Dockerfile problem: three paid calls
                 # asking the model to fix a file that was already correct, then a
-                # verdict blaming the script. Asking again here costs one subprocess
-                # and is the difference between a wrong answer and an honest one.
+                # verdict blaming the script.
+                #
+                # Every build failure, not just the first, because the daemon can stop
+                # between attempt one and attempt two just as easily. Measured at 78ms,
+                # against builds that take seconds, so the cost of asking is noise and
+                # the cost of not asking is a wrong verdict and two paid calls.
                 problem = daemon_error()
                 if problem is not None:
                     print(f"\ncannot use Docker: {printable(problem)}", file=sys.stderr)

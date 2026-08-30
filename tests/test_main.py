@@ -338,3 +338,17 @@ def test_main_stops_paying_the_model_when_docker_dies_mid_run(monkeypatch, tmp_p
 
     assert module.main([str(script)]) == EXIT_NO_DOCKER
     assert len(llm.prompts) == 1                 # one call, not three
+
+
+def test_every_kind_has_a_headline_too():
+    """The exit-code table is asserted complete; the headline table was not, and a kind
+    missing from it falls to a `.get` default that says FAILED. That is the same shape
+    as the default which once let a failed run report success, so it is closed the same
+    way: by asserting the set rather than trusting it."""
+    import inspect
+    from typing import get_args
+    import envforge.__main__ as module
+    from envforge.agent import Kind
+    source = inspect.getsource(module.report)
+    for kind in get_args(Kind):
+        assert f'"{kind}"' in source, f"{kind} has no headline"

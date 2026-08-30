@@ -64,7 +64,7 @@ and `6` are this tool being unable to do its job: no credentials or the model un
 the token budget spent, Docker unavailable, or no Dockerfile that would build. Those say nothing about the
 script and a caller should fix its setup rather than read a verdict into them.
 
-281 tests, 268 of which need neither Docker nor an API key. Both suites run on every push
+285 tests, 272 of which need neither Docker nor an API key. Both suites run on every push
 and every pull request.
 
 ## What is designed and not built

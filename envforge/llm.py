@@ -195,12 +195,12 @@ def reachable(send):
         return send()
     except Exception as exc:               # noqa: BLE001 - narrowed immediately below
         status = getattr(exc, "status_code", None)
-        if isinstance(exc, (TypeError, ValueError)) and "auth" in str(exc).lower():
-            # The Anthropic SDK does not raise for a missing key at construction; it
-            # defers to request time and raises TypeError there. That is not an
-            # LLMError, not a ProviderUnavailable and not an OSError, so it escaped
-            # every handler in the program and crashed the run with a traceback on the
-            # single most common setup mistake there is.
+        if isinstance(exc, TypeError) and "resolve authentication" in str(exc):
+            # A backstop, not the mechanism. Credentials are checked when the client is
+            # built, so this only fires if that check is bypassed or the SDK changes
+            # where it resolves them from. Matched on the SDK's specific phrase rather
+            # than on the word "auth", which would have swallowed any TypeError from our
+            # own code that happened to mention authentication.
             raise MissingKey("ANTHROPIC_API_KEY") from exc
         if status is None:
             # No HTTP response at all: DNS, TLS, a dropped connection, a timeout.
@@ -255,7 +255,21 @@ class AnthropicLLM:
         import anthropic
 
         self.model = model
-        self._client = client if client is not None else anthropic.Anthropic()
+        if client is not None:
+            self._client = client
+            return
+        self._client = anthropic.Anthropic()
+        # Asked of the constructed client rather than of the environment, and asked here
+        # rather than left to request time. This SDK resolves credentials from several
+        # places and raises nothing when it finds none, deferring to the first request
+        # and raising `TypeError` there, which is not an exception any handler in this
+        # program was looking for: a missing key crashed the run with a traceback.
+        #
+        # Reading the client's own resolved values keeps `ANTHROPIC_AUTH_TOKEN` working,
+        # which checking the one environment variable would have broken.
+        if not getattr(self._client, "api_key", None) and \
+                not getattr(self._client, "auth_token", None):
+            raise MissingKey("ANTHROPIC_API_KEY")
 
     def build_request(self, system: str, user: str, tool: Tool) -> dict[str, Any]:
         return {

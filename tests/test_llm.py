@@ -306,3 +306,47 @@ def test_make_llm_builds_each_provider(monkeypatch):
     assert isinstance(make_llm("openai:gpt-5"), OpenAICompatLLM)
     groq = make_llm("groq:llama-3.3-70b-versatile")
     assert groq.strict is False and str(groq._client.base_url).startswith(GROQ_BASE_URL)
+
+
+def test_anthropic_refuses_to_build_without_credentials(monkeypatch):
+    """Checked when the client is built, not by pattern-matching an error later.
+
+    This SDK resolves credentials from several places and raises nothing when it finds
+    none, deferring to the first request and raising `TypeError` there. That escaped
+    every handler in the program and crashed a run with a traceback on the most common
+    setup mistake there is.
+    """
+    for variable in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+        monkeypatch.delenv(variable, raising=False)
+    with pytest.raises(MissingKey) as caught:
+        AnthropicLLM("claude-sonnet-5")
+    assert caught.value.variable == "ANTHROPIC_API_KEY"
+
+
+def test_an_auth_token_is_credentials_too(monkeypatch):
+    """Checking the one environment variable would have broken this. The client's own
+    resolved values are what get asked, so the SDK's other supported method keeps
+    working."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "sk-ant-token")
+    AnthropicLLM("claude-sonnet-5")          # constructs, does not raise
+
+
+def test_the_auth_backstop_does_not_swallow_our_own_mistakes():
+    """The backstop matched the word "auth" at first, which would have turned any
+    TypeError from our own code that happened to mention authentication into "your key
+    is missing". It matches the SDK's specific phrase now."""
+    from envforge.llm import reachable
+
+    def our_bug():
+        raise TypeError("author() takes 2 positional arguments but 3 were given")
+
+    with pytest.raises(TypeError):           # re-raised, not relabelled
+        reachable(our_bug)
+
+    def sdk_says():
+        raise TypeError("Could not resolve authentication method. Expected one of "
+                        "api_key, auth_token, or credentials to be set.")
+
+    with pytest.raises(MissingKey):
+        reachable(sdk_says)
