@@ -16,7 +16,8 @@ import pytest
 
 from envforge.llm import (
     GROQ_BASE_URL, MAX_TOKENS, AnthropicLLM, Call, InvalidArguments, LLMError,
-    OpenAICompatLLM, Refused, Tool, Truncated, make_llm, validate,
+    MissingKey, OpenAICompatLLM, ProviderUnavailable, Refused, Tool, Truncated,
+    make_llm, validate,
 )
 
 SCHEMA = {
@@ -275,8 +276,26 @@ def test_groq_will_not_borrow_the_openai_key(monkeypatch):
     openai default the key would send an OpenAI secret to Groq's servers."""
     monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
-    with pytest.raises(ValueError, match="GROQ_API_KEY"):
+    # `MissingKey` rather than `ValueError`: a missing key is not a malformed spec, and
+    # reporting it as one told the user to fix something they had typed correctly.
+    with pytest.raises(MissingKey) as caught:
         make_llm("groq:llama-3.3-70b-versatile")
+    assert caught.value.variable == "GROQ_API_KEY"
+
+
+def test_a_missing_key_is_a_provider_failure_and_not_a_usage_error(monkeypatch):
+    """Every provider, one behaviour. The Anthropic SDK is the interesting one: it does
+    not raise at construction at all, deferring auth to request time, where it raises
+    `TypeError`. That is not an `LLMError`, not a `ProviderUnavailable` and not an
+    `OSError`, so it escaped every handler in the program and crashed the run with a
+    traceback on the most common setup mistake there is."""
+    for variable in ("OPENAI_API_KEY", "GROQ_API_KEY"):
+        monkeypatch.delenv(variable, raising=False)
+    for spec in ("openai:gpt-5", "groq:llama"):
+        with pytest.raises(MissingKey):
+            make_llm(spec)
+    # And a MissingKey is a ProviderUnavailable, so the loop's handler already covers it.
+    assert issubclass(MissingKey, ProviderUnavailable)
 
 
 def test_make_llm_builds_each_provider(monkeypatch):

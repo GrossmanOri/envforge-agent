@@ -26,7 +26,7 @@ from .budget import DEFAULT as DEFAULT_BUDGET
 from .budget import Budget
 from .events import Event, Provenance
 from .gate import check
-from .llm import ProviderUnavailable, make_llm
+from .llm import MissingKey, ProviderUnavailable, make_llm
 from .sandbox import DockerSandbox, SandboxError, daemon_error
 from .workspace import WorkspaceError, gather
 
@@ -106,12 +106,12 @@ def check_key(spec: str) -> int:
     """
     try:
         llm = make_llm(spec)
-    except ValueError as exc:
-        print(f"bad provider spec: {exc}", file=sys.stderr)
-        return EXIT_USAGE
-    except Exception as exc:                       # a missing key raises at construction
-        print(f"no usable credentials for {spec}: {exc}", file=sys.stderr)
+    except MissingKey as exc:
+        print(f"{printable(exc.variable)} is not set", file=sys.stderr)
         return EXIT_UNAVAILABLE
+    except ValueError as exc:
+        print(f"bad provider spec: {printable(str(exc))}", file=sys.stderr)
+        return EXIT_USAGE
 
     client = getattr(llm, "_client", None)
     if client is None or not hasattr(client, "models"):
@@ -125,7 +125,8 @@ def check_key(spec: str) -> int:
     except Exception as exc:
         status = getattr(exc, "status_code", "?")
         reported = getattr(exc, "type", "") or type(exc).__name__
-        print(f"{spec}: FAILED ({status} {reported}) {exc}", file=sys.stderr)
+        print(f"{printable(spec)}: FAILED ({printable(str(status))} "
+              f"{printable(str(reported))}) {printable(str(exc))}", file=sys.stderr)
         return EXIT_UNAVAILABLE
 
     wanted = spec.partition(":")[2]
@@ -186,16 +187,32 @@ def report(outcome: Outcome) -> None:
     rather than printed bare so nobody reads it as ours.
     """
     print()
-    print("ok" if outcome.ok else "FAILED", "-", printable(outcome.reason))
+    # Keyed to the kind, not to `ok`. `ok` means the tool did its job, which is true
+    # even when the script it was watching failed, so keying the header to it printed
+    # "ok" above an exit code of 1. The person and the shell now agree.
+    headline = {
+        "ran": "ok", "script_failed": "the script FAILED", "no_image": "FAILED",
+        "failed": "FAILED", "budget": "STOPPED", "unavailable": "STOPPED",
+        "unsupported": "REFUSED",
+    }.get(outcome.kind, "FAILED")
+    print(headline, "-", printable(outcome.reason))
     print(f"attempts {outcome.attempts}, "
           f"{outcome.usage.calls} model call(s), {outcome.usage.tokens} tokens")
     if outcome.used_fallback:
         print("the Dockerfile came from us, not from the model")
 
     if outcome.dockerfile:
-        print("\n--- the Dockerfile that was built ---")
+        # Prefixed and labelled like the container block, and for the same reason. This
+        # was printed at column zero with no marker, so the model could end a Dockerfile
+        # with lines that read as this program's own summary: a forged
+        # "--- what the script did (exit 0) ---" was the last thing on screen for a run
+        # where the gate refused every attempt and nothing was ever built.
+        built = outcome.build is not None and outcome.build.ok
+        whose = "written by us" if outcome.used_fallback else "written by the model"
+        print(f"\n--- the Dockerfile {'that was built' if built else 'last considered'}"
+              f", {whose} ---")
         for line in outcome.dockerfile.rstrip().splitlines():
-            print(printable(line))
+            print(f"  | {printable(line)}")
 
     run = outcome.run
     if run is None:
@@ -317,12 +334,15 @@ def main(argv: Sequence[str] | None = None, environ=None) -> int:
 
     try:
         llm = make_llm(args.model)
-    except ValueError as exc:
-        print(f"bad provider spec: {exc}", file=sys.stderr)
-        return EXIT_USAGE
-    except Exception as exc:
-        print(f"no usable credentials for {args.model}: {exc}", file=sys.stderr)
+    except MissingKey as exc:
+        # Its own exit code, not the usage one. Reporting a missing key as a bad spec
+        # told the user to fix something they had typed correctly.
+        print(f"{printable(exc.variable)} is not set. Put it in the environment or in "
+              f"the project's .env; see .env.example.", file=sys.stderr)
         return EXIT_UNAVAILABLE
+    except ValueError as exc:
+        print(f"bad provider spec: {printable(str(exc))}", file=sys.stderr)
+        return EXIT_USAGE
 
     problem = daemon_error()
     if problem is not None:
@@ -336,6 +356,17 @@ def main(argv: Sequence[str] | None = None, environ=None) -> int:
     try:
         for event in agent.run(workspace, language, tuple(args.arg)):
             print(render(event), flush=True)
+            if event.kind == "build_failed":
+                # The pre-flight probe only proves Docker was up when we started. A
+                # daemon that stops mid-run makes every build fail with exit 1, which
+                # the loop reads as a repairable Dockerfile problem: three paid calls
+                # asking the model to fix a file that was already correct, then a
+                # verdict blaming the script. Asking again here costs one subprocess
+                # and is the difference between a wrong answer and an honest one.
+                problem = daemon_error()
+                if problem is not None:
+                    print(f"\ncannot use Docker: {printable(problem)}", file=sys.stderr)
+                    return EXIT_NO_DOCKER
             if event.kind == "finished":
                 outcome = event.data["outcome"]
     except (OSError, SandboxError) as exc:

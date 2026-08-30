@@ -22,7 +22,7 @@ it cost; nothing yet decides what that behaviour means. The model also has no to
 reads the script once and writes a Dockerfile, which makes this a workflow with a feedback
 loop rather than an agent.
 
-276 tests, 263 of which need neither Docker nor an API key. Both suites run on every push
+281 tests, 268 of which need neither Docker nor an API key. Both suites run on every push
 and every pull request.
 
 ## The default provider, decided 2026-08-22
@@ -182,10 +182,15 @@ both providers return for a prompt over the context window, which this tool can 
 `printable` kept newlines, so a single string reaching the summary could paint whole forged
 lines with no control character in it, and it let bidirectional overrides through, which
 reverse a line's reading order without one either. A stopped daemon still cost three paid
-repair calls before reporting the script as having run; one `docker version` probe now costs
-nothing and exits 5. `evidence = str(exc)` was the one evidence path with no bound, and a
+repair calls before reporting the script as having run. A `docker version` probe before the
+loop covers the daemon being down at the start; a third review showed the probe alone was
+not enough, since a daemon that stops mid-run makes every build fail with exit 1, which the
+loop reads as a repairable Dockerfile problem. The probe is now repeated on the first build
+failure, before a repair is paid for. `evidence = str(exc)` was the one evidence path with no bound, and a
 provider message carrying model-chosen text put 200,000 characters into the next prompt.
-And 108 images had accumulated, now removed in a `finally`.
+And 108 images had accumulated. Cleanup went into the CLI's `finally`, which a third
+review showed covered only the CLI: the Docker test suite still leaked one image per run,
+because the seam existed and the tests using that seam did not. Both clean up now.
 
 One correction to the review: it estimated the images at 21GB. Layers are shared, so
 `docker system df` reports 540MB. The clutter was real and the number was not.

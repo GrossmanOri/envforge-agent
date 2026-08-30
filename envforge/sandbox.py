@@ -63,11 +63,21 @@ class RunResult:
 
 
 class Sandbox(Protocol):
-    """The seam. DockerSandbox now, a fake in tests, a Kubernetes Job later."""
+    """The seam. DockerSandbox now, a fake in tests, a Kubernetes Job later.
+
+    `built_tags` and `remove_image` are on the seam because a caller has to be able to
+    clean up what a run created. They were reached for through the protocol without
+    being declared on it, so substituting a conforming sandbox made the program crash
+    after the run had already finished and before it printed its answer.
+    """
+
+    built_tags: list[str]
 
     def build(self, dockerfile: str, files: Mapping[str, str], tag: str) -> BuildResult: ...
 
     def run(self, image: str, args: Sequence[str] = ()) -> RunResult: ...
+
+    def remove_image(self, tag: str) -> None: ...
 
 
 def build_argv(tag: str, context: Path) -> list[str]:
@@ -299,9 +309,17 @@ class DockerSandbox:
         )
 
     def remove_image(self, tag: str) -> None:
-        subprocess.run(
-            ["docker", "image", "rm", "--force", tag],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        """Best effort, and bounded. This was the only docker call in the file with no
+        timeout, and it runs once per built tag inside a `finally`, so a wedged daemon
+        hung the program forever after the run had already produced its answer."""
+        try:
+            subprocess.run(
+                ["docker", "image", "rm", "--force", tag],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=30,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            # Cleanup failing must never lose a result the run already earned.
+            pass

@@ -60,11 +60,11 @@ there is.
 and prints what it did, and `python -m envforge --check` verifies the API key without
 spending a call. The exit code separates what a caller must not confuse. `0` is a clean run and `1` is
 the script running and exiting nonzero, which is a finding about the sample. `3`, `4`, `5`
-and `6` are this tool being unable to do its job: the model unreachable, the token budget
-spent, Docker unavailable, or no Dockerfile that would build. Those say nothing about the
+and `6` are this tool being unable to do its job: no credentials or the model unreachable,
+the token budget spent, Docker unavailable, or no Dockerfile that would build. Those say nothing about the
 script and a caller should fix its setup rather than read a verdict into them.
 
-276 tests, 263 of which need neither Docker nor an API key. Both suites run on every push
+281 tests, 268 of which need neither Docker nor an API key. Both suites run on every push
 and every pull request.
 
 ## What is designed and not built

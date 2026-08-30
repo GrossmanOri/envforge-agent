@@ -58,14 +58,28 @@ class FakeLLM:
 
 
 class FakeSandbox:
+    """Conforms to the whole `Sandbox` protocol, cleanup included.
+
+    It did not, and the gap was invisible until a review substituted it into `main`:
+    the run finished correctly and then the program died reaching for `built_tags`,
+    after the answer had been produced and before it was printed. A test double that
+    implements only the interesting half is how an unused seam rots.
+    """
+
     def __init__(self, builds=(), runs=()):
         self.builds, self.runs = list(builds), list(runs)
         self.built = []
+        self.built_tags = []
+        self.removed = []
 
     def build(self, dockerfile, files, tag):
         self.built.append(dockerfile)
+        self.built_tags.append(tag)
         self.context = dict(files)
         return self.builds.pop(0) if self.builds else _build()
+
+    def remove_image(self, tag):
+        self.removed.append(tag)
 
     def run(self, image, args=()):
         return self.runs.pop(0) if self.runs else _run()
@@ -534,9 +548,17 @@ def test_the_whole_loop_against_a_real_daemon(tmp_path):
     script = tmp_path / "hello.py"
     script.write_text("import sys; print('from inside'); sys.exit(3)\n")
     dockerfile = default_dockerfile("python", "hello.py")
-    agent = Agent(FakeLLM(_call(dockerfile)),
-                  DockerSandbox(Limits(run_timeout=60.0)), ALLOW)
-    events = list(agent.run(gather(script), "python"))
+    sandbox = DockerSandbox(Limits(run_timeout=60.0))
+    try:
+        agent = Agent(FakeLLM(_call(dockerfile)), sandbox, ALLOW)
+        events = list(agent.run(gather(script), "python"))
+    finally:
+        # The suite leaked one image per run, which is how a machine ended up holding
+        # a hundred of them. Cleanup lived only in the CLI, so the seam existed and the
+        # tests exercising that seam did not use it.
+        for tag in sandbox.built_tags:
+            sandbox.remove_image(tag)
     outcome = events[-1].data["outcome"]
     assert outcome.ok and outcome.attempts == 1
+    assert outcome.kind == "script_failed"       # it ran, and it exited 3
     assert outcome.run.exit_code == 3 and "from inside" in outcome.run.stdout

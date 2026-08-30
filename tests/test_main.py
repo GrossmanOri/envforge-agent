@@ -274,3 +274,67 @@ def test_a_right_to_left_override_is_escaped_too():
     with no control code involved."""
     assert "‮" not in printable("safe‮gnp.exe")
     assert "​" not in printable("hidden​space")
+
+
+# --- main() past the usage checks, which had no coverage at all -------------------------
+
+def _drive_main(monkeypatch, tmp_path, sandbox, llm, argv_extra=()):
+    """Run `main` with the real body: the loop, the report, the exit code and the
+    cleanup. Every earlier test here stopped at a usage error, so every fix living in
+    `main` was asserted in prose only, which is how two of them shipped broken."""
+    import envforge.__main__ as module
+    script = tmp_path / "s.py"
+    script.write_text("print(1)\n")
+    monkeypatch.setattr(module, "load_env", lambda *a, **k: [])
+    monkeypatch.setattr(module, "daemon_error", lambda: None)
+    monkeypatch.setattr(module, "make_llm", lambda spec: llm)
+    monkeypatch.setattr(module, "DockerSandbox", lambda *a, **k: sandbox)
+    return module.main([str(script), *argv_extra])
+
+
+def test_main_runs_the_loop_reports_and_cleans_up(monkeypatch, tmp_path, capsys):
+    from tests.test_agent import FakeLLM, FakeSandbox, _call
+    sandbox = FakeSandbox()
+    assert _drive_main(monkeypatch, tmp_path, sandbox, FakeLLM(_call())) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "what the script did" in out
+    # The images this run created are removed, which nothing asserted before.
+    assert sandbox.removed == sandbox.built_tags != []
+
+
+def test_main_returns_one_when_the_script_itself_fails(monkeypatch, tmp_path):
+    """The end-to-end version of the bug that made a failing script exit 0."""
+    from tests.test_agent import FakeLLM, FakeSandbox, _call, _run
+    sandbox = FakeSandbox(runs=[_run(exit_code=3, stdout="nope\n")])
+    assert _drive_main(monkeypatch, tmp_path, sandbox, FakeLLM(_call())) == EXIT_RUN_FAILED
+
+
+def test_main_cleans_up_even_when_the_run_ends_badly(monkeypatch, tmp_path):
+    """Cleanup lives in a `finally`, so it has to survive the unhappy paths too."""
+    from tests.test_agent import FakeLLM, FakeSandbox, _build, _call
+    sandbox = FakeSandbox(builds=[_build(ok=False, exit_code=1, log="boom")] * 3)
+    code = _drive_main(monkeypatch, tmp_path, sandbox,
+                       FakeLLM(_call(), _call(), _call()))
+    assert code == EXIT_NO_IMAGE
+    assert sandbox.removed == sandbox.built_tags != []
+
+
+def test_main_stops_paying_the_model_when_docker_dies_mid_run(monkeypatch, tmp_path):
+    """The pre-flight probe only proves Docker was up when we started. A daemon that
+    stops afterwards makes every build fail with exit 1, which the loop reads as a
+    repairable Dockerfile problem: three paid calls to fix a correct file, then a
+    verdict blaming the script. Verified as three calls before the re-probe existed."""
+    import envforge.__main__ as module
+    from tests.test_agent import FakeLLM, FakeSandbox, _build, _call
+    sandbox = FakeSandbox(builds=[_build(ok=False, exit_code=1, log="daemon gone")] * 3)
+    llm = FakeLLM(_call(), _call(), _call())
+    states = iter([None, "Cannot connect to the Docker daemon"])
+    monkeypatch.setattr(module, "daemon_error", lambda: next(states, "gone"))
+    script = tmp_path / "s.py"
+    script.write_text("print(1)\n")
+    monkeypatch.setattr(module, "load_env", lambda *a, **k: [])
+    monkeypatch.setattr(module, "make_llm", lambda spec: llm)
+    monkeypatch.setattr(module, "DockerSandbox", lambda *a, **k: sandbox)
+
+    assert module.main([str(script)]) == EXIT_NO_DOCKER
+    assert len(llm.prompts) == 1                 # one call, not three

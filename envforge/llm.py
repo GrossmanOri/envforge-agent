@@ -67,6 +67,19 @@ class ProviderUnavailable(Exception):
         self.kind = kind
 
 
+class MissingKey(ProviderUnavailable):
+    """No usable credentials for this provider.
+
+    A subclass of `ProviderUnavailable` so the loop's handler already covers it, and its
+    own type so callers can stop reporting it as a malformed spec. It was reported as a
+    usage error, which told a user to fix something they had typed correctly.
+    """
+
+    def __init__(self, variable: str):
+        super().__init__(f"{variable} is not set", kind="no_key")
+        self.variable = variable
+
+
 class InvalidArguments(LLMError):
     """Arguments came back but do not satisfy the schema. Repairable."""
 
@@ -182,6 +195,13 @@ def reachable(send):
         return send()
     except Exception as exc:               # noqa: BLE001 - narrowed immediately below
         status = getattr(exc, "status_code", None)
+        if isinstance(exc, (TypeError, ValueError)) and "auth" in str(exc).lower():
+            # The Anthropic SDK does not raise for a missing key at construction; it
+            # defers to request time and raises TypeError there. That is not an
+            # LLMError, not a ProviderUnavailable and not an OSError, so it escaped
+            # every handler in the program and crashed the run with a traceback on the
+            # single most common setup mistake there is.
+            raise MissingKey("ANTHROPIC_API_KEY") from exc
         if status is None:
             # No HTTP response at all: DNS, TLS, a dropped connection, a timeout.
             # Matched by inheritance rather than by class name. The name test that was
@@ -309,7 +329,7 @@ class OpenAICompatLLM:
         # as a 401 from the wrong provider halfway through a run.
         key = os.environ.get(api_key_env)
         if not key:
-            raise ValueError(f"{api_key_env} is not set")
+            raise MissingKey(api_key_env)
         self._client = openai.OpenAI(base_url=base_url, api_key=key)
 
     def build_request(self, system: str, user: str, tool: Tool) -> dict[str, Any]:
