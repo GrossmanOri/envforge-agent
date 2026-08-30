@@ -56,7 +56,7 @@ a container run, which tokens do not measure. Every reply is charged, including 
 refusals and truncations we cannot use, and a truncated reply is the most expensive kind
 there is.
 
-231 tests, 218 of which need neither Docker nor an API key. Both suites run on every push
+238 tests, 225 of which need neither Docker nor an API key. Both suites run on every push
 and every pull request.
 
 ## What is designed and not built

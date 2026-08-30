@@ -1,19 +1,42 @@
-# Status
+# Build log
 
-Updated 2026-08-30, sitting 6 merged and sitting 7 briefed.
+What was built, what broke, and what was decided. Written for someone who has not seen this
+project before, so entries are named for what they are rather than for when they were
+scheduled.
 
-## Where we are
-All five of sitting 6's shapes are built: the workspace, the build context taken as
-contents, the outcome slimmed to totals, the event vocabulary, and the token budget.
-Nothing in the plan now blocks the tool loop. 232 tests pass.
+`README.md` says what runs today and `ARCHITECTURE.md` holds the invariants and the
+decision log. This file is the record of how those got that way, including the parts that
+were wrong first. Nothing here is tidied after the fact: where a fix was the wrong shape,
+the wrong shape is still described, because that is the part worth reading.
 
-A review of the branch before merge found two things worth carrying forward, and both are
-in the sitting 7 brief at the end of this file. A spent budget currently degrades quietly
-into a build nobody judged, and a provider failure such as a dead API key is not caught at
-all, so it kills the run without an outcome. Neither is a bug in the budget; both are the
-run being unable to say honestly that it failed.
+Updated 2026-08-30.
 
-## What sitting 5 produced
+## Where this is
+Built and tested: the sandbox that holds the untrusted script, the model layer, the
+deterministic gate every Dockerfile passes before a build, the repair loop, the workspace
+that is the only code here handling a path, the closed event vocabulary with its provenance
+labels, and the token budget.
+
+Not built: the verdict, the trace, and the command line entry point. There is no
+`__main__.py`, so **this cannot yet be run from a shell**, and nothing decides what a run
+means. The model also has no tools: it reads the script once and writes a Dockerfile, which
+makes this a workflow with a feedback loop rather than an agent.
+
+238 tests, 225 of which need neither Docker nor an API key. Both suites run on every push
+and every pull request.
+
+## The default provider, decided 2026-08-22 and not yet built
+`anthropic:claude-sonnet-5`. The native SDK with strict tool use, which is the only path
+that grammar-constrains Claude's arguments, and cheap enough that the capped repair loop can
+spend its attempts without cost being the reason a run stops. `ANTHROPIC_API_KEY` is read
+from the environment and never from a file.
+
+Stated as a decision rather than as behaviour, because `make_llm(spec)` requires a spec and
+there is no default anywhere in the code. Nothing chooses a provider today, since nothing
+starts a run without being handed one. The default lands with the command line entry point,
+which is the first caller that will have to pick one.
+
+## The gate
 An allowlist of six instructions and nothing else: FROM, COPY, RUN, USER, CMD, ENTRYPOINT.
 No WORKDIR, no ENV, no ADD, no ARG, no SHELL, no multi-stage.
 
@@ -103,21 +126,21 @@ boundary. Anyone can publish there, so `FROM eviluser/backdoor:1.0` is inside th
 as written. The registry-host rule stops the daemon pulling from a host the attacker
 named; it does not make the image trustworthy.
 
-Sitting 4 complete: `envforge/agent.py` and `tests/test_agent.py`.
+The repair loop: `envforge/agent.py` and `tests/test_agent.py`.
 231 tests today, 218 needing neither Docker nor an API key, 13 against the real daemon.
 
-## What sitting 4 produced
+## The repair loop
 The plain repair loop. It defines `write_dockerfile` against the schema `Tool` already
 enforces, asks, gates, builds, runs, and decides one thing over and over: could a
 rewritten Dockerfile fix this. It yields `Event`s rather than printing, and the final
-event carries an `Outcome`, so sitting 5's graph engine and sitting 8's trace attach to
+event carries an `Outcome`, so the graph engine and the trace module attach to
 the same seam. There is still no `__main__`, so nothing runs from a shell.
 
 Repairable, and each one spends an attempt: a gate rejection, a failed build, exit 126 or
 127, and a reply that was refused-adjacent rather than refused, meaning `InvalidArguments`,
 `Truncated`, or no tool call at all.
 
-Terminal, because the script ran and what it did is sitting 7's problem: exit 0, exit 1,
+Terminal, because the script ran and what it did is the tool loop's problem: exit 0, exit 1,
 exit 137, a 125 that came with a cidfile, and a timeout. A timeout is not a repair
 candidate. The run happened.
 
@@ -125,11 +148,11 @@ Four decisions worth naming:
 
 1. `gate` is a required constructor argument with no default. Every Dockerfile reaching
    the daemon was written by a model that just read untrusted text, so a loop that can be
-   constructed without a gate is a loop that can build one unchecked. Sitting 6 fills in
+   constructed without a gate is a loop that can build one unchecked. The gate fills in
    the real allowlist; the tests pass an explicit stub.
 2. Repair is decided by whether the container started, not by its exit code. `RunResult`
    carries `start_error`, read from the daemon before the force-remove. This closes the
-   gap sitting 2 left open, and closes it better than the 126/127 test it replaced: those
+   gap the sandbox left open, and closes it better than the 126/127 test it replaced: those
    codes can be produced by a script that wants to look like a broken image, and a script
    that can choose an exit code has already started, so the field is empty for it.
 3. The fallback Dockerfile goes through the same gate. One path from a Dockerfile string
@@ -139,19 +162,19 @@ Four decisions worth naming:
    output is bounded in the sandbox. Both are attacker-controlled text on the way to a
    model.
 
-Sitting 3 of 11 complete: `envforge/llm.py` and `tests/test_llm.py`.
+The model layer: `envforge/llm.py` and `tests/test_llm.py`.
 48 tests, 39 without Docker or any API key, 9 against the real daemon.
 The repository is public, and `main` rejects direct pushes: the ruleset requires a pull
 request and a green `test` check, verified on 2026-08-23 by a push that was refused.
 
-## What sitting 3 produced
+## The model layer
 `LLM` Protocol, `AnthropicLLM` on the native SDK, `OpenAICompatLLM` covering OpenAI and
 Groq through `base_url`, `Tool`, `Call`, `validate`, and `make_llm("provider:model")`.
 Four failure types, because the loop has to tell them apart: `InvalidArguments` is
 repairable, `Refused` is not, `Truncated` means the ceiling was hit, and a bare `LLMError`
 means the response had no tool call at all.
 
-`build_request` is a pure function on each provider, the same move as sitting 2's
+`build_request` is a pure function on each provider, the same move as the sandbox's
 `build_argv`, so the invariants are tested with no network: `strict` is asked for on
 Anthropic and OpenAI, deliberately not on Groq, and `tool_choice` names the single tool.
 
@@ -173,13 +196,13 @@ The fakes build their canned responses through `anthropic.types.Message.model_va
 and `openai.types.chat.ChatCompletion.model_validate`. A payload that could not have come
 from the real API fails the test instead of passing it.
 
-Sitting 2 of 11 complete: `envforge/sandbox.py` and `tests/test_sandbox.py`.
+The sandbox: `envforge/sandbox.py` and `tests/test_sandbox.py`.
 24 tests, 15 without Docker and 9 against the real daemon, all passing.
 A `.venv` with pytest exists in the repo directory and is gitignored.
-The sitting's judgment question is answered and recorded: why the memory test asserts
-both exit 137 and the absence of `MemoryError` in stderr.
+Why the memory test asserts both exit 137 and the absence of `MemoryError` in
+stderr is recorded below.
 
-## What sitting 2 produced
+## The sandbox
 `Sandbox` protocol, `DockerSandbox`, `Limits`, `BuildResult`, `RunResult`, `SandboxError`.
 The two argv builders `build_argv` and `run_argv` are pure functions returning a list,
 so the invariant tests read the argv the code actually builds without touching Docker.
@@ -250,7 +273,7 @@ daemon is an assumption.
 There is no line budget any more. The old rule said roughly 650 including tests and was
 being compared against the source number alone, so it read as nearly met while the real
 total was 1483. Raising it would have kept the actual problem: the count was changing the
-code, trimming docstrings that carried the reasoning and opening three sittings in a row
+code, trimming docstrings that carried the reasoning and opening three entries in a row
 with a note about length instead of the work.
 
 What replaces it is not countable. A file whose responsibility cannot be stated in one
@@ -305,7 +328,7 @@ script with a gem dependency or a Node script with an npm dependency cannot be b
 matter what the model writes.
 
 A wrong label cannot cost a compromise, but it can cost an honest report, and that belongs
-to sitting 7. Label a bash script as python, the fallback runs `python /app/s.sh`, it exits
+to the tool loop. Label a bash script as python, the fallback runs `python /app/s.sh`, it exits
 1 on a syntax error, and the loop calls that terminal with `ok=True` because a nonzero exit
 is the verdict's problem rather than the loop's. The verdict would then be formed from a
 run in which the script's own logic never executed.
@@ -323,22 +346,22 @@ Timeout returns `exit_code=None` with `timed_out=True`. Nothing yet decides what
 timeout means for the verdict.
 
 `--cpus` and `no-new-privileges` are still unverified by observation. Both appear in the
-argv and have tests asserting that, which is a weaker claim than sitting 1's five flags.
+argv and have tests asserting that, which is a weaker claim than the five flags checked by observation.
 
 ## CI, added 2026-08-22
 `.github/workflows/tests.yml` runs both suites on push to `main` and on pull requests.
 The docker half is the reason it exists: GitHub's Linux runners ship a real daemon, so
-the hardening flags stay checked on a machine that is not Ori's laptop. Steps are named
+the hardening flags stay checked on a machine that is not the development one. Steps are named
 separately so a red build says which half broke.
 
-Two consequences for later sittings. The suite must never need an API key, so the fake
-LLM planned for sitting 3 is a CI requirement and not a convenience. And this is signal,
+Two consequences for later work. The suite must never need an API key, so the fake
+LLM layer planned at the time is a CI requirement and not a convenience. And this is signal,
 not enforcement: turning it into an actual gate needs branch protection on `main`, a
 repository setting nobody has flipped yet.
 
 ## Refusal policy, decided 2026-08-23
 The input is a script nobody trusts and the model has cybersecurity safeguards, so a
-refusal is an expected outcome rather than an edge case. Decided with Ori:
+refusal is an expected outcome rather than an edge case. Decided:
 
 Retry once, on a counter separate from the repair budget. The repair loop works because
 each attempt carries new evidence; a refusal retry resends identical text and hopes the
@@ -400,7 +423,7 @@ probed is not.
 `base_image` never reached the gate. The gate is now a `Gate` Protocol taking the
 dockerfile, the declared base image, and the set of filenames a `COPY` may name. All three
 are passed rather than inferred, and `allowed_files` holds only the script today so the
-manifest arriving in a later sitting grows the set instead of changing the signature. Two
+manifest arriving later grows the set instead of changing the signature. Two
 tests cover it, one asserting what the gate is handed and one where a gate catches a model
 declaring `python:3.12-slim` while writing `FROM ubuntu:22.04`.
 
@@ -415,7 +438,7 @@ previous Dockerfile and the opening template has no slot for it. There is now a 
 template, `RETRY`, for the case where the reply was unusable but there is nothing to
 correct. The test asserts the two prompts differ.
 
-## Sitting 6, first of five
+## The workspace
 `envforge/workspace.py`. The only code in the project that handles a path.
 
 Tools and the sandbox will ask for names and contents and never receive a path, so there
@@ -441,7 +464,7 @@ Three decisions worth naming:
 in without touching a caller: an upload has no directory, and a build running as a
 Kubernetes Job has no host filesystem to point at.
 
-## Sitting 6, second of five
+## The build context, taken as contents
 `Sandbox.build` takes a mapping of names to contents instead of a `Path`, and `Agent.run`
 takes a `Workspace` instead of a script path. The agent no longer receives a path at all,
 and a test asserts that by reading the signature, because if a `Path` ever comes back the
@@ -460,7 +483,7 @@ The build context can hold more than one file, so a manifest can be copied into 
 `allowed_files` reaching the gate is the set the workspace actually gathered rather than a
 hardcoded singleton, so a `COPY` may name the script and any manifest beside it and
 nothing else. That is the rule that stops the model writing `COPY requirements.txt` for a
-file the build cannot see, which the tools in sitting 7 would otherwise have manufactured.
+file the build cannot see, which the tool loop would otherwise have manufactured.
 
 The sandbox refuses a name that is not a bare filename. The workspace only ever produces
 bare names, so that is defence in depth rather than the guard that matters: the sandbox
@@ -476,7 +499,7 @@ reasoning, and an empty name now raises `SandboxError` rather than `IsADirectory
 
 Reaching it required a workspace holding a file with that name, which today is impossible
 because the sibling menu is ours and the extension rule keeps a script called Dockerfile
-out. It becomes reachable the moment sitting 7 grows that menu, which is a plausible thing
+out. It becomes reachable the moment the tool loop grows that menu, which is a plausible thing
 to want.
 
 A silent policy change worth naming: a script with a latin-1 comment used to run with
@@ -484,7 +507,7 @@ replacement characters, because the agent read with `errors="replace"`. There is
 reader now and it is strict, so such a script is refused at ingestion. Defensible, but a
 decision rather than a consequence.
 
-## Sitting 6, third of five
+## The outcome, slimmed to totals
 `Outcome` carries totals rather than payloads. It held every `Call`, and a `Call` holds the
 full request and response JSON, which is harmless at four small calls and megabytes once a
 tool loop runs fifteen turns, on the one event every consumer has to hold.
@@ -509,17 +532,16 @@ were the replies not returning a usage, so the totals now count every reply, and
 contrast between `calls` and tokens that this paragraph draws no longer exists.
 
 The same review asked for raw request and response bodies on failed provider replies. That
-needs the provider error types to retain wire data, so it is deferred explicitly to sitting
-8's trace design rather than half-built here.
+needs the provider error types to retain wire data, so it is deferred explicitly to the trace module's design rather than half-built here.
 
-## Sitting 6, fourth of five
+## The event vocabulary
 `envforge/events.py`. The twelve kinds an engine may yield, and who wrote every string in
 each one. `Event` checks both at construction, so an engine that invents `node_entered`
 fails there rather than putting a record in the trace that nobody can label.
 
 The closed set is the smaller half. The labels are the reason this had to happen before
 the LangGraph port and before the trace: a reader cannot tell whether a string came from
-us, the model, a container or the files the run was handed, and neither can sitting 8's
+us, the model, a container or the files the run was handed, and neither can the
 trace module. Only the code that emits the event knows, so a label added later is a guess
 dressed up as a record.
 
@@ -540,7 +562,7 @@ has to honour it.
 
 A fifth provenance was considered and refused. Docker's own words on `exec_failed` are the
 daemon quoting the model's ENTRYPOINT, so the untrusted author is the model and the daemon
-is not a separate one. `TOOL` exists and nothing emits it; sitting 7 does.
+is not a separate one. `TOOL` exists and nothing emits it; the tool loop will.
 
 The test that closes the loop reads `agent.py` with `ast` and asserts the kinds emitted
 there are exactly the kinds declared. Construction covers one direction, a kind emitted
@@ -553,20 +575,20 @@ that emission is the only place the answer exists, not that a consumer is immine
 
 215 tests pass.
 
-## Sitting 6, fifth of five
+## The token budget
 `envforge/budget.py`. The model spend is bounded in tokens, and `max_attempts` stays where
 it is. Two currencies, two bounds: an attempt builds an image and runs a container, which
 no count of tokens measures, while a count of attempts stops measuring the bill the moment
 one attempt can take many turns.
 
 A turn cap measures nothing on its own, because every turn resends everything before it.
-Sitting 7 makes that sharp rather than theoretical: each file the model reads stays in the
+The tool loop makes that sharp rather than theoretical: each file the model reads stays in the
 conversation for every turn after it.
 
 Part of the total is reserved and cannot be spent on looking around. `can_investigate`
 asks with the reserve held back, `can_write` asks without it, and the gap between them is
 the whole idea: investigation is worth nothing if there is not enough left afterwards to
-turn it into a Dockerfile. Nothing calls `can_investigate` until sitting 7. It is here now
+turn it into a Dockerfile. Nothing calls `can_investigate` until the tool loop lands. It is here now
 because a tool loop written against a turn counter is a rewrite later rather than an
 argument, which is the test every one of the five shapes had to pass.
 
@@ -601,7 +623,7 @@ providers reads the usage off the response it already has, and `validate` failur
 charged through a small wrapper because `validate` itself knows nothing about tokens. Zero
 remains the default and now means one thing only: no reply reached us to read a usage off.
 
-This does not reopen the sitting 8 deferral. That one is about keeping raw request and
+This does not reopen the trace deferral. That one is about keeping raw request and
 response bodies for failed replies, which needs error types that retain wire data. Two
 integers are not that.
 
@@ -621,7 +643,7 @@ which OpenAI's newer models require. A test asserts the ceiling is in the reques
 and asserts the deprecated name is absent.
 
 The lesson is the one this file keeps recording. The gap was disclosed honestly in three
-places, ADR-015, the `budget.py` header and the sitting note, and every one of them called
+places, ADR-015, the `budget.py` header and the entry above, and every one of them called
 it a known gap in the estimate. None of them said the bound itself did not hold, which is
 the sentence that would have made someone fix it.
 
@@ -632,7 +654,7 @@ Before the tool loop, and as `envforge/prompts.py` rather than as text files.
 
 The reason is not tidiness and is not tool descriptions. A tool description is glued to its
 JSON schema and the schema is code, so they change as a unit and stay together. The reason
-is the failure this sitting produced three times: the `/app` trap, the `--upgrade pip`
+is the failure this stage produced three times: the `/app` trap, the `--upgrade pip`
 reflex and the missing `-y` were all the prompt describing the gate by hand while nobody
 consulted the gate.
 
@@ -653,7 +675,7 @@ per-language yet. The gate is language-agnostic and the only per-language facts 
 live in `LANGUAGES`. A split now is scaffolding for a tenant who has not arrived.
 
 ## The deterministic inspection layer, decided 2026-08-25
-Ori's proposal, closing the observability gap without the second model call Ben's design
+Proposed and accepted, closing the observability gap without the second model call Ben's design
 uses. Accepted with two corrections.
 
 It is a different thing rather than the same thing in a costume. Ben's intermediate is a
@@ -675,7 +697,7 @@ injecting recreates Ben's early binding, though it does. It is that a diff compu
 data we handed the model measures compliance rather than competence: agreement with a list
 it never saw is evidence, and agreement with a list we gave it is nothing. Two more: our
 list is incomplete by construction, since dynamic imports are exactly where `ast` fails, so
-an anchored model gets worse precisely where reading beats parsing. And sitting 7's exit
+an anchored model gets worse precisely where reading beats parsing. And the tool loop's exit
 ticket is a run where the model's investigation changed the outcome, which stops being
 attributable to the tools if a digest was injected.
 
@@ -696,12 +718,12 @@ one afternoon away. Today's fallback installs nothing, so a refusal degrades a r
 transcribing fallback would install attacker-named packages with no model involved, turning
 refusal from degrade into escalate.
 
-## Sitting 7 policy, decided 2026-08-25 before any of it is built
+## Manifest policy, decided 2026-08-25 before any of it is built
 The tools exist for one reason worth stating plainly: an import name is not a package name.
 `import cv2` needs `opencv-python-headless`, and no amount of reading the script reveals
 that while a `requirements.txt` states it. That single case is what makes the tools
 load-bearing rather than decorative, and a run where the manifest changed the outcome is
-the demo the whole sitting has to produce.
+the demo that work has to produce.
 
 What a manifest is here. It sits beside the script, we never write it, a developer did, so
 it is untrusted text exactly like the script. It is optional: only the script is required
@@ -751,126 +773,3 @@ paths and `--index-url`, so a package can only arrive by name from the default i
 Beyond that, containment is the container, which is the `pip install` argument in general,
 and the real fix is the offline install after pre-resolution recorded in LATER.
 
-## Before sitting 7, and blocking it
-Ori's request 2026-08-25. Go over the layout and the accounts before any of sitting 7 is
-written, because both have grown by accretion and neither has been looked at since the
-project changed shape.
-
-On disk: `~/Projects/envforge/` holds `v1`, `private` and `agent`. Decide what is still
-live, what is history worth keeping, and what is neither. `private` in particular has
-accumulated planning documents from a project this one no longer continues.
-
-On GitHub, corrected 2026-08-30: this was written as "two repositories nobody is using" and
-both halves of that were wrong. `GrossmanOri/envforge-private` is the remote of the notes
-directory and is in daily use. `GrossmanOri/envforge` is v1's remote, so it is not in use
-but is history worth keeping rather than clutter. The decision left is archive or keep for
-v1, one line of reasoning either way so it is not remade later.
-
-Also found the same day: this repository is public, while the operating rules described it
-as private. No note file has ever been committed here, so the rule held in substance, but
-one paragraph above did name a notes file by path when deferring a piece of work. That
-reference is gone in the same commit as this line. The rule it breaks is not only about
-leaking: a pointer a reader cannot follow is a broken link, so a public record should say
-what was decided and never where the decision is filed.
-
-Not a tidiness exercise. A directory nobody has audited is where a stale document sits
-quoting a design that no longer exists, which has already happened twice in this project
-with ARCHITECTURE.md and STATUS.md.
-
-## Next
-Sitting 6 is the five shapes, which needs no model at all.
-Sitting 7 is the CLI, whose exit ticket is `python -m envforge script.py` against a real
-Anthropic call. Changed 2026-08-30 from the tool loop, which moves to sitting 8: nothing has
-been run end to end yet, and the loop is better judged against a real run than against a
-test. Sitting 9 is the LangGraph port as a real two-node cycle. The plan is twelve sittings
-now, not eleven, and the brief below is the current one.
-
-## Brief for sitting 7: make it runnable
-Written 2026-08-30, before the code, so the argument can be attacked first. Replaces an
-earlier draft of this brief that made sitting 7 the tool loop.
-
-**The audit above still blocks this, and goes first.** `~/Projects/envforge/` holds `v1`,
-`private` and `agent`, and the two unused GitHub repositories are still undecided. That was
-Ori's condition on 25 August and nothing here changes it. It is also cheaper to do before a
-CLI than after, because packaging is the first thing that has to know which directory is
-the project.
-
-### Why the CLI and not the tool loop
-Six sittings in, there is no `__main__.py`. README says so plainly: nothing can be run from
-a shell. Every part built so far is exercised only by tests and by driving it from a Python
-prompt. That is the real cost the project is carrying, and it is larger than any design
-question currently open.
-
-Building the tool loop first adds a fifth part to a machine nobody has run end to end. The
-loop also gets better if it lands second, because it can then be judged by what it does to
-a real run instead of by what a test asserts about it.
-
-### What sitting 7 builds
-`envforge/__main__.py`. One script in, one verdict out. `python -m envforge script.py`
-against a real Anthropic call, and a run that a person can read the output of.
-
-Three things fall out of it that are on this list because a CLI cannot ship without them,
-not because they are interesting on their own.
-
-**A provider failure has to stop the run properly.** `agent.py` catches
-`(InvalidArguments, Truncated, LLMError)`. A dead API key raises `AuthenticationError`, an
-exhausted account raises `PermissionDeniedError` with `.type == "billing_error"`, and a
-rate limit raises `RateLimitError`. None of those is an `LLMError`, so today each one
-escapes the generator: traceback, no `finished` event, no outcome, spend unrecorded. A
-command line tool that dies this way on an expired key is not shippable.
-
-These must never reach the fallback path. A refusal is an HTTP 200 with
-`stop_reason == "refusal"`; every failure above is an exception with no response body, so
-the protocol separates them cleanly and only our code loses the distinction. If a dead key
-were ever mapped onto the refusal path we would build our own Dockerfile, run it, and print
-a normal-looking verdict for a run the model never saw. For a tool whose only output is a
-judgment about untrusted code, saying "fine" when the judge never arrived is the worst
-failure available. Note that 403 covers both billing and permissions, so the `.type` has to
-be read rather than the status code.
-
-**A spent budget has to stop the run too, rather than degrade it.** Today it behaves like a
-second refusal: writes our own Dockerfile, builds it, reports `ok`. The two do not mean the
-same thing. Two refusals is the model judging the script, which is information about the
-script. A spent budget is information about us. Falling back there prints a verdict that no
-judgment went into.
-
-**The budget becomes configurable, because the CLI is where configuration belongs.**
-Precedence, the ordinary one: an explicit constructor argument, then `ENVFORGE_TOKEN_BUDGET`,
-then the default. A `--token-budget` flag if it is free to add. Only the total is exposed.
-The reserve stays internal and is derived from it, because the reserve is arithmetic about
-one worst-case write call and not a number anyone should have to reason about.
-
-The default stays generous on purpose. Once a bound budget ends the run loudly, hitting it
-means something went wrong rather than that an allowance ran out, and there is no reason to
-keep the ceiling tight.
-
-### What moves to sitting 8
-The tool loop, with `can_investigate` getting its first caller and `TOOL` its first
-emitter. Every tool result is attacker-controlled text and goes through `bound()` before it
-reaches a prompt.
-
-### Settled, so it is not reopened
-The reserve is a fixed token count, not a fraction of the total. Sized as one worst-case
-producing call: the prompt plus the output ceiling, which is 32,000 today. A fraction would
-lock away more the more generous the total, which is backwards, since a bigger budget does
-not make the final write call more expensive. The code already does this and needs no
-change. Ori raised it, Gemini agreed, recorded here so the next reader does not re-derive it.
-
-## Superseded
-Sitting 5: the LangGraph port. The same loop as graph nodes behind one interface, with the
-plain engine kept so the two can be compared rather than replaced.
-
-Default provider spec decided 2026-08-22: `anthropic:claude-sonnet-5`. Native SDK with
-strict tool use, which is the only path that gives a grammar guarantee for Claude, and
-cheap enough that the capped repair loop can run its attempts without the cost being the
-reason we stop. `ANTHROPIC_API_KEY` in the environment, never in a file.
-Nothing blocks sitting 3 now.
-
-## Sittings
-1 cage (done) | 2 sandbox (done) | 3 llm (done) | 4 plain loop (done) | 5 gate (done) |
-6 the five shapes (done) | 7 tool loop | 8 LangGraph port | 9 trace | 10 verdict |
-11 prompts and cost | 12 packaging
-
-The numbering from 5 onwards no longer matches the plan file, and this line is what the
-repository actually did rather than what was planned. 6 to 12 are Ori's to confirm or
-renumber; the names are taken from the Next paragraph above, which is the newer record.
