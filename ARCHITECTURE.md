@@ -160,8 +160,9 @@ Decided 2026-08-25, revised 2026-08-27. `Outcome` held every `Call`, and a `Call
 full request and response JSON. Harmless at four small calls and megabytes once a tool loop
 runs fifteen turns, on the one event every consumer must hold. It now carries a `Usage` of
 counts and token totals plus a full UUID `run_id`; the whole `Call` rides the `wrote` event,
-which carries the same `run_id`. `Usage.calls` counts every request sent to the model, while
-its token totals count only replies that returned usage. Rejected: dropping the bodies until
+which carries the same `run_id`. `Usage.calls` counts every request sent to the model, and
+since invariant 18 its token totals count every reply that reported a usage, a refusal and a
+truncation included, rather than successes alone. Rejected: dropping the bodies until
 the trace module exists, which would lose the wire JSON the trace is being built to record.
 
 Raw provider bodies for refusals, truncations and invalid replies are not yet preserved.
@@ -169,7 +170,7 @@ They need error types that retain provider wire data, so the trace module in sit
 that design rather than adding half a trace to the repair loop.
 
 ### ADR-014: the engine seam is a labelled vocabulary, not a topology
-Decided 2026-08-27. `envforge/events.py` holds the eleven kinds an engine may yield, and
+Decided 2026-08-27. `envforge/events.py` holds the twelve kinds an engine may yield, and
 `Event` refuses anything else at construction. The plain loop and the LangGraph port both
 honour it, which a node-shaped interface could not be: a plain loop has no nodes.
 

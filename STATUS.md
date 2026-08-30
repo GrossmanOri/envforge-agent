@@ -498,12 +498,16 @@ unsupported language, and carried on `wrote`. `Usage.calls` now counts every req
 including a refusal, while token totals remain limited to replies that returned usage.
 Two new tests cover the full ID and the unsupported-language path. 207 tests pass.
 
+That last sentence held for four days only. The budget piece below found that the failures
+were the replies not returning a usage, so the totals now count every reply, and the
+contrast between `calls` and tokens that this paragraph draws no longer exists.
+
 The same review asked for raw request and response bodies on failed provider replies. That
 needs the provider error types to retain wire data, so it is deferred explicitly to sitting
 8's trace design and recorded in `private/LATER.md` rather than half-built here.
 
 ## Sitting 6, fourth of five
-`envforge/events.py`. The eleven kinds an engine may yield, and who wrote every string in
+`envforge/events.py`. The twelve kinds an engine may yield, and who wrote every string in
 each one. `Event` checks both at construction, so an engine that invents `node_entered`
 fails there rather than putting a record in the trace that nobody can label.
 
@@ -513,7 +517,7 @@ us, the model, a container or the files the run was handed, and neither can sitt
 trace module. Only the code that emits the event knows, so a label added later is a guess
 dressed up as a record.
 
-Authors are a set per string, not one value per event. Three of the eleven made that
+Authors are a set per string, not one value per event. Three of the twelve made that
 necessary rather than tidy. `gate_rejected` carries a Dockerfile that is the model's on
 every path but one, since after two refusals the file we wrote ourselves goes through the
 same gate and can be rejected there too. `gate_rejected` is our own sentence quoting the model's line
