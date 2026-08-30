@@ -22,19 +22,36 @@ Not built: the verdict, the trace, and the command line entry point. There is no
 means. The model also has no tools: it reads the script once and writes a Dockerfile, which
 makes this a workflow with a feedback loop rather than an agent.
 
-238 tests, 225 of which need neither Docker nor an API key. Both suites run on every push
+240 tests, 227 of which need neither Docker nor an API key. Both suites run on every push
 and every pull request.
 
 ## The default provider, decided 2026-08-22 and not yet built
 `anthropic:claude-sonnet-5`. The native SDK with strict tool use, which is the only path
 that grammar-constrains Claude's arguments, and cheap enough that the capped repair loop can
-spend its attempts without cost being the reason a run stops. `ANTHROPIC_API_KEY` is read
-from the environment and never from a file.
+spend its attempts without cost being the reason a run stops.
 
 Stated as a decision rather than as behaviour, because `make_llm(spec)` requires a spec and
 there is no default anywhere in the code. Nothing chooses a provider today, since nothing
 starts a run without being handed one. The default lands with the command line entry point,
 which is the first caller that will have to pick one.
+
+## Keys come from a .env, reversed 2026-08-30
+The original decision said the key was read from the environment and never from a file.
+That is now the opposite: `.env.example` ships in the repository, a developer copies it to
+`.env`, and the command line entry point loads it.
+
+The reversal is recorded rather than the old sentence quietly deleted, because the reasoning
+changed and not the facts. Reading from the environment is marginally safer, since a secret
+in a process environment is not a secret on disk. It is also the wrong trade for a project
+whose main cost right now is that nobody can run it: a `.env` with a checked-in example is
+what a person cloning this expects, and every extra step between cloning and a first run is
+a step where they stop.
+
+What actually holds the line is unchanged and is now enforced rather than remembered. `.env`
+is in `.gitignore`, `.env.example` carries placeholders only, and a test asserts both: that
+`.env` is ignored by git, and that nothing in the example file looks like a credential. The
+risk in this pattern was never the file, it was the day someone pastes a real key into the
+example and commits it.
 
 ## The gate
 An allowlist of six instructions and nothing else: FROM, COPY, RUN, USER, CMD, ENTRYPOINT.

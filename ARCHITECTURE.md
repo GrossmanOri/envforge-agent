@@ -222,6 +222,23 @@ fire. A bound that holds on one provider out of three is not a bound.
 than once, and a budget carrying its own spent total would let the first run bound the
 second.
 
+### ADR-016: keys come from a .env, and a test guards the example
+Decided 2026-08-30, reversing the 2026-08-22 decision that the key is read from the
+environment and never from a file. `.env.example` ships here with placeholders, a developer
+copies it to `.env`, and the command line entry point loads it with a standard loader.
+
+The reversal is about cost, not about safety. Reading only from the environment is
+marginally safer, because a secret in a process environment is not a secret on disk. It is
+the wrong trade for a project whose largest problem is that nobody can run it: a `.env` with
+a checked-in example is what someone cloning this expects, and every step between cloning
+and a first run is a step where they stop. Rejected: the OS keychain, which is safer again
+and asks a new reader to learn a platform-specific command before anything works.
+
+What holds the line is that `.env` is in `.gitignore` and `.env.example` carries
+placeholders only, and both are asserted by a test rather than remembered. The failure this
+guards is not the file existing; it is the day a real key is pasted into the example and
+committed to a public repository, which no convention prevents and a test does.
+
 ## What crosses each boundary
 
 | from | to | payload |
