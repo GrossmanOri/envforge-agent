@@ -39,6 +39,34 @@ class LLMError(Exception):
         self.output_tokens = output_tokens
 
 
+class ProviderUnavailable(Exception):
+    """We could not reach the model at all: a dead key, an empty account, a rate limit,
+    a network failure.
+
+    Deliberately not an `LLMError`. The loop catches the three `LLMError` types as
+    repairable, meaning the reply was unusable and a rewritten prompt might do better.
+    Nothing about this is repairable, and asking again spends money to fail identically.
+
+    The distinction that matters is not the retry policy though, it is what the run is
+    allowed to conclude. A refusal is a successful HTTP 200 with `stop_reason` set to
+    `refusal`, and it is the model judging the script, which is a finding. Everything
+    here is an exception with no response body at all, and it is our infrastructure
+    failing, which is not a finding about anything. If these ever reached the refusal
+    path we would build our own Dockerfile, run it, and report an ordinary-looking
+    verdict on a run the model never saw. For a tool whose only product is a judgment
+    about untrusted code, saying "fine" when the judge never arrived is the worst
+    failure available.
+
+    `kind` names which one, because the HTTP status does not: an exhausted account and a
+    key without model access are both 403, separated only by the error type the provider
+    reports.
+    """
+
+    def __init__(self, message: str, kind: str = "unavailable"):
+        super().__init__(message)
+        self.kind = kind
+
+
 class InvalidArguments(LLMError):
     """Arguments came back but do not satisfy the schema. Repairable."""
 
@@ -121,6 +149,39 @@ def validate(arguments: Any, tool: Tool) -> dict[str, Any]:
     return arguments
 
 
+def reachable(send):
+    """Call the provider, and turn "we could not reach it" into one typed failure.
+
+    Both SDKs raise their own exception classes, and neither is an `LLMError`, so
+    without this they escape the loop's handlers entirely: the run dies mid-generator
+    with a traceback, no outcome, and whatever was already spent unrecorded.
+
+    Matched by HTTP status rather than by class name, because the two SDKs do not share
+    a hierarchy and the statuses are the part both agree on. 403 is read further, since
+    an exhausted account and a key that cannot use the model are the same status and
+    only the provider's own error type separates them.
+    """
+    try:
+        return send()
+    except Exception as exc:               # noqa: BLE001 - narrowed immediately below
+        status = getattr(exc, "status_code", None)
+        if status is None:
+            # No status means no HTTP response: DNS, TLS, a dropped connection. The
+            # SDKs both name these `APIConnectionError`, which we match on rather than
+            # import, so this module keeps working if only one SDK is installed.
+            if "connection" in type(exc).__name__.lower():
+                raise ProviderUnavailable(f"could not reach the provider: {exc}",
+                                          kind="network") from exc
+            raise
+        kind = {401: "auth", 429: "rate_limit"}.get(status)
+        if status == 403:
+            reported = getattr(exc, "type", "") or ""
+            kind = "billing" if "billing" in reported else "permission"
+        if kind is None:
+            raise
+        raise ProviderUnavailable(f"{kind}: {exc}", kind=kind) from exc
+
+
 def charge(check, arguments: Any, tool: Tool, spent: tuple[int, int]) -> dict[str, Any]:
     """Run `validate` and make sure a failure carries what the reply cost.
 
@@ -171,7 +232,7 @@ class AnthropicLLM:
 
     def call(self, system: str, user: str, tool: Tool) -> Call:
         request = self.build_request(system, user, tool)
-        response = self._client.messages.create(**request)
+        response = reachable(lambda: self._client.messages.create(**request))
         spent = self.tokens(response)
         if response.stop_reason == "refusal":
             details = response.stop_details
@@ -254,7 +315,7 @@ class OpenAICompatLLM:
 
     def call(self, system: str, user: str, tool: Tool) -> Call:
         request = self.build_request(system, user, tool)
-        response = self._client.chat.completions.create(**request)
+        response = reachable(lambda: self._client.chat.completions.create(**request))
         spent = self.tokens(response)
         choice = response.choices[0]
         refusal = getattr(choice.message, "refusal", None)

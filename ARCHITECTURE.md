@@ -66,6 +66,9 @@ same gate before any build.
 19. Every event an engine yields is one of a closed set, and every string it carries has
     its authors declared. An engine cannot invent a kind, and no record reaches a reader
     without saying whether we wrote it.
+20. A run that cannot reach the model, or that exhausts its token budget, ends with
+    `ok` false and never falls back to a Dockerfile we wrote. Neither is a finding about
+    the script, and a verdict no judgment went into must not be reported as a success.
 
 Invariants 4 and 5 are asserted against the argv that `sandbox.py` actually builds, so
 dropping a flag from the code fails a test rather than passing review.
@@ -238,6 +241,37 @@ What holds the line is that `.env` is in `.gitignore` and `.env.example` carries
 placeholders only, and both are asserted by a test rather than remembered. The failure this
 guards is not the file existing; it is the day a real key is pasted into the example and
 committed to a public repository, which no convention prevents and a test does.
+
+### ADR-017: the command line, and the two failures it forced
+Decided 2026-08-30. `envforge/__main__.py`. `python -m envforge script.py` runs one script
+end to end and `--check` verifies the key without spending a call. It is the first caller
+this project has had: everything under it was driven by tests until now.
+
+Two failures were fixed because a command line cannot ship with them, and both are the same
+mistake in different places. A run has to be able to say honestly that it failed.
+
+A spent budget used to fall back to the Dockerfile we write ourselves, copying the shape of
+a second refusal. The two do not mean the same thing. A refusal is the model judging the
+script, which is information about the script. A spent budget is information about us, and
+building on it prints a verdict no judgment went into. It now ends the run. That is also
+what allows the ceiling to be generous, since hitting it then means something went wrong
+rather than that an allowance ran out.
+
+A provider failure was not caught at all. `AuthenticationError`, `PermissionDeniedError`
+and `RateLimitError` are none of the three `LLMError` types the loop handles, so each one
+escaped the generator: no outcome, and whatever had been spent unrecorded. `llm.reachable`
+now turns them into one `ProviderUnavailable`, deliberately not an `LLMError` so it cannot
+reach the repair path. Matched on HTTP status rather than exception class, because the two
+SDKs share no hierarchy; 403 is read further, since an exhausted account and a key without
+model access are the same status and only the provider's error type separates them.
+
+The exit code carries the distinction to the shell. `1` is the script running and failing,
+which is a result. `3` and `4` are this tool being unable to work. A caller that collapsed
+them would treat a dead key as a verdict about the code it was given.
+
+Configuration is `.env` first, then the environment, with `--token-budget` and
+`ENVFORGE_TOKEN_BUDGET` for the total only. The reserve stays internal: it is arithmetic
+about one worst-case producing call, not a number anyone should have to reason about.
 
 ## What crosses each boundary
 

@@ -17,12 +17,12 @@ deterministic gate every Dockerfile passes before a build, the repair loop, the 
 that is the only code here handling a path, the closed event vocabulary with its provenance
 labels, and the token budget.
 
-Not built: the verdict, the trace, and the command line entry point. There is no
-`__main__.py`, so **this cannot yet be run from a shell**, and nothing decides what a run
-means. The model also has no tools: it reads the script once and writes a Dockerfile, which
-makes this a workflow with a feedback loop rather than an agent.
+Not built: the verdict and the trace. The command line reports what a script did and what
+it cost; nothing yet decides what that behaviour means. The model also has no tools: it
+reads the script once and writes a Dockerfile, which makes this a workflow with a feedback
+loop rather than an agent.
 
-240 tests, 227 of which need neither Docker nor an API key. Both suites run on every push
+268 tests, 255 of which need neither Docker nor an API key. Both suites run on every push
 and every pull request.
 
 ## The default provider, decided 2026-08-22 and not yet built
@@ -34,6 +34,65 @@ Stated as a decision rather than as behaviour, because `make_llm(spec)` requires
 there is no default anywhere in the code. Nothing chooses a provider today, since nothing
 starts a run without being handed one. The default lands with the command line entry point,
 which is the first caller that will have to pick one.
+
+## It runs, 2026-08-30
+`envforge/__main__.py`. The first caller this project has had. Everything under it was
+driven by tests until now, and the first real run is the only reason the two things below
+were found rather than deferred again.
+
+The run, verbatim, against a script importing `requests` and reaching for the network:
+
+    asking               attempt 1: asking for a Dockerfile
+    wrote                got 142 characters
+    building             building envforge-c32a02687da...:attempt1
+    running              running envforge-c32a02687da...:attempt1
+    finished             the script ran and exited 0
+
+    --- the Dockerfile that was built ---
+    FROM python:3.11-slim
+    COPY hello.py /app/hello.py
+    RUN ["pip", "install", "--no-cache-dir", "requests"]
+    ENTRYPOINT ["python", "/app/hello.py"]
+
+    --- what the script did (exit 0) ---
+    [stdout, written by the container, not by us]
+      | resolving example.com ...
+      | network refused, as expected: ConnectionError
+      | done
+
+One model call, 1692 tokens. The build had network, since pip needed it, and the run did
+not, which is the line the whole design rests on and which had never been demonstrated
+outside a test before.
+
+**Two failures a command line cannot ship with.** Both are the same mistake in different
+places: a run that cannot say honestly that it failed.
+
+A spent budget fell back to the Dockerfile we write ourselves, copying the shape of a
+second refusal. A refusal is the model judging the script, which is information about the
+script. A spent budget is information about us. Building on it printed a verdict no
+judgment went into and called it a success. It now ends the run, which is also what makes a
+generous ceiling safe: hitting it means something went wrong rather than that an allowance
+ran out.
+
+A provider failure was not caught at all. A dead key, an empty account and a rate limit are
+none of the three `LLMError` types the loop handles, so each escaped the generator: no
+outcome, no `finished` event, and whatever had been spent unrecorded. They are now one
+`ProviderUnavailable`, deliberately not an `LLMError` so it cannot reach the repair path.
+If it ever did, we would build our own Dockerfile, run it, and print an ordinary-looking
+verdict on a run the model never saw.
+
+**The first report hid the product.** It printed the exit code and stopped, so the actual
+output of the script, which is the only thing this tool exists to show, was not there. Found
+by running it, not by reading it. The report now ends with what the container wrote,
+labelled as the container's words rather than ours.
+
+**Where the leak test was too narrow.** It scanned Markdown only, and eleven pieces of
+internal vocabulary were still in the Python files, including one in a docstring here.
+It now scans `envforge/*.py` and `tests/*.py` too. One match was a genuine English use of
+the word, reworded rather than exempted, because an exemption list is where a strict check
+starts leaking.
+
+268 tests pass, 13 of them against the real daemon.
 
 ## Keys come from a .env, reversed 2026-08-30
 The original decision said the key was read from the environment and never from a file.

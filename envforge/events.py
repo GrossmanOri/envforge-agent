@@ -64,8 +64,9 @@ class Kind:
     authors: Mapping[str, frozenset[Provenance]]
 
 
-US, INPUT, MODEL, CONTAINER = (
-    Provenance.US, Provenance.INPUT, Provenance.MODEL, Provenance.CONTAINER)
+US, INPUT, MODEL, TOOL, CONTAINER = (
+    Provenance.US, Provenance.INPUT, Provenance.MODEL, Provenance.TOOL,
+    Provenance.CONTAINER)
 
 # One rule the table applies without saying so on every line: a number we format into
 # our own sentence does not make whoever chose it an author. "build exited 137" is ours
@@ -85,8 +86,13 @@ VOCABULARY: dict[str, Kind] = {kind.name: kind for kind in (
     _kind("refused", (US, MODEL),          # str(exc) quotes what the provider said
           reason=(MODEL,)),
     _kind("fell_back", (US,)),
-    # A count of tokens against a total, both of them ours.
+    # A count of tokens against a total, both of them ours. Terminal: a spent budget
+    # ends the run rather than falling back, so this is always followed by `finished`.
     _kind("budget_spent", (US,)),
+    # Our sentence wrapping what the provider's SDK said about why it refused us. Not
+    # about the script at all: a dead key, an empty account, a rate limit.
+    _kind("provider_unavailable", (US, TOOL),
+          kind=(US,)),
     # str(exc) on InvalidArguments names the offending field, which the model chose.
     _kind("unusable_reply", (US, MODEL)),
     _kind("wrote", (US,),                  # a character count and nothing else

@@ -56,13 +56,19 @@ a container run, which tokens do not measure. Every reply is charged, including 
 refusals and truncations we cannot use, and a truncated reply is the most expensive kind
 there is.
 
-240 tests, 227 of which need neither Docker nor an API key. Both suites run on every push
+**The command line**, `envforge/__main__.py`. `python -m envforge script.py` takes a script
+and prints what it did, and `python -m envforge --check` verifies the API key without
+spending a call. The exit code separates two things a caller must not confuse: `1` means the
+script ran and failed, which is a finding, while `3` and `4` mean this tool could not reach
+the model or ran out of its token budget, which are not findings about anything.
+
+268 tests, 255 of which need neither Docker nor an API key. Both suites run on every push
 and every pull request.
 
 ## What is designed and not built
 
-The verdict, the trace, and the command line entry point. There is no `__main__.py`, so
-there is nothing to run from a shell yet, and nothing decides what a run means.
+The verdict and the trace. The command line reports what the script did and what it cost;
+nothing yet decides what that behaviour *means*, which is the verdict's job.
 
 The model has no tools. It reads the script once and writes a Dockerfile, so it cannot look
 anything up before deciding. That makes this a workflow with a feedback loop rather than an

@@ -14,7 +14,7 @@ from envforge.agent import (
     default_dockerfile, language_for,
 )
 from envforge.budget import Budget
-from envforge.llm import Call, InvalidArguments, Refused, Truncated
+from envforge.llm import Call, InvalidArguments, ProviderUnavailable, Refused, Truncated
 from envforge.sandbox import BuildResult, DockerSandbox, Limits, RunResult
 from envforge.workspace import Files, gather
 
@@ -245,18 +245,55 @@ def test_two_refusals_fall_back_to_our_own_dockerfile(script):
 
 # --- the token budget ----------------------------------------------------------------
 
-def test_a_spent_budget_falls_back_instead_of_asking(script):
-    """The same shape as a second refusal. A run that has spent its budget still
-    produces an image, because the alternative is paying for everything up to here
-    and having nothing to show for it."""
+def test_a_spent_budget_ends_the_run_rather_than_degrading_it(script):
+    """A spent budget is not a second refusal, and used to be treated as one.
+
+    A refusal is the model judging the script, which is information about the script
+    and a fair reason to fall back to a Dockerfile we wrote. A spent budget is
+    information about us: the ceiling was too low, or something looped. Building on it
+    prints a verdict that no judgment went into and labels it a success, and a report
+    nobody can trust is worse than no report.
+
+    Ending here is also what lets the ceiling be generous. Once hitting it means
+    something went wrong rather than that an allowance ran out, there is no reason to
+    keep it tight.
+    """
     llm = FakeLLM(_call())
     sandbox = FakeSandbox()
     agent = Agent(llm, sandbox, ALLOW, budget=Budget(total=10, reserve=5))
     events, kinds, outcome = drive(agent, script)
-    assert kinds[0] == "budget_spent" and "asking" not in kinds
-    assert outcome.ok and outcome.used_fallback and outcome.usage.calls == 0
-    assert sandbox.built == [default_dockerfile("python", "s.py")]
-    assert llm.prompts == []                         # it was never asked at all
+    assert kinds == ["budget_spent", "finished"]
+    assert not outcome.ok and not outcome.used_fallback
+    assert "budget exhausted" in outcome.reason
+    assert sandbox.built == []                       # nothing was built on a spent budget
+    assert llm.prompts == []                         # and it was never asked at all
+
+
+def test_a_provider_we_cannot_reach_ends_the_run_and_never_falls_back(script):
+    """A dead key is not a finding about the script.
+
+    Before this it was not caught at all: `ProviderUnavailable` is deliberately not an
+    `LLMError`, and the loop's handlers only cover those, so the exception escaped the
+    generator. The run died with a traceback, no `finished` event, no outcome, and
+    whatever had already been spent unrecorded.
+
+    It must also never reach the fallback path. Doing so would build our own Dockerfile,
+    run it, and report an ordinary-looking verdict on a run the model never saw, which
+    for a tool whose only product is a judgment about untrusted code is the worst
+    available failure.
+    """
+    for kind, message in [("auth", "auth: 401 invalid x-api-key"),
+                          ("billing", "billing: 403 credit balance too low"),
+                          ("rate_limit", "rate_limit: 429 slow down"),
+                          ("network", "could not reach the provider")]:
+        llm = FakeLLM(ProviderUnavailable(message, kind=kind), _call())
+        sandbox = FakeSandbox()
+        events, kinds, outcome = drive(Agent(llm, sandbox, ALLOW), script)
+        assert kinds == ["asking", "provider_unavailable", "finished"], kind
+        assert not outcome.ok and not outcome.used_fallback, kind
+        assert kind in outcome.reason, kind
+        assert sandbox.built == []                   # nothing was built
+        assert llm.queue                             # and it was not asked a second time
 
 
 def test_a_reply_we_could_not_use_is_still_charged(script):

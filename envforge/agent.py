@@ -22,7 +22,8 @@ from typing import Any, Iterator, Protocol, Sequence
 from .budget import Budget, Usage
 from .budget import DEFAULT as DEFAULT_BUDGET
 from .events import Event
-from .llm import LLM, Call, InvalidArguments, LLMError, Refused, Tool, Truncated
+from .llm import (LLM, Call, InvalidArguments, LLMError, ProviderUnavailable,
+                  Refused, Tool, Truncated)
 from .sandbox import BuildResult, RunResult, Sandbox
 from .workspace import Workspace
 
@@ -346,17 +347,25 @@ class Agent:
             while dockerfile is None:
                 user = self._prompt(language, script, text, previous, evidence)
                 if not self.budget.can_write(usage(), SYSTEM, user):
-                    # The same shape as a second refusal: the model stops being asked
-                    # and we write the Dockerfile ourselves. A spent budget degrades a
-                    # run rather than ending it with nothing, and the alternative is
-                    # paying for everything up to here and having no image to show.
-                    yield Event("budget_spent",
-                                f"{usage().tokens} of {self.budget.total} tokens spent, "
-                                "using our own Dockerfile")
-                    dockerfile = default_dockerfile(language, script)
-                    base_image = LANGUAGES[language].base_image
-                    used_fallback = True
-                    break
+                    # A spent budget ends the run. It used to fall back to the
+                    # Dockerfile we write ourselves, copying the shape of a second
+                    # refusal, and the two do not mean the same thing. A refusal is the
+                    # model judging the script, which is information about the script.
+                    # A spent budget is information about us: the ceiling was too low or
+                    # something looped. Building on it prints a verdict that no judgment
+                    # went into and calls it a success, and a report nobody can trust is
+                    # worse than no report. Ending here is also what allows the ceiling
+                    # to be set generously, since hitting it now means something went
+                    # wrong rather than that an allowance ran out.
+                    spent = usage()
+                    reason = (f"token budget exhausted: {spent.tokens} of "
+                              f"{self.budget.total} spent over {spent.calls} call(s), "
+                              f"and the next one needs room this run does not have")
+                    yield Event("budget_spent", reason)
+                    yield Event("finished", reason, {"outcome": Outcome(
+                        ok=False, reason=reason, attempts=attempt, usage=spent,
+                        refusals=refusals, run_id=run_id)})
+                    return
                 yield Event("asking", f"attempt {attempt}: asking for a Dockerfile")
                 calls += 1
                 try:
@@ -371,6 +380,18 @@ class Agent:
                     base_image = LANGUAGES[language].base_image
                     used_fallback = True
                     yield Event("fell_back", "refused twice, using our own Dockerfile")
+                except ProviderUnavailable as exc:
+                    # Not repairable, and not a finding about the script. Asking again
+                    # spends money to fail identically, and falling back would print a
+                    # verdict on a run the model never saw. Ends the run, saying which
+                    # kind, because a dead key and an empty account need different
+                    # actions from whoever is reading.
+                    reason = f"the model could not be reached ({exc.kind}): {exc}"
+                    yield Event("provider_unavailable", reason, {"kind": exc.kind})
+                    yield Event("finished", reason, {"outcome": Outcome(
+                        ok=False, reason=reason, attempts=attempt, usage=usage(),
+                        refusals=refusals, run_id=run_id)})
+                    return
                 except (InvalidArguments, Truncated, LLMError) as exc:
                     # Repairable, but by rewriting the reply rather than the image.
                     charge(exc)
