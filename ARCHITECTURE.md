@@ -60,6 +60,9 @@ same gate before any build.
 17. No file in a build context may be named something the build itself interprets. A
     context file called `Dockerfile` replaces the gated one, and the container then runs
     instructions nothing checked.
+18. Every reply from the model is charged to the run's ledger, whether it was usable or
+    not. A refusal, a truncation and a schema failure all cost tokens, and a bound that
+    charged only for successes could be walked past by a loop that never succeeds.
 
 Invariants 4 and 5 are asserted against the argv that `sandbox.py` actually builds, so
 dropping a flag from the code fails a test rather than passing review.

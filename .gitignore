@@ -7,3 +7,6 @@ dist/
 .pytest_cache/
 traces/
 *.jsonl
+
+# Knowledge-graph cache, derived from the tracked files. Regenerate with /graphify.
+graphify-out/
