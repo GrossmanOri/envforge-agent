@@ -229,6 +229,13 @@ class OpenAICompatLLM:
             function["strict"] = True
         return {
             "model": self.model,
+            # The same ceiling the Anthropic path sends. Without it the budget's
+            # estimate is a guess about a limit that does not exist: `estimate` adds
+            # MAX_TOKENS on the assumption a reply cannot exceed it, so one reply here
+            # could overshoot the whole budget before the next call is refused. It also
+            # gives `Truncated` something to fire on, which is otherwise unreachable
+            # on this path.
+            "max_completion_tokens": MAX_TOKENS,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},

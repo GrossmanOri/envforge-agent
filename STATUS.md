@@ -572,8 +572,8 @@ The estimate gates and the provider's numbers record. `estimate` errs high twice
 characters-per-token rate below the real one and a reply assumed to run to the output
 ceiling, so the loop stops one call early rather than one call late. An overestimate is
 never written into the ledger and refunded, because that pessimism compounds until the
-budget is a turn cap wearing a different name. The ceiling half is an Anthropic truth
-only: `OpenAICompatLLM` still sends no ceiling, which is the known gap recorded above.
+budget is a turn cap wearing a different name. The ceiling half was an Anthropic truth only
+when this was written, and stopped being one on 30 August, below.
 
 `Budget` is frozen and holds no counters, so an `Agent` built once and run twice starts
 each run at zero. A budget carrying its own spent total would let the first run quietly
@@ -598,6 +598,28 @@ remains the default and now means one thing only: no reply reached us to read a 
 This does not reopen the sitting 8 deferral. That one is about keeping raw request and
 response bodies for failed replies, which needs error types that retain wire data. Two
 integers are not that.
+
+## The bound that only bound one provider, 2026-08-30
+A clean-context review of the branch found that `OpenAICompatLLM` sent no output ceiling.
+Anthropic was sent `max_tokens` and the other two were sent nothing, while `estimate` added
+`MAX_TOKENS` to every guess on the assumption that a reply cannot exceed it.
+
+So on two providers out of three the assumption was simply false. One reply could run past
+the whole budget before `can_write` got the chance to refuse the next call, and `Truncated`
+had nothing to fire on, since truncation is the provider enforcing a ceiling we never sent.
+The budget read as a bound and was one only under Anthropic.
+
+Both OpenAI-compatible providers are now sent `max_completion_tokens`, which Groq's own
+reference and OpenAI both document as the replacement for the deprecated `max_tokens`, and
+which OpenAI's newer models require. A test asserts the ceiling is in the request for both,
+and asserts the deprecated name is absent.
+
+The lesson is the one this file keeps recording. The gap was disclosed honestly in three
+places, ADR-015, the `budget.py` header and the sitting note, and every one of them called
+it a known gap in the estimate. None of them said the bound itself did not hold, which is
+the sentence that would have made someone fix it.
+
+232 tests pass.
 
 ## Prompts move to a module, decided 2026-08-25
 Before the tool loop, and as `envforge/prompts.py` rather than as text files.

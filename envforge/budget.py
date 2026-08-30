@@ -36,9 +36,10 @@ from .llm import MAX_TOKENS
 CHARS_PER_TOKEN = 3
 
 # One producing call at its worst: a prompt of this many characters, and a reply that
-# runs all the way to the output ceiling. The ceiling part is an Anthropic truth today,
-# since `OpenAICompatLLM` sends no ceiling at all, which is a known gap rather than a
-# decision. Under OpenAI the worst case is whatever that model does by default.
+# runs all the way to the output ceiling. The ceiling half holds on all three providers,
+# because every one of them is sent MAX_TOKENS: Anthropic as `max_tokens`, OpenAI and
+# Groq as `max_completion_tokens`. A provider we did not send a ceiling to would make
+# this whole estimate a guess about a limit that does not exist.
 WORST_PROMPT = 48_000
 DEFAULT_RESERVE = WORST_PROMPT // CHARS_PER_TOKEN + MAX_TOKENS
 # Expressed in worst-case calls rather than as a round number, so the figure means

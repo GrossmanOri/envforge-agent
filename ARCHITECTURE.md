@@ -211,8 +211,12 @@ The estimate gates and the provider's numbers record. `estimate` errs high in bo
 a characters-per-token rate below the real one and a reply assumed to run to the output
 ceiling, so the loop stops one call early rather than one call late. An overestimate is
 never written into the ledger and refunded later, because that pessimism would compound
-until the budget was a turn cap under another name. The ceiling half is an Anthropic truth
-today: `OpenAICompatLLM` still sends no ceiling, which is a known gap.
+until the budget was a turn cap under another name. The ceiling half holds on all three
+providers: Anthropic is sent `max_tokens` and the two OpenAI-compatible ones are sent
+`max_completion_tokens`, which both document as the replacement for the deprecated name.
+Until 2026-08-30 `OpenAICompatLLM` sent no ceiling at all, so on that path one reply could
+overshoot the whole budget before the next call was refused, and `Truncated` could never
+fire. A bound that holds on one provider out of three is not a bound.
 
 `Budget` is frozen and holds no counters. An `Agent` is built once and may be run more
 than once, and a budget carrying its own spent total would let the first run bound the

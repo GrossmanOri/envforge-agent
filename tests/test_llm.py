@@ -102,6 +102,22 @@ def test_openai_asks_for_strict_and_groq_does_not():
     assert groq_request["tool_choice"]["function"]["name"] == "write_dockerfile"
 
 
+def test_every_provider_sends_an_output_ceiling():
+    """ARCHITECTURE.md invariant 18 and ADR-015. `budget.estimate` assumes a reply
+    cannot exceed MAX_TOKENS, so a provider we do not send a ceiling to makes that
+    assumption false and lets one reply overshoot the whole budget. It is also the
+    only thing `Truncated` can fire on, so without it that path is unreachable.
+
+    `max_completion_tokens` rather than `max_tokens`: both OpenAI and Groq document
+    the latter as deprecated in favour of it, and OpenAI's newer models reject it.
+    """
+    for llm in (OpenAICompatLLM("gpt-5", client=object()),
+                OpenAICompatLLM("llama", strict=False, client=object())):
+        request = llm.build_request("s", "u", TOOL)
+        assert request["max_completion_tokens"] == MAX_TOKENS
+        assert "max_tokens" not in request
+
+
 def test_a_schema_that_strict_mode_would_reject_is_refused_at_construction():
     with pytest.raises(ValueError, match="additionalProperties"):
         Tool("t", "d", {"type": "object", "properties": {}, "required": ["a"]})
