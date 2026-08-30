@@ -176,11 +176,41 @@ def _force_remove(name: str) -> None:
         pass  # A wedged daemon is not a reason to lose the run's result.
 
 
+def daemon_error() -> str | None:
+    """Why Docker cannot be used, or None if it can.
+
+    One cheap call before the loop starts. Without it a stopped daemon looked exactly
+    like three failed builds: the agent spent three paid model calls asking for repairs
+    to a Dockerfile that was already correct, then reported the script as having run and
+    failed. The daemon being down is neither the model's fault nor a finding about the
+    script, and it is knowable in advance for the price of one subprocess.
+    """
+    try:
+        finished = subprocess.run(
+            ["docker", "version", "--format", "{{.Server.Version}}"],
+            capture_output=True, timeout=20, check=False)
+    except FileNotFoundError:
+        return "the docker command is not on PATH"
+    except OSError as exc:
+        return f"could not run docker: {exc}"
+    except subprocess.TimeoutExpired:
+        return "docker did not answer within 20 seconds"
+    if finished.returncode != 0:
+        detail = finished.stderr.decode("utf-8", "replace").strip().splitlines()
+        return detail[0] if detail else "the docker daemon did not answer"
+    return None
+
+
 class DockerSandbox:
     """Docker CLI on the host. No socket is mounted anywhere (invariant 7)."""
 
     def __init__(self, limits: Limits | None = None) -> None:
         self.limits = limits or Limits()
+        # Every tag this sandbox built, so whoever started the run can remove them.
+        # Cleanup is the caller's call rather than automatic: layer reuse is what makes
+        # a second run take seconds, and a loop that deleted its own base layers would
+        # pay full price every attempt.
+        self.built_tags: list[str] = []
 
     def build(self, dockerfile: str, files: Mapping[str, str], tag: str) -> BuildResult:
         """Every file lands in the context root under its own name, which is the name a
@@ -191,6 +221,10 @@ class DockerSandbox:
         second read, and a file can change between two reads.
         """
         started = time.monotonic()
+        # Recorded before the attempt, not after: a build that fails part-way still
+        # leaves layers and an image id behind, so the tag is what has to be cleaned up
+        # whether or not the build succeeded.
+        self.built_tags.append(tag)
         with tempfile.TemporaryDirectory(prefix="envforge-ctx-") as tmp:
             context = Path(tmp)
             (context / "Dockerfile").write_text(dockerfile, encoding="utf-8")

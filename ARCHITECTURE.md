@@ -69,6 +69,13 @@ same gate before any build.
 20. A run that cannot reach the model, or that exhausts its token budget, ends with
     `ok` false and never falls back to a Dockerfile we wrote. Neither is a finding about
     the script, and a verdict no judgment went into must not be reported as a success.
+21. Configuration is never read from a directory the sample controls. The `.env` is read
+    from the package's own directory only, and only four variable names are accepted from
+    it, so a file shipped beside a sample can neither supply credentials nor redirect
+    where the model call goes.
+22. What the shell learns comes from a typed `Outcome.kind`, never from matching words in
+    a sentence. `reason` splices in filenames and provider text, so a sample could
+    otherwise choose the exit code.
 
 Invariants 4 and 5 are asserted against the argv that `sandbox.py` actually builds, so
 dropping a flag from the code fails a test rather than passing review.
@@ -237,6 +244,12 @@ a checked-in example is what someone cloning this expects, and every step betwee
 and a first run is a step where they stop. Rejected: the OS keychain, which is safer again
 and asks a new reader to learn a platform-specific command before anything works.
 
+Amended 2026-08-30 after a review: the file is read from the directory holding the package
+and never from the working directory, and only `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+`GROQ_API_KEY` and `ENVFORGE_TOKEN_BUDGET` are accepted from it. The first version read
+`./.env`, and since this tool is normally run from the directory holding the sample under
+analysis, that let a sample ship configuration the process obeyed. See invariant 21.
+
 What holds the line is that `.env` is in `.gitignore` and `.env.example` carries
 placeholders only, and both are asserted by a test rather than remembered. The failure this
 guards is not the file existing; it is the day a real key is pasted into the example and
@@ -265,13 +278,26 @@ reach the repair path. Matched on HTTP status rather than exception class, becau
 SDKs share no hierarchy; 403 is read further, since an exhausted account and a key without
 model access are the same status and only the provider's error type separates them.
 
-The exit code carries the distinction to the shell. `1` is the script running and failing,
-which is a result. `3` and `4` are this tool being unable to work. A caller that collapsed
-them would treat a dead key as a verdict about the code it was given.
+The exit code carries the distinction to the shell. `1` is the script running and exiting
+nonzero, which is a result. `3` through `6` are this tool being unable to work: no provider,
+no budget, no Docker, no Dockerfile that builds. A caller that collapsed them would treat a
+dead key as a verdict about the code it was given.
 
-Configuration is `.env` first, then the environment, with `--token-budget` and
-`ENVFORGE_TOKEN_BUDGET` for the total only. The reserve stays internal: it is arithmetic
-about one worst-case producing call, not a number anyone should have to reason about.
+The code is chosen from a typed `Outcome.kind` and never from the words in `reason`. A
+first version matched substrings, and `reason` splices in the gate's quoted line, which
+carries the script's filename: a sample named "x could not be reached.py" produced the exit
+code meaning "retry, the provider was down". `Kind` has no default, because the version
+that had one reported a failed run as a success on the single path that forgot to set it.
+
+Configuration is the environment first, then the project's own `.env`, with
+`--token-budget` and `ENVFORGE_TOKEN_BUDGET` for the total only. The reserve stays internal:
+it is arithmetic about one worst-case producing call, not a number anyone should have to
+reason about.
+
+The `.env` is read from the directory holding the package and never from the working
+directory, and only four variable names are accepted from it. Both rules exist because this
+tool is normally run from the directory holding the sample it is analysing, so reading
+`./.env` let an untrusted sample supply configuration this process then obeyed.
 
 ## What crosses each boundary
 

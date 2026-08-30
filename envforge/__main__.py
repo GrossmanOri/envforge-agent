@@ -27,7 +27,7 @@ from .budget import Budget
 from .events import Event, Provenance
 from .gate import check
 from .llm import ProviderUnavailable, make_llm
-from .sandbox import DockerSandbox, SandboxError
+from .sandbox import DockerSandbox, SandboxError, daemon_error
 from .workspace import WorkspaceError, gather
 
 DEFAULT_SPEC = "anthropic:claude-sonnet-5"
@@ -42,6 +42,7 @@ EXIT_USAGE = 2
 EXIT_UNAVAILABLE = 3
 EXIT_BUDGET = 4
 EXIT_NO_DOCKER = 5
+EXIT_NO_IMAGE = 6
 
 
 # The only variables a `.env` may set. An allowlist, like the gate, and for the same
@@ -142,12 +143,26 @@ def check_key(spec: str) -> int:
 # the very label that says the output is not ours. The gate already refuses non-printables
 # in a Dockerfile for this reason; the report was the one attacker-controlled channel to a
 # terminal without the rule.
-CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+CONTROL = re.compile(
+    "[\x00-\x08\x0b-\x1f\x7f-\x9f"
+    # Bidirectional overrides and invisible separators, which are outside C0 and C1 and
+    # were still getting through. U+202E reverses the display order of everything after
+    # it, so a line can be made to read as its own opposite without a control code.
+    "\u200b-\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]")
 
 
-def printable(text: str) -> str:
-    """Replace control characters with a visible escape, keeping the length honest."""
-    return CONTROL.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
+def printable(text: str, keep_newlines: bool = False) -> str:
+    """Replace anything that acts on a terminal with a visible escape.
+
+    `keep_newlines` is for text we split ourselves and prefix line by line. Everywhere
+    else a newline is escaped too, because a single string reaching the summary can
+    otherwise forge whole lines: a reason containing "\nok - the script ran" paints a
+    convincing success block with no control character in it at all.
+    """
+    escaped = CONTROL.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
+    if keep_newlines:
+        return escaped
+    return escaped.replace("\r", "\\r").replace("\n", "\\n")
 
 
 def render(event: Event) -> str:
@@ -179,7 +194,8 @@ def report(outcome: Outcome) -> None:
 
     if outcome.dockerfile:
         print("\n--- the Dockerfile that was built ---")
-        print(printable(outcome.dockerfile.rstrip()))
+        for line in outcome.dockerfile.rstrip().splitlines():
+            print(printable(line))
 
     run = outcome.run
     if run is None:
@@ -199,7 +215,12 @@ def report(outcome: Outcome) -> None:
 
 EXIT_FOR_KIND = {
     "ran": EXIT_OK,
-    "failed": EXIT_RUN_FAILED,
+    # The script ran and exited nonzero. A finding, not a malfunction: the tool did its
+    # job and the news is bad. This was unreachable until the success path started
+    # distinguishing the two, so every failing script reported 0.
+    "script_failed": EXIT_RUN_FAILED,
+    "no_image": EXIT_NO_IMAGE,
+    "failed": EXIT_NO_IMAGE,
     "unsupported": EXIT_USAGE,
     "budget": EXIT_BUDGET,
     "unavailable": EXIT_UNAVAILABLE,
@@ -261,7 +282,11 @@ def main(argv: Sequence[str] | None = None, environ=None) -> int:
     environ = os.environ if environ is None else environ
     parser = build_parser()
     args = parser.parse_args(argv)
-    load_env(Path.cwd())
+    # No argument. Passing `Path.cwd()` here is what defeated this function's own
+    # protection: the parameter won, `PROJECT_ROOT` was never used in production,
+    # and a sample's directory was read exactly as before. The parameter exists for
+    # tests and nothing else.
+    load_env()
 
     if args.check:
         return check_key(args.model)
@@ -272,7 +297,8 @@ def main(argv: Sequence[str] | None = None, environ=None) -> int:
 
     language = args.language or language_for(args.script)
     if language is None:
-        print(f"cannot tell what language {args.script.name} is. Use --language.",
+        print(f"cannot tell what language {printable(args.script.name)} is. "
+              f"Use --language.",
               file=sys.stderr)
         return EXIT_USAGE
 
@@ -285,7 +311,8 @@ def main(argv: Sequence[str] | None = None, environ=None) -> int:
     try:
         workspace = gather(args.script, LANGUAGES[language].siblings)
     except WorkspaceError as exc:
-        print(f"cannot read {args.script}: {exc}", file=sys.stderr)
+        print(f"cannot read {printable(str(args.script))}: {printable(str(exc))}",
+              file=sys.stderr)
         return EXIT_USAGE
 
     try:
@@ -297,7 +324,14 @@ def main(argv: Sequence[str] | None = None, environ=None) -> int:
         print(f"no usable credentials for {args.model}: {exc}", file=sys.stderr)
         return EXIT_UNAVAILABLE
 
-    agent = Agent(llm, DockerSandbox(), check, budget=budget)
+    problem = daemon_error()
+    if problem is not None:
+        print(f"cannot use Docker: {printable(problem)}", file=sys.stderr)
+        print("is the daemon running?", file=sys.stderr)
+        return EXIT_NO_DOCKER
+
+    sandbox = DockerSandbox()
+    agent = Agent(llm, sandbox, check, budget=budget)
     outcome = None
     try:
         for event in agent.run(workspace, language, tuple(args.arg)):
@@ -310,9 +344,15 @@ def main(argv: Sequence[str] | None = None, environ=None) -> int:
         # catching: without it a stopped daemon looked like three failed builds, spent
         # three paid repair calls on a Dockerfile that was already correct, and then
         # reported the script as having run and failed.
-        print(f"\ncannot reach Docker: {exc}", file=sys.stderr)
-        print("is the daemon running?", file=sys.stderr)
+        print(f"\ncannot reach Docker: {printable(str(exc))}", file=sys.stderr)
         return EXIT_NO_DOCKER
+    finally:
+        # Every attempt builds a tagged image and nothing removed them, so a machine
+        # that had run this a hundred times held a hundred images. Layers are shared, so
+        # the disk cost is far smaller than the count suggests, but the clutter is real
+        # and each one was built from a Dockerfile an untrusted script influenced.
+        for tag in sandbox.built_tags:
+            sandbox.remove_image(tag)
     if outcome is None:                     # the generator cannot end without one
         print("the run ended without an outcome", file=sys.stderr)
         return EXIT_RUN_FAILED

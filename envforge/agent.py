@@ -17,7 +17,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Protocol, Sequence
+from typing import Any, Iterator, Literal, Protocol, Sequence
 
 from .budget import Budget, Usage
 from .budget import DEFAULT as DEFAULT_BUDGET
@@ -180,6 +180,13 @@ Your most recent usable Dockerfile is above. Here is the latest problem:
 Write the complete corrected Dockerfile."""
 
 
+# Every way a run can end. A closed set for the same reason the event vocabulary is one:
+# a caller switches on this, so an unlisted value is a caller reading a case it has never
+# handled.
+Kind = Literal["ran", "script_failed", "no_image", "failed",
+               "budget", "unavailable", "unsupported"]
+
+
 @dataclass(frozen=True)
 class Outcome:
     """Carried on the final event rather than returned, because a generator's return
@@ -200,7 +207,12 @@ class Outcome:
     # is reading attacker-influenced prose: a script named
     # "x could not be reached.py" was enough to turn a failed run into "we could not
     # reach the model", which tells a caller to retry something that did not happen.
-    kind: str = "ran"          # ran | failed | budget | unavailable | unsupported
+    #
+    # No default, deliberately. The first version defaulted to "ran", and one terminal
+    # path that forgot to set it therefore reported a failed run as a success and exited
+    # 0 while printing FAILED. A missing value is now a TypeError at construction, which
+    # is a test failure rather than a wrong answer to a caller.
+    kind: Kind
     dockerfile: str | None = None
     build: BuildResult | None = None
     run: RunResult | None = None
@@ -403,7 +415,11 @@ class Agent:
                     # Repairable, but by rewriting the reply rather than the image.
                     charge(exc)
                     yield Event("unusable_reply", str(exc))
-                    evidence = str(exc)   # RETRY's own heading already says what it is
+                    # Bounded like every other evidence path. This one was missed:
+                    # a provider message carrying model-chosen text put 200,000
+                    # characters into the next prompt, which the budget's estimate
+                    # was nowhere near large enough to refuse.
+                    evidence = bound(str(exc), EVIDENCE_LIMIT)
                     break
                 else:
                     charge(call)
@@ -471,10 +487,16 @@ class Agent:
                             f"{bound(result.start_error, EVIDENCE_LIMIT)}")
                 continue
 
-            # The script ran. What it did is the verdict's problem, not the loop's.
+            # The script ran. What it *means* is the verdict's problem, but whether it
+            # succeeded is observable here and the caller needs it: a run that ends in a
+            # nonzero exit is a finding, and reporting it as an unqualified success made
+            # the documented meaning of exit 1 unreachable.
             yield Event("finished", f"the script ran and exited {result.exit_code}",
                         {"outcome": Outcome(
-                            ok=True, reason="the script ran", dockerfile=dockerfile,
+                            ok=True,
+                            kind="ran" if result.exit_code == 0 else "script_failed",
+                            reason=f"the script ran and exited {result.exit_code}",
+                            dockerfile=dockerfile,
                             build=build, run=result, attempts=attempt, usage=usage(),
                             refusals=refusals, used_fallback=used_fallback,
                             run_id=run_id)})
@@ -482,7 +504,8 @@ class Agent:
 
         yield Event("finished", f"gave up after {attempt} attempts",
                     {"outcome": Outcome(
-                        ok=False, reason=f"no Dockerfile worked in {attempt} attempts",
+                        ok=False, kind="no_image",
+                        reason=f"no Dockerfile worked in {attempt} attempts",
                         dockerfile=previous, attempts=attempt, usage=usage(),
                         refusals=refusals, used_fallback=used_fallback,
                         run_id=run_id)})

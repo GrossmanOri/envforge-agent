@@ -22,7 +22,7 @@ it cost; nothing yet decides what that behaviour means. The model also has no to
 reads the script once and writes a Dockerfile, which makes this a workflow with a feedback
 loop rather than an agent.
 
-272 tests, 259 of which need neither Docker nor an API key. Both suites run on every push
+276 tests, 263 of which need neither Docker nor an API key. Both suites run on every push
 and every pull request.
 
 ## The default provider, decided 2026-08-22
@@ -152,6 +152,45 @@ provider's error text is neither a tool result nor the model's words. `PROVIDER`
 rather than overloading `TOOL`, whose real user is about to be the tool loop.
 
 272 tests pass.
+
+## The second review, and the fix that was defeated by its own call site, 2026-08-30
+Blocked again. Two of the seven fixes from the first pass did not hold, and both were
+invisible in a diff: the suite was green while a failed run reported success and while a
+sample's configuration was still being read.
+
+**The `.env` fix never ran in production.** The function pinned the path to the project's
+own directory. `main` then called it as `load_env(Path.cwd())`, so the parameter won and
+the constant was never used. The test passed because it called the function rather than the
+program. The allowlist added at the same time did hold, so the redirect was blocked, but a
+sample could still choose which account paid for the run and remove the cost ceiling.
+
+The lesson is narrow and worth keeping: a fix inside a function proves nothing about the
+program until a test drives the entry point. The replacement test calls `main` from a
+hostile directory, which is the only version of the check that could ever have failed.
+
+**A failed run exited 0.** `Outcome.kind` was set on five terminal paths and missed on the
+sixth, the one that gives up after three attempts. Its default was `"ran"`, so the CLI
+printed FAILED and told the shell everything was fine. `Kind` is now a closed `Literal`
+with no default, which turns the same mistake into a `TypeError` at construction.
+
+The same finding had a second half. The success path set `"ran"` whatever the container did,
+so a script exiting nonzero also reported 0 and the documented meaning of exit 1 was
+unreachable. Three records described a behaviour the code could not produce.
+
+**Five smaller ones.** 400 and 408 still escaped the provider wrapper, and a 400 is what
+both providers return for a prompt over the context window, which this tool can produce.
+`printable` kept newlines, so a single string reaching the summary could paint whole forged
+lines with no control character in it, and it let bidirectional overrides through, which
+reverse a line's reading order without one either. A stopped daemon still cost three paid
+repair calls before reporting the script as having run; one `docker version` probe now costs
+nothing and exits 5. `evidence = str(exc)` was the one evidence path with no bound, and a
+provider message carrying model-chosen text put 200,000 characters into the next prompt.
+And 108 images had accumulated, now removed in a `finally`.
+
+One correction to the review: it estimated the images at 21GB. Layers are shared, so
+`docker system df` reports 540MB. The clutter was real and the number was not.
+
+276 tests pass.
 
 ## Keys come from a .env, reversed 2026-08-30
 The original decision said the key was read from the environment and never from a file.

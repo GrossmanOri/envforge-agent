@@ -192,7 +192,11 @@ def reachable(send):
                 raise ProviderUnavailable(f"could not reach the provider: {exc}",
                                           kind="network") from exc
             raise
-        kind = {401: "auth", 429: "rate_limit"}.get(status)
+        # 400 and 408 were the last two escaping. A 400 is what both providers return
+        # for a prompt over the context window, which this tool can produce by feeding a
+        # long log into a repair, so it is reachable rather than theoretical.
+        kind = {400: "rejected", 401: "auth", 408: "network",
+                429: "rate_limit"}.get(status)
         if status == 403:
             reported = getattr(exc, "type", "") or ""
             kind = "billing" if "billing" in reported else "permission"

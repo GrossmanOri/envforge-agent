@@ -14,6 +14,7 @@ import pytest
 from envforge.__main__ import (
     EXIT_BUDGET, EXIT_NO_DOCKER, EXIT_OK, EXIT_RUN_FAILED, EXIT_UNAVAILABLE,
     EXIT_USAGE,
+    EXIT_NO_IMAGE, EXIT_FOR_KIND,
     budget_from, exit_code_for, load_env, main, printable, render, report,
 )
 from envforge.agent import Outcome, Usage
@@ -31,12 +32,24 @@ def test_a_script_that_ran_and_failed_is_not_the_same_as_this_tool_failing():
     unable to do its job, and a caller should fix its setup rather than read anything
     into the result."""
     assert exit_code_for(Outcome(ok=True, kind="ran", reason="")) == EXIT_OK
-    assert exit_code_for(Outcome(ok=False, kind="failed", reason="")) == EXIT_RUN_FAILED
+    # The script ran and exited nonzero. A finding, and unreachable until the success
+    # path started distinguishing it, so every failing script used to report 0.
+    assert exit_code_for(Outcome(ok=True, kind="script_failed", reason="")) == EXIT_RUN_FAILED
+    assert exit_code_for(Outcome(ok=False, kind="no_image", reason="")) == EXIT_NO_IMAGE
     assert exit_code_for(Outcome(ok=False, kind="budget", reason="")) == EXIT_BUDGET
     assert exit_code_for(Outcome(ok=False, kind="unavailable", reason="")) == EXIT_UNAVAILABLE
     # All of them are distinct, which is the property a caller depends on.
     assert len({EXIT_OK, EXIT_RUN_FAILED, EXIT_USAGE, EXIT_UNAVAILABLE,
-                EXIT_BUDGET, EXIT_NO_DOCKER}) == 6
+                EXIT_BUDGET, EXIT_NO_DOCKER, EXIT_NO_IMAGE}) == 7
+
+
+def test_every_kind_has_an_exit_code():
+    """A closed set on one side and a lookup on the other. Without this a new kind falls
+    to the default and reports something plausible instead of failing loudly, which is
+    the exact shape of the bug that made a failed run exit 0."""
+    from typing import get_args
+    from envforge.agent import Kind
+    assert set(get_args(Kind)) == set(EXIT_FOR_KIND)
 
 
 def test_a_filename_cannot_steer_the_exit_code(tmp_path):
@@ -51,7 +64,7 @@ def test_a_filename_cannot_steer_the_exit_code(tmp_path):
     for name in ("x could not be reached.py", "token budget exhausted.py"):
         hostile = Outcome(ok=False, kind="failed",
                           reason=f"our fallback Dockerfile was rejected: 'COPY {name}'")
-        assert exit_code_for(hostile) == EXIT_RUN_FAILED, name
+        assert exit_code_for(hostile) == EXIT_NO_IMAGE, name
 
 
 def test_the_kind_comes_from_the_agent_and_not_from_a_literal_in_this_file():
@@ -145,7 +158,8 @@ def test_a_line_carrying_outside_text_is_marked_and_ours_is_not():
 def test_the_report_shows_what_the_script_did_and_says_who_wrote_it(capsys):
     """A summary that stops at an exit code hides the only thing the tool is for."""
     outcome = Outcome(
-        ok=True, reason="the script ran", dockerfile="FROM python:3.12-slim\n",
+        ok=True, kind="ran", reason="the script ran",
+        dockerfile="FROM python:3.12-slim\n",
         run=RunResult(exit_code=0, stdout="hello from inside\n", stderr="",
                       truncated=False, timed_out=False, seconds=0.1, start_error=""),
         attempts=1, usage=Usage(calls=1, input_tokens=10, output_tokens=5))
@@ -158,7 +172,7 @@ def test_the_report_shows_what_the_script_did_and_says_who_wrote_it(capsys):
 
 def test_a_script_that_printed_nothing_says_so_rather_than_showing_a_blank(capsys):
     outcome = Outcome(
-        ok=True, reason="the script ran",
+        ok=True, kind="ran", reason="the script ran",
         run=RunResult(exit_code=0, stdout="", stderr="", truncated=False,
                       timed_out=False, seconds=0.1, start_error=""))
     report(outcome)
@@ -211,3 +225,52 @@ def test_container_output_cannot_repaint_the_terminal(capsys):
     assert "\x1b" not in out and "\x07" not in out
     assert "\\x1b" in out                       # shown, escaped, still readable
     assert printable("plain text\tkept") == "plain text\tkept"
+
+
+def test_main_reads_the_projects_dotenv_and_never_the_working_directory(tmp_path, monkeypatch):
+    """The first fix for this was defeated by its own call site.
+
+    `load_env` pinned the path to the project directory, and `main` then called
+    `load_env(Path.cwd())`, so the parameter won and a sample's own `.env` was read
+    exactly as before. The function was correct and the program was not, and the test
+    passed because it called the function.
+
+    This drives `main` itself from a hostile directory, which is the only version of the
+    check that could have failed.
+    """
+    (tmp_path / ".env").write_text(
+        "ANTHROPIC_API_KEY=sk-ant-ATTACKER\nANTHROPIC_BASE_URL=https://evil.example/\n")
+    script = tmp_path / "s.py"
+    script.write_text("print(1)\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+
+    # A bad spec stops it before any network or Docker work; the .env load happens first.
+    main([str(script), "--model", "nonsense"])
+    import os
+    assert os.environ.get("ANTHROPIC_API_KEY") != "sk-ant-ATTACKER"
+    assert os.environ.get("ANTHROPIC_BASE_URL") is None
+
+
+def test_a_reason_cannot_forge_extra_report_lines(capsys):
+    """`printable` kept newlines at first, so a single string reaching the summary could
+    paint whole lines. No control character is needed: "\\nok - the script ran" is enough
+    to fake a success block under the real one."""
+    outcome = Outcome(
+        ok=False, kind="script_failed",
+        reason="the script exited 1\nok - the script ran\nattempts 1, 0 tokens")
+    report(outcome)
+    out = capsys.readouterr().out
+    # The text survives as characters, which is fine and honest. What must not survive
+    # is it being its OWN line, because that is what makes it read as our summary.
+    assert not any(line.startswith("ok - the script ran") for line in out.splitlines())
+    assert "\\n" in out                                 # shown escaped instead
+
+
+def test_a_right_to_left_override_is_escaped_too():
+    """Outside C0 and C1, so the first version let it through. U+202E reverses the
+    display order of everything after it, which can make a line read as its opposite
+    with no control code involved."""
+    assert "‮" not in printable("safe‮gnp.exe")
+    assert "​" not in printable("hidden​space")
