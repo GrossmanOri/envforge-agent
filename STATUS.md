@@ -769,68 +769,82 @@ with ARCHITECTURE.md and STATUS.md.
 
 ## Next
 Sitting 6 is the five shapes, which needs no model at all.
-Sitting 7 is the tool loop, whose entry ticket is one live Anthropic call and whose exit
-ticket is a run where the investigation demonstrably changed the outcome. Sitting 8 is the
-LangGraph port as a real two-node cycle. The plan is twelve sittings now, not eleven.
+Sitting 7 is the CLI, whose exit ticket is `python -m envforge script.py` against a real
+Anthropic call. Changed 2026-08-30 from the tool loop, which moves to sitting 8: nothing has
+been run end to end yet, and the loop is better judged against a real run than against a
+test. Sitting 9 is the LangGraph port as a real two-node cycle. The plan is twelve sittings
+now, not eleven, and the brief below is the current one.
 
-## Brief for sitting 7: the run has to be able to fail honestly
-Written 2026-08-30, before the code, so the argument can be attacked before it is built.
+## Brief for sitting 7: make it runnable
+Written 2026-08-30, before the code, so the argument can be attacked first. Replaces an
+earlier draft of this brief that made sitting 7 the tool loop.
 
-The tool loop is the headline, and it is not the part that needs deciding. Two questions
-have to be answered before the loop is worth writing, and both are about what a run is
-allowed to report about itself.
+**The audit above still blocks this, and goes first.** `~/Projects/envforge/` holds `v1`,
+`private` and `agent`, and the two unused GitHub repositories are still undecided. That was
+Ori's condition on 25 August and nothing here changes it. It is also cheaper to do before a
+CLI than after, because packaging is the first thing that has to know which directory is
+the project.
 
-**One. A spent budget is not a refusal, and should stop pretending to be one.**
-Today `agent.py` treats an exhausted budget exactly like a second refusal: it writes our
-own Dockerfile, builds it, and reports `ok` with `used_fallback` set. That was copied from
-the refusal path and the two do not mean the same thing. Two refusals is the model looking
-at the script and declining, which is information about the script and a fair reason to
-fall back. A spent budget is information about us: the ceiling was too low, or something
-looped. Falling back there ships a Dockerfile that no judgment went into and calls it a
-success.
+### Why the CLI and not the tool loop
+Six sittings in, there is no `__main__.py`. README says so plainly: nothing can be run from
+a shell. Every part built so far is exercised only by tests and by driving it from a Python
+prompt. That is the real cost the project is carrying, and it is larger than any design
+question currently open.
 
-So a bound budget becomes its own terminal outcome. Not `ok`, its own reason, and the trace
-says how much was spent and where. `budget_spent` stays in the vocabulary because the event
-should be visible, but it stops turning into a build. This is what lets the ceiling be set
-generously, which is the whole point: once hitting it means something went wrong, there is
-no reason to keep it tight, and a high ceiling stops causing arbitrary failures.
+Building the tool loop first adds a fifth part to a machine nobody has run end to end. The
+loop also gets better if it lands second, because it can then be judged by what it does to
+a real run instead of by what a test asserts about it.
 
-Touches `Outcome`, the vocabulary, and the three tests that currently assert the fallback.
+### What sitting 7 builds
+`envforge/__main__.py`. One script in, one verdict out. `python -m envforge script.py`
+against a real Anthropic call, and a run that a person can read the output of.
 
-**Two. An API failure is not a verdict, and right now it is not caught at all.**
-`agent.py` catches `(InvalidArguments, Truncated, LLMError)`. A dead API key raises
-`anthropic.AuthenticationError`, an exhausted account raises `PermissionDeniedError` with
-`.type == "billing_error"`, and a rate limit raises `RateLimitError`. None of those is an
-`LLMError`, so each one propagates out of the generator: the run dies mid-stream with a
-traceback, no `finished` event, no outcome, and the tokens already spent are never charged.
+Three things fall out of it that are on this list because a CLI cannot ship without them,
+not because they are interesting on their own.
 
-These must never be able to reach the fallback path. A refusal is an HTTP 200 with
-`stop_reason == "refusal"`; every failure above is a raised exception with no response body
-at all, so the protocol already separates them cleanly and only our own code loses the
-distinction. If a dead key were ever mapped onto the refusal path, we would build our own
-Dockerfile, run it, and report a normal-looking result for a run the model never saw. For a
-tool whose only output is a judgment about untrusted code, reporting "fine" when the judge
-never arrived is the worst failure available.
+**A provider failure has to stop the run properly.** `agent.py` catches
+`(InvalidArguments, Truncated, LLMError)`. A dead API key raises `AuthenticationError`, an
+exhausted account raises `PermissionDeniedError` with `.type == "billing_error"`, and a
+rate limit raises `RateLimitError`. None of those is an `LLMError`, so today each one
+escapes the generator: traceback, no `finished` event, no outcome, spend unrecorded. A
+command line tool that dies this way on an expired key is not shippable.
 
-The shape: a third error class alongside the repairable ones, for failures that are ours
-rather than the script's, ending the run loudly with what was spent. 403 needs `.type`
-read, since `billing_error` and `permission_error` share the status code.
+These must never reach the fallback path. A refusal is an HTTP 200 with
+`stop_reason == "refusal"`; every failure above is an exception with no response body, so
+the protocol separates them cleanly and only our code loses the distinction. If a dead key
+were ever mapped onto the refusal path we would build our own Dockerfile, run it, and print
+a normal-looking verdict for a run the model never saw. For a tool whose only output is a
+judgment about untrusted code, saying "fine" when the judge never arrived is the worst
+failure available. Note that 403 covers both billing and permissions, so the `.type` has to
+be read rather than the status code.
 
-**Three, and only then, the loop.** `can_investigate` gets its first caller. It already
-holds back a reserve so that investigation cannot eat the call that has to produce a
-Dockerfile. Every tool result is attacker-controlled text and goes through `bound()` before
-it reaches a prompt, and `TOOL` in the provenance table gets its first emitter.
+**A spent budget has to stop the run too, rather than degrade it.** Today it behaves like a
+second refusal: writes our own Dockerfile, builds it, reports `ok`. The two do not mean the
+same thing. Two refusals is the model judging the script, which is information about the
+script. A spent budget is information about us. Falling back there prints a verdict that no
+judgment went into.
 
-**Configuration is deliberately not in this sitting.** The budget is hardcoded because
-nothing in the project has a configuration surface yet, and inventing one for a single
-value is the wrong order. It belongs with the CLI, where the precedence can be the ordinary
-one: constructor argument, then `ENVFORGE_TOKEN_BUDGET`, then the default.
+**The budget becomes configurable, because the CLI is where configuration belongs.**
+Precedence, the ordinary one: an explicit constructor argument, then `ENVFORGE_TOKEN_BUDGET`,
+then the default. A `--token-budget` flag if it is free to add. Only the total is exposed.
+The reserve stays internal and is derived from it, because the reserve is arithmetic about
+one worst-case write call and not a number anyone should have to reason about.
 
-The judgment question to answer before writing any of it: if a run burns its whole budget
-investigating and then cannot afford to write a Dockerfile, the reserve was too small. If it
-holds back a reserve it never needs, every run pays for a call it does not make. Which of
-those two is the one to design against, and what does the answer say about whether the
-reserve should be a fixed number of tokens or a fraction of the total?
+The default stays generous on purpose. Once a bound budget ends the run loudly, hitting it
+means something went wrong rather than that an allowance ran out, and there is no reason to
+keep the ceiling tight.
+
+### What moves to sitting 8
+The tool loop, with `can_investigate` getting its first caller and `TOOL` its first
+emitter. Every tool result is attacker-controlled text and goes through `bound()` before it
+reaches a prompt.
+
+### Settled, so it is not reopened
+The reserve is a fixed token count, not a fraction of the total. Sized as one worst-case
+producing call: the prompt plus the output ceiling, which is 32,000 today. A fraction would
+lock away more the more generous the total, which is backwards, since a bigger budget does
+not make the final write call more expensive. The code already does this and needs no
+change. Ori raised it, Gemini agreed, recorded here so the next reader does not re-derive it.
 
 ## Superseded
 Sitting 5: the LangGraph port. The same loop as graph nodes behind one interface, with the
