@@ -2,8 +2,9 @@
 
 Takes a script you do not trust, has an LLM write a Dockerfile for it, builds and runs it
 in a hardened container, repairs the Dockerfile when the run fails, and reports what the
-script tried to do while it ran. Python and Bash, one file at a time. A language it does not handle is refused before the
-model is consulted.
+script tried to do while it ran. Python and Bash, one script at a time, plus the few
+sibling files that language declares, such as a `requirements.txt` found beside it. A
+language it does not handle is refused before the model is consulted.
 
 Built in the open, one piece at a time. This README separates what runs today from what is
 still design, so nothing here has to be taken on trust.
@@ -42,7 +43,20 @@ script exiting 1 could not, because the script ran, and watching it run is the p
 **The workspace**, `envforge/workspace.py`. The only code here that handles a path.
 Symlinks are resolved and then checked for containment, in that order.
 
-190 tests, 177 of which need neither Docker nor an API key. Both suites run on every push
+**The event vocabulary**, `envforge/events.py`. A closed set of the kinds a run may
+report, and for each string in them, which of us wrote it: this program, the untrusted
+input, the model, or the container. An engine that invents a kind fails when it builds the
+event rather than when someone later tries to read it. Nothing renders these yet, so the
+labels are recorded and not consumed.
+
+**The token budget**, `envforge/budget.py`. What the model may be paid for one run,
+counted in tokens rather than in turns, because every turn resends the ones before it. It
+sits alongside the attempt cap rather than replacing it, since an attempt costs a build and
+a container run, which tokens do not measure. Every reply is charged, including the
+refusals and truncations we cannot use, and a truncated reply is the most expensive kind
+there is.
+
+231 tests, 218 of which need neither Docker nor an API key. Both suites run on every push
 and every pull request.
 
 ## What is designed and not built

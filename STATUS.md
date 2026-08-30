@@ -98,7 +98,7 @@ as written. The registry-host rule stops the daemon pulling from a host the atta
 named; it does not make the image trustworthy.
 
 Sitting 4 complete: `envforge/agent.py` and `tests/test_agent.py`.
-215 tests today, 202 needing neither Docker nor an API key, 13 against the real daemon.
+231 tests today, 218 needing neither Docker nor an API key, 13 against the real daemon.
 
 ## What sitting 4 produced
 The plain repair loop. It defines `write_dockerfile` against the schema `Tool` already
