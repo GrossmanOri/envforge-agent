@@ -206,9 +206,9 @@ with the reserve held back and `can_write` asks it without; nothing calls the fi
 the tool loop lands, and it exists now because a loop written against a turn counter is a rewrite
 rather than an argument.
 
-A spent budget falls back to the Dockerfile we write ourselves, the same shape as a second
-refusal. Paying for everything up to that point and producing no image is the one outcome
-worth avoiding.
+A spent budget ended the run as of 2026-08-30, and this paragraph used to say the
+opposite: that it fell back to the Dockerfile we write ourselves, the same shape as a
+second refusal. Invariant 20 and ADR-017 hold the current rule and the argument for it.
 
 The estimate gates and the provider's numbers record. `estimate` errs high in both halves,
 a characters-per-token rate below the real one and a reply assumed to run to the output
@@ -277,7 +277,7 @@ about one worst-case producing call, not a number anyone should have to reason a
 
 | from | to | payload |
 |---|---|---|
-| CLI | agent | script path, model spec, caps  *(no CLI exists yet)* |
+| CLI | agent | a `Workspace` of names and contents, a language, and script arguments |
 | agent | LLM | script text, language, bounded failure evidence |
 | LLM | gate | Dockerfile text, declared base image |
 | gate | sandbox | approved Dockerfile, or a rejection reason |

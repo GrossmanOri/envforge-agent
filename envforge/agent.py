@@ -195,6 +195,12 @@ class Outcome:
 
     ok: bool
     reason: str
+    # What kind of ending this was, as a value rather than a sentence. `reason` splices
+    # in filenames, gate text and provider messages, so anything matching on its words
+    # is reading attacker-influenced prose: a script named
+    # "x could not be reached.py" was enough to turn a failed run into "we could not
+    # reach the model", which tells a caller to retry something that did not happen.
+    kind: str = "ran"          # ran | failed | budget | unavailable | unsupported
     dockerfile: str | None = None
     build: BuildResult | None = None
     run: RunResult | None = None
@@ -292,7 +298,8 @@ class Agent:
         go wrong with a Dockerfile we wrote ourselves, and in all three the honest
         move is to stop and say which, never to ask the model again."""
         return Event("finished", reason, {"outcome": Outcome(
-            ok=False, reason=reason, dockerfile=dockerfile, build=build, run=run,
+            ok=False, kind="failed", reason=reason, dockerfile=dockerfile,
+            build=build, run=run,
             attempts=attempt, usage=usage, refusals=refusals, used_fallback=True,
             run_id=run_id)})
 
@@ -312,7 +319,7 @@ class Agent:
             supported = ", ".join(sorted(LANGUAGES))
             yield Event("finished", f"{language} is not supported",
                         {"outcome": Outcome(
-                            ok=False,
+                            ok=False, kind="unsupported",
                             reason=f"this agent handles {supported}, not {language!r}",
                             run_id=run_id)})
             return
@@ -363,8 +370,8 @@ class Agent:
                               f"and the next one needs room this run does not have")
                     yield Event("budget_spent", reason)
                     yield Event("finished", reason, {"outcome": Outcome(
-                        ok=False, reason=reason, attempts=attempt, usage=spent,
-                        refusals=refusals, run_id=run_id)})
+                        ok=False, kind="budget", reason=reason, attempts=attempt,
+                        usage=spent, refusals=refusals, run_id=run_id)})
                     return
                 yield Event("asking", f"attempt {attempt}: asking for a Dockerfile")
                 calls += 1
@@ -389,8 +396,8 @@ class Agent:
                     reason = f"the model could not be reached ({exc.kind}): {exc}"
                     yield Event("provider_unavailable", reason, {"kind": exc.kind})
                     yield Event("finished", reason, {"outcome": Outcome(
-                        ok=False, reason=reason, attempts=attempt, usage=usage(),
-                        refusals=refusals, run_id=run_id)})
+                        ok=False, kind="unavailable", reason=reason, attempts=attempt,
+                        usage=usage(), refusals=refusals, run_id=run_id)})
                     return
                 except (InvalidArguments, Truncated, LLMError) as exc:
                     # Repairable, but by rewriting the reply rather than the image.

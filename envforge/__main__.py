@@ -16,6 +16,7 @@ crash of this tool would be wrong.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 from typing import Iterator, Sequence
@@ -26,7 +27,7 @@ from .budget import Budget
 from .events import Event, Provenance
 from .gate import check
 from .llm import ProviderUnavailable, make_llm
-from .sandbox import DockerSandbox
+from .sandbox import DockerSandbox, SandboxError
 from .workspace import WorkspaceError, gather
 
 DEFAULT_SPEC = "anthropic:claude-sonnet-5"
@@ -40,20 +41,54 @@ EXIT_RUN_FAILED = 1
 EXIT_USAGE = 2
 EXIT_UNAVAILABLE = 3
 EXIT_BUDGET = 4
+EXIT_NO_DOCKER = 5
 
 
-def load_env(root: Path) -> None:
-    """Read a local `.env` if one is there, and never complain if it is not.
+# The only variables a `.env` may set. An allowlist, like the gate, and for the same
+# reason: the interesting attack is never the name you thought of. `ANTHROPIC_BASE_URL`
+# is the one that matters, because setting it points the client at another server and
+# sends the key there, but no blocklist would have caught every equivalent.
+ENV_ALLOWED = frozenset({
+    "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY", "ENVFORGE_TOKEN_BUDGET",
+})
 
-    Optional on purpose. The environment still wins, so an exported key beats the file
-    and CI needs no file at all. `python-dotenv` is imported here rather than at module
-    scope so that a checkout without it can still run the tests.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def load_env(root: Path | None = None, environ=None) -> list[str]:
+    """Read the project's own `.env`, and only ever that one.
+
+    The location is fixed to the directory containing this package, not the working
+    directory. That is the whole point rather than a detail. This tool analyses samples
+    nobody trusts, and running it from the sample's own directory is the natural
+    workflow, so reading `./.env` means an untrusted sample can ship a config file that
+    this process then obeys. Verified before it was fixed: a `.env` beside a sample set
+    `ANTHROPIC_BASE_URL`, and the client would have sent the key to that host.
+
+    Names are filtered as well as the path, because the file being ours is a weaker
+    guarantee than it looks: it is edited by hand, copied between machines, and pasted
+    from instructions. Only credentials and our own budget setting get through.
+
+    The process environment always wins, so an exported key beats the file and CI needs
+    no file at all. Returns the names it set, so a caller can say so rather than having
+    the effect be invisible.
     """
+    import os
+    environ = os.environ if environ is None else environ
+    path = (root or PROJECT_ROOT) / ".env"
     try:
-        from dotenv import load_dotenv
+        from dotenv import dotenv_values
     except ImportError:
-        return
-    load_dotenv(root / ".env", override=False)
+        return []
+    applied = []
+    for name, value in dotenv_values(path).items():
+        if name not in ENV_ALLOWED or value is None:
+            continue
+        if environ.get(name):          # already exported: the environment wins
+            continue
+        environ[name] = value
+        applied.append(name)
+    return applied
 
 
 def check_key(spec: str) -> int:
@@ -83,7 +118,9 @@ def check_key(spec: str) -> int:
               f"without spending a call, so it was not checked further.")
         return EXIT_OK
     try:
-        models = list(client.models.list(limit=20))
+        # No kwargs: `limit` is Anthropic-only and made this command report a
+        # perfectly good OpenAI or Groq key as unusable.
+        models = list(client.models.list())
     except Exception as exc:
         status = getattr(exc, "status_code", "?")
         reported = getattr(exc, "type", "") or type(exc).__name__
@@ -100,6 +137,19 @@ def check_key(spec: str) -> int:
     return EXIT_OK
 
 
+# Everything except tab. A terminal treats these as commands, not as text: a sample can
+# clear the screen, set the window title, and repaint a convincing "ok" summary, erasing
+# the very label that says the output is not ours. The gate already refuses non-printables
+# in a Dockerfile for this reason; the report was the one attacker-controlled channel to a
+# terminal without the rule.
+CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def printable(text: str) -> str:
+    """Replace control characters with a visible escape, keeping the length honest."""
+    return CONTROL.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
+
+
 def render(event: Event) -> str:
     """One line per event, marked with who wrote it.
 
@@ -109,7 +159,7 @@ def render(event: Event) -> str:
     question a person skimming output actually needs answered.
     """
     marker = " " if event.authors() == {Provenance.US} else "!"
-    return f"{marker} {event.kind:<20} {event.message}"
+    return f"{marker} {event.kind:<20} {printable(event.message)}"
 
 
 def report(outcome: Outcome) -> None:
@@ -121,7 +171,7 @@ def report(outcome: Outcome) -> None:
     rather than printed bare so nobody reads it as ours.
     """
     print()
-    print("ok" if outcome.ok else "FAILED", "-", outcome.reason)
+    print("ok" if outcome.ok else "FAILED", "-", printable(outcome.reason))
     print(f"attempts {outcome.attempts}, "
           f"{outcome.usage.calls} model call(s), {outcome.usage.tokens} tokens")
     if outcome.used_fallback:
@@ -129,7 +179,7 @@ def report(outcome: Outcome) -> None:
 
     if outcome.dockerfile:
         print("\n--- the Dockerfile that was built ---")
-        print(outcome.dockerfile.rstrip())
+        print(printable(outcome.dockerfile.rstrip()))
 
     run = outcome.run
     if run is None:
@@ -140,21 +190,32 @@ def report(outcome: Outcome) -> None:
         if stream.strip():
             print(f"[{name}, written by the container, not by us]")
             for line in stream.rstrip().splitlines():
-                print(f"  | {line}")
+                print(f"  | {printable(line)}")
     if not run.stdout.strip() and not run.stderr.strip():
         print("  (the script produced no output)")
     if run.truncated:
         print("  (output was bounded before it reached here)")
 
 
+EXIT_FOR_KIND = {
+    "ran": EXIT_OK,
+    "failed": EXIT_RUN_FAILED,
+    "unsupported": EXIT_USAGE,
+    "budget": EXIT_BUDGET,
+    "unavailable": EXIT_UNAVAILABLE,
+}
+
+
 def exit_code_for(outcome: Outcome) -> int:
-    if outcome.ok:
-        return EXIT_OK
-    if "budget exhausted" in outcome.reason:
-        return EXIT_BUDGET
-    if "could not be reached" in outcome.reason:
-        return EXIT_UNAVAILABLE
-    return EXIT_RUN_FAILED
+    """Switch on the typed kind, never on the words in `reason`.
+
+    This matched substrings of `reason` until a review broke it. `reason` splices in
+    filenames, the gate's quoted line and provider error text, so a script named
+    "x could not be reached.py" produced exit 3, telling a caller to retry a provider
+    that had answered fine. The sample under analysis is exactly the thing an attacker
+    controls, so prose from it must never steer a machine-readable result.
+    """
+    return EXIT_FOR_KIND.get(outcome.kind, EXIT_RUN_FAILED)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -238,10 +299,20 @@ def main(argv: Sequence[str] | None = None, environ=None) -> int:
 
     agent = Agent(llm, DockerSandbox(), check, budget=budget)
     outcome = None
-    for event in agent.run(workspace, language, tuple(args.arg)):
-        print(render(event), flush=True)
-        if event.kind == "finished":
-            outcome = event.data["outcome"]
+    try:
+        for event in agent.run(workspace, language, tuple(args.arg)):
+            print(render(event), flush=True)
+            if event.kind == "finished":
+                outcome = event.data["outcome"]
+    except (OSError, SandboxError) as exc:
+        # No docker binary, or a daemon that is not running. Neither is a finding about
+        # the script and neither is the model's fault, which is what made this worth
+        # catching: without it a stopped daemon looked like three failed builds, spent
+        # three paid repair calls on a Dockerfile that was already correct, and then
+        # reported the script as having run and failed.
+        print(f"\ncannot reach Docker: {exc}", file=sys.stderr)
+        print("is the daemon running?", file=sys.stderr)
+        return EXIT_NO_DOCKER
     if outcome is None:                     # the generator cannot end without one
         print("the run ended without an outcome", file=sys.stderr)
         return EXIT_RUN_FAILED

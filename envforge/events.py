@@ -40,6 +40,10 @@ class Provenance(Enum):
     MODEL = "model"
     # A tool result. Nothing emits one yet; the tool loop will.
     TOOL = "tool"
+    # The provider's own error text, which is neither the model's words nor a tool's.
+    # Added rather than folding it into TOOL: overloading a value makes `authors()` lie
+    # to the tool loop that is about to become TOOL's real user.
+    PROVIDER = "provider"
     CONTAINER = "container"
 
 
@@ -64,8 +68,8 @@ class Kind:
     authors: Mapping[str, frozenset[Provenance]]
 
 
-US, INPUT, MODEL, TOOL, CONTAINER = (
-    Provenance.US, Provenance.INPUT, Provenance.MODEL, Provenance.TOOL,
+US, INPUT, MODEL, PROVIDER, CONTAINER = (
+    Provenance.US, Provenance.INPUT, Provenance.MODEL, Provenance.PROVIDER,
     Provenance.CONTAINER)
 
 # One rule the table applies without saying so on every line: a number we format into
@@ -91,7 +95,7 @@ VOCABULARY: dict[str, Kind] = {kind.name: kind for kind in (
     _kind("budget_spent", (US,)),
     # Our sentence wrapping what the provider's SDK said about why it refused us. Not
     # about the script at all: a dead key, an empty account, a rate limit.
-    _kind("provider_unavailable", (US, TOOL),
+    _kind("provider_unavailable", (US, PROVIDER),
           kind=(US,)),
     # str(exc) on InvalidArguments names the offending field, which the model chose.
     _kind("unusable_reply", (US, MODEL)),

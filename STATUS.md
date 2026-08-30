@@ -22,18 +22,18 @@ it cost; nothing yet decides what that behaviour means. The model also has no to
 reads the script once and writes a Dockerfile, which makes this a workflow with a feedback
 loop rather than an agent.
 
-268 tests, 255 of which need neither Docker nor an API key. Both suites run on every push
+272 tests, 259 of which need neither Docker nor an API key. Both suites run on every push
 and every pull request.
 
-## The default provider, decided 2026-08-22 and not yet built
+## The default provider, decided 2026-08-22
 `anthropic:claude-sonnet-5`. The native SDK with strict tool use, which is the only path
 that grammar-constrains Claude's arguments, and cheap enough that the capped repair loop can
 spend its attempts without cost being the reason a run stops.
 
-Stated as a decision rather than as behaviour, because `make_llm(spec)` requires a spec and
-there is no default anywhere in the code. Nothing chooses a provider today, since nothing
-starts a run without being handed one. The default lands with the command line entry point,
-which is the first caller that will have to pick one.
+This was a decision with nothing implementing it until 30 August: `make_llm(spec)` requires
+a spec, and nothing chose one because nothing started a run without being handed one. The
+command line was the first caller that had to pick, and it is where the default now lives,
+as `DEFAULT_SPEC` in `envforge/__main__.py`.
 
 ## It runs, 2026-08-30
 `envforge/__main__.py`. The first caller this project has had. Everything under it was
@@ -93,6 +93,65 @@ the word, reworded rather than exempted, because an exemption list is where a st
 starts leaking.
 
 268 tests pass, 13 of them against the real daemon.
+
+## What the review found in the command line, 2026-08-30
+Blocked on first pass. Seven findings, two of them holes this change opened. Every one was
+demonstrated by running something, not by reading the diff, which is the whole reason the
+step exists.
+
+**A sample could redirect our API traffic.** `load_env` read `./.env`. This tool analyses
+samples nobody trusts, and running it from the sample's own directory is the natural
+workflow, so a `.env` shipped beside a sample was loaded into the process and obeyed.
+Setting `ANTHROPIC_BASE_URL` pointed the client at another host, which sends the key there
+and lets the sample choose the Dockerfile the gate is handed. Reproduced before the fix:
+the variable went from unset to `https://evil.example/v1/`.
+
+Fixed with two rules rather than one. The path is fixed to the project's own directory and
+never the working directory, and the names are an allowlist, because "the file is ours" is
+a weaker guarantee than it sounds once a file is copied between machines and pasted from
+instructions.
+
+**A filename could steer the exit code.** `exit_code_for` matched substrings of the
+outcome's `reason`, and `reason` splices in the gate's quoted line, which contains the
+script's filename. A script named `x could not be reached.py` produced exit 3, telling a
+caller to retry a provider that had answered perfectly well. `Outcome` now carries a typed
+`kind` set where the outcome is built, and the exit code switches on that. Prose the sample
+influences can no longer reach a machine-readable result.
+
+The same finding had a second half worth more than the first: nothing coupled the producer
+to the consumer, so rewording one sentence in the loop changed what the shell learned while
+every test still passed. There is now a test that drives the real loop to each terminal
+state and asserts the code a shell would actually get.
+
+**Four provider failures still escaped.** The typed wrapper matched connection errors on
+the class name, and `APITimeoutError` does not contain the word, though it subclasses the
+connection error in both SDKs. Timeouts, 500, 503, Anthropic's 529 and a 404 from a
+mistyped model name all escaped as tracebacks, each reproducing exactly the failure this
+change claimed to have fixed. Matching is now by inheritance, and 404 and 5xx have their
+own kinds.
+
+**Container output could repaint the terminal.** `report` printed what a sample wrote
+straight to the TTY, so a sample could clear the screen, set the window title and paint a
+convincing `ok` summary, erasing the label saying the output was not ours. Control
+characters are now escaped. The gate has refused non-printables for this exact reason since
+August; the report was the one attacker-controlled channel to a terminal without the rule.
+
+**Docker being absent or stopped was unhandled.** A stopped daemon looked like three failed
+builds, spent three paid repair calls on a Dockerfile that was already correct, and then
+reported the script as having run and failed. It now has its own exit code.
+
+**`--check` was broken for two of three providers.** It passed `limit` to `models.list()`,
+which the OpenAI SDK does not accept, so a working OpenAI or Groq key was reported as
+unusable and the bare `except` hid that it was our bug.
+
+**Two stale sentences and a stale table row**, all saying a spent budget falls back, and one
+claiming no command line exists. Retired in the same commit.
+
+The provenance value was wrong too: `provider_unavailable` was labelled `TOOL`, and the
+provider's error text is neither a tool result nor the model's words. `PROVIDER` was added
+rather than overloading `TOOL`, whose real user is about to be the tool loop.
+
+272 tests pass.
 
 ## Keys come from a .env, reversed 2026-08-30
 The original decision said the key was read from the environment and never from a file.
@@ -668,9 +727,9 @@ turn it into a Dockerfile. Nothing calls `can_investigate` until the tool loop l
 because a tool loop written against a turn counter is a rewrite later rather than an
 argument, which is the test every one of the five shapes had to pass.
 
-A spent budget falls back to the Dockerfile we write ourselves, exactly like a second
-refusal. Paying for everything up to that point and producing no image is the one ending
-worth engineering against.
+A spent budget fell back to the Dockerfile we write ourselves, exactly like a second
+refusal. That changed on 30 August, below: it now ends the run, because a verdict no
+judgment went into should not be reported as a success.
 
 The estimate gates and the provider's numbers record. `estimate` errs high twice over, a
 characters-per-token rate below the real one and a reply assumed to run to the output

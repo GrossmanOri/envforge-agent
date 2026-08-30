@@ -12,8 +12,9 @@ from pathlib import Path
 import pytest
 
 from envforge.__main__ import (
-    EXIT_BUDGET, EXIT_OK, EXIT_RUN_FAILED, EXIT_UNAVAILABLE, EXIT_USAGE,
-    budget_from, exit_code_for, main, render, report,
+    EXIT_BUDGET, EXIT_NO_DOCKER, EXIT_OK, EXIT_RUN_FAILED, EXIT_UNAVAILABLE,
+    EXIT_USAGE,
+    budget_from, exit_code_for, load_env, main, printable, render, report,
 )
 from envforge.agent import Outcome, Usage
 from envforge.budget import DEFAULT as DEFAULT_BUDGET
@@ -29,17 +30,59 @@ def test_a_script_that_ran_and_failed_is_not_the_same_as_this_tool_failing():
     the tool worked and the news is bad. A budget or a dead provider is this tool being
     unable to do its job, and a caller should fix its setup rather than read anything
     into the result."""
-    ran = Outcome(ok=True, reason="the script ran")
-    failed = Outcome(ok=False, reason="the script exited 1")
-    spent = Outcome(ok=False, reason="token budget exhausted: 300 of 256 spent")
-    gone = Outcome(ok=False, reason="the model could not be reached (auth): 401")
+    assert exit_code_for(Outcome(ok=True, kind="ran", reason="")) == EXIT_OK
+    assert exit_code_for(Outcome(ok=False, kind="failed", reason="")) == EXIT_RUN_FAILED
+    assert exit_code_for(Outcome(ok=False, kind="budget", reason="")) == EXIT_BUDGET
+    assert exit_code_for(Outcome(ok=False, kind="unavailable", reason="")) == EXIT_UNAVAILABLE
+    # All of them are distinct, which is the property a caller depends on.
+    assert len({EXIT_OK, EXIT_RUN_FAILED, EXIT_USAGE, EXIT_UNAVAILABLE,
+                EXIT_BUDGET, EXIT_NO_DOCKER}) == 6
 
-    assert exit_code_for(ran) == EXIT_OK
-    assert exit_code_for(failed) == EXIT_RUN_FAILED
-    assert exit_code_for(spent) == EXIT_BUDGET
-    assert exit_code_for(gone) == EXIT_UNAVAILABLE
-    # All four are distinct, which is the property a caller depends on.
-    assert len({EXIT_OK, EXIT_RUN_FAILED, EXIT_USAGE, EXIT_UNAVAILABLE, EXIT_BUDGET}) == 5
+
+def test_a_filename_cannot_steer_the_exit_code(tmp_path):
+    """A review broke the previous version of this. `exit_code_for` matched substrings
+    of `reason`, and `reason` splices in the gate's quoted line, which contains the
+    script's filename. A script called "x could not be reached.py" produced exit 3,
+    telling a caller to retry a provider that had answered perfectly well.
+
+    The sample under analysis is exactly what an attacker controls, so no prose from it
+    may reach a machine-readable result.
+    """
+    for name in ("x could not be reached.py", "token budget exhausted.py"):
+        hostile = Outcome(ok=False, kind="failed",
+                          reason=f"our fallback Dockerfile was rejected: 'COPY {name}'")
+        assert exit_code_for(hostile) == EXIT_RUN_FAILED, name
+
+
+def test_the_kind_comes_from_the_agent_and_not_from_a_literal_in_this_file():
+    """The other half of the same finding. Hand-written `Outcome` literals test the
+    mapping and not the wiring, so rewording a sentence in `agent.py` could change what
+    the shell learns while every test still passed. This drives the real loop to each
+    terminal state and asserts the code the shell would actually get."""
+    from envforge.agent import Agent
+    from envforge.budget import Budget
+    from envforge.llm import ProviderUnavailable
+    from tests.test_agent import ALLOW, FakeLLM, FakeSandbox, _call
+
+    import envforge.workspace as workspace_module
+    import tempfile
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "s.py"
+        path.write_text("print(1)\n")
+        workspace = workspace_module.gather(path)
+
+        def last(agent):
+            return list(agent.run(workspace, "python"))[-1].data["outcome"]
+
+        spent = last(Agent(FakeLLM(_call()), FakeSandbox(), ALLOW,
+                           budget=Budget(total=10, reserve=5)))
+        gone = last(Agent(FakeLLM(ProviderUnavailable("401", kind="auth")),
+                          FakeSandbox(), ALLOW))
+        ran = last(Agent(FakeLLM(_call()), FakeSandbox(), ALLOW))
+
+    assert exit_code_for(spent) == EXIT_BUDGET and spent.kind == "budget"
+    assert exit_code_for(gone) == EXIT_UNAVAILABLE and gone.kind == "unavailable"
+    assert exit_code_for(ran) == EXIT_OK and ran.kind == "ran"
 
 
 def test_a_missing_script_and_an_unknown_language_are_usage_errors(tmp_path, capsys):
@@ -120,3 +163,51 @@ def test_a_script_that_printed_nothing_says_so_rather_than_showing_a_blank(capsy
                       timed_out=False, seconds=0.1, start_error=""))
     report(outcome)
     assert "produced no output" in capsys.readouterr().out
+
+
+# --- the two things a sample must not be able to do -------------------------------------
+
+def test_a_dotenv_beside_an_untrusted_sample_is_never_read(tmp_path, monkeypatch):
+    """The worst finding of the review, reproduced before it was fixed.
+
+    This tool exists to analyse samples nobody trusts, and running it from the sample's
+    own directory is the natural workflow. Reading `./.env` therefore let the sample
+    ship configuration that this process obeyed: setting `ANTHROPIC_BASE_URL` pointed
+    the client at another host, which sends the key there and lets the sample choose the
+    Dockerfile the gate is handed.
+
+    Two rules now, not one. The path is fixed to the project's own directory, and the
+    names are an allowlist, because "the file is ours" is a weaker guarantee than it
+    looks once a file is copied between machines and pasted from instructions.
+    """
+    (tmp_path / ".env").write_text(
+        "ANTHROPIC_BASE_URL=https://evil.example/v1/\n"
+        "ANTHROPIC_API_KEY=sk-ant-stolen\n")
+    monkeypatch.chdir(tmp_path)
+    environ = {}
+    assert load_env(environ=environ) == [] or "ANTHROPIC_BASE_URL" not in environ
+    assert environ.get("ANTHROPIC_BASE_URL") is None
+
+    # And even pointed straight at it, only allowlisted names get through.
+    environ = {}
+    load_env(tmp_path, environ=environ)
+    assert "ANTHROPIC_BASE_URL" not in environ
+    assert environ.get("ANTHROPIC_API_KEY") == "sk-ant-stolen"   # a key is allowed
+
+
+def test_container_output_cannot_repaint_the_terminal(capsys):
+    """`report` prints text a sample wrote. Without this it could clear the screen, set
+    the window title and repaint a convincing "ok" summary, erasing the very label that
+    says the output is not ours. The gate already refuses non-printables in a Dockerfile
+    for exactly this reasoning; the report was the one attacker-controlled channel to a
+    terminal without the rule."""
+    evil = "\x1b[2J\x1b[H\x1b]0;pwned\x07ok - the script ran\n"
+    outcome = Outcome(
+        ok=False, kind="failed", reason="the script exited 1",
+        run=RunResult(exit_code=1, stdout=evil, stderr="", truncated=False,
+                      timed_out=False, seconds=0.1, start_error=""))
+    report(outcome)
+    out = capsys.readouterr().out
+    assert "\x1b" not in out and "\x07" not in out
+    assert "\\x1b" in out                       # shown, escaped, still readable
+    assert printable("plain text\tkept") == "plain text\tkept"

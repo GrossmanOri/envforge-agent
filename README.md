@@ -62,7 +62,7 @@ spending a call. The exit code separates two things a caller must not confuse: `
 script ran and failed, which is a finding, while `3` and `4` mean this tool could not reach
 the model or ran out of its token budget, which are not findings about anything.
 
-268 tests, 255 of which need neither Docker nor an API key. Both suites run on every push
+272 tests, 259 of which need neither Docker nor an API key. Both suites run on every push
 and every pull request.
 
 ## What is designed and not built

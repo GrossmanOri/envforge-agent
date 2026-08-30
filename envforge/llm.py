@@ -149,6 +149,23 @@ def validate(arguments: Any, tool: Tool) -> dict[str, Any]:
     return arguments
 
 
+def _connection_errors() -> tuple[type[BaseException], ...]:
+    """The connection-failure base class of whichever SDKs are installed.
+
+    Imported lazily and tolerantly so this module still works with only one of them
+    present, which is the reason the original check matched on a class name instead.
+    Matching the base class is what makes a timeout count, since both SDKs derive their
+    timeout error from their connection error.
+    """
+    found: list[type[BaseException]] = []
+    for module in ("anthropic", "openai"):
+        try:
+            found.append(__import__(module).APIConnectionError)
+        except (ImportError, AttributeError):
+            continue
+    return tuple(found) or (OSError,)
+
+
 def reachable(send):
     """Call the provider, and turn "we could not reach it" into one typed failure.
 
@@ -166,10 +183,12 @@ def reachable(send):
     except Exception as exc:               # noqa: BLE001 - narrowed immediately below
         status = getattr(exc, "status_code", None)
         if status is None:
-            # No status means no HTTP response: DNS, TLS, a dropped connection. The
-            # SDKs both name these `APIConnectionError`, which we match on rather than
-            # import, so this module keeps working if only one SDK is installed.
-            if "connection" in type(exc).__name__.lower():
+            # No HTTP response at all: DNS, TLS, a dropped connection, a timeout.
+            # Matched by inheritance rather than by class name. The name test that was
+            # here first missed `APITimeoutError`, which subclasses the connection error
+            # in both SDKs but does not contain "connection", so a timed-out call went
+            # back to escaping the loop entirely.
+            if isinstance(exc, _connection_errors()):
                 raise ProviderUnavailable(f"could not reach the provider: {exc}",
                                           kind="network") from exc
             raise
@@ -177,6 +196,15 @@ def reachable(send):
         if status == 403:
             reported = getattr(exc, "type", "") or ""
             kind = "billing" if "billing" in reported else "permission"
+        elif status == 404:
+            # A model name that does not exist, which is almost always a typo in the
+            # spec. Not repairable by asking again, so it ends the run rather than
+            # spending three attempts on it.
+            kind = "no_such_model"
+        elif status >= 500:
+            # 500, 503, and Anthropic's 529 overloaded. The provider is up enough to
+            # answer and not enough to serve, which is theirs to fix and ours to report.
+            kind = "server"
         if kind is None:
             raise
         raise ProviderUnavailable(f"{kind}: {exc}", kind=kind) from exc
