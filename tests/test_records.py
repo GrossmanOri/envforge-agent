@@ -63,6 +63,43 @@ def test_a_public_record_names_nothing_private_and_no_internal_vocabulary(doc):
     )
 
 
+# A run of characters long enough to be a real token rather than a placeholder. Real keys
+# from every provider here are far longer than this; `sk-ant-REPLACE_ME` is not.
+CREDENTIAL = re.compile(r"[A-Za-z0-9_\-]{32,}")
+
+
+def test_the_env_file_is_ignored_by_git():
+    """ADR-016. The whole `.env` convention rests on this one line in .gitignore, so it is
+    asserted rather than assumed. Checked against git itself rather than by reading the
+    file, because a pattern that looks right and does not match is the failure mode."""
+    import subprocess
+    result = subprocess.run(
+        ["git", "check-ignore", "-q", ".env"], cwd=ROOT, capture_output=True)
+    assert result.returncode == 0, (
+        ".env is not ignored by git. A developer's real key is one `git add -A` from a "
+        "public repository until this passes.")
+
+
+def test_the_example_env_holds_no_credential():
+    """ADR-016. The example ships in a public repository, so the failure it guards is
+    somebody pasting a real key in place of a placeholder and committing it. That is not
+    prevented by a convention, and a diff full of placeholders is exactly where an eye
+    slides past one value that is not."""
+    example = ROOT / ".env.example"
+    assert example.exists(), (
+        ".env.example is missing. It is what a person cloning this copies to .env, and "
+        "the file this test exists to keep honest.")
+    offenders = []
+    for number, line in enumerate(example.read_text().splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        name, _, value = stripped.partition("=")
+        if CREDENTIAL.search(value):
+            offenders.append(f".env.example:{number}: {name.strip()} looks like a real value")
+    assert not offenders, "\n  ".join(["a credential in a public file:"] + offenders)
+
+
 def test_the_check_would_actually_catch_something():
     """A test that can only pass is not a test. This asserts the patterns match the
     strings they are meant to match, so a future edit that guts the regexes fails here
@@ -79,3 +116,7 @@ def test_the_check_would_actually_catch_something():
     # `origin` or `GrossmanOri` is not the author being named.
     assert not BANNED["the author's name"].search("git push origin main")
     assert not BANNED["the author's name"].search("github.com/GrossmanOri/envforge-agent")
+    # And that the credential check separates a real key from a placeholder, which is the
+    # only judgment it makes and the one worth pinning down.
+    assert CREDENTIAL.search("sk-ant-api03-" + "x" * 40), "a real-length key must be caught"
+    assert not CREDENTIAL.search("sk-ant-REPLACE_ME"), "a placeholder must not be caught"
