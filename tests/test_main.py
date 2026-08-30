@@ -14,7 +14,7 @@ import pytest
 from envforge.__main__ import (
     EXIT_BUDGET, EXIT_NO_DOCKER, EXIT_OK, EXIT_RUN_FAILED, EXIT_UNAVAILABLE,
     EXIT_USAGE,
-    EXIT_NO_IMAGE, EXIT_FOR_KIND,
+    EXIT_NO_IMAGE, EXIT_FOR_KIND, HEADLINE_FOR_KIND,
     budget_from, exit_code_for, load_env, main, printable, render, report,
 )
 from envforge.agent import Outcome, Usage
@@ -341,14 +341,66 @@ def test_main_stops_paying_the_model_when_docker_dies_mid_run(monkeypatch, tmp_p
 
 
 def test_every_kind_has_a_headline_too():
-    """The exit-code table is asserted complete; the headline table was not, and a kind
-    missing from it falls to a `.get` default that says FAILED. That is the same shape
-    as the default which once let a failed run report success, so it is closed the same
-    way: by asserting the set rather than trusting it."""
-    import inspect
+    """Set equality against the real table, not a grep of the function's source.
+
+    The first version of this searched `inspect.getsource(report)` for each kind's
+    name. A review mutated the code, deleting an entry from the dict while leaving the
+    word in a nearby comment, and the whole suite stayed green while a spent budget
+    silently degraded from STOPPED to FAILED. A test that a mutation survives is not a
+    test, and grepping source is how you write one by accident.
+    """
     from typing import get_args
-    import envforge.__main__ as module
     from envforge.agent import Kind
-    source = inspect.getsource(module.report)
-    for kind in get_args(Kind):
-        assert f'"{kind}"' in source, f"{kind} has no headline"
+    assert set(get_args(Kind)) == set(HEADLINE_FOR_KIND)
+
+
+def test_the_daemon_is_re_probed_on_every_build_failure_not_only_the_first(monkeypatch, tmp_path):
+    """A mutation proved this property was prose only.
+
+    Making the probe fire on the first build failure alone left the whole suite green,
+    so nothing asserted the part that matters: a daemon can stop between attempt one and
+    attempt two, and the run that catches it is the one that stops paying for repairs.
+    This puts the failure on the SECOND build, where a first-only probe cannot see it.
+    """
+    import envforge.__main__ as module
+    from tests.test_agent import FakeLLM, FakeSandbox, _build, _call
+    sandbox = FakeSandbox(builds=[_build(ok=False, exit_code=1, log="boom")] * 3)
+    llm = FakeLLM(_call(), _call(), _call())
+    # Healthy on the pre-flight and on the first failure; gone by the second.
+    states = iter([None, None, "Cannot connect to the Docker daemon"])
+    monkeypatch.setattr(module, "daemon_error", lambda: next(states, "gone"))
+    script = tmp_path / "s.py"
+    script.write_text("print(1)\n")
+    monkeypatch.setattr(module, "load_env", lambda *a, **k: [])
+    monkeypatch.setattr(module, "make_llm", lambda spec: llm)
+    monkeypatch.setattr(module, "DockerSandbox", lambda *a, **k: sandbox)
+
+    assert module.main([str(script)]) == EXIT_NO_DOCKER
+    assert len(llm.prompts) == 2          # stopped at the second, not after three
+
+
+def test_our_own_precondition_is_not_reported_as_a_broken_daemon(tmp_path, monkeypatch, capsys):
+    """`SandboxError` means we handed the sandbox something invalid; an `OSError` means
+    Docker is unreachable. Collapsing them told an operator the daemon was broken when
+    it was fine and the caller had made a mistake."""
+    import envforge.__main__ as module
+    from envforge.sandbox import SandboxError
+    from tests.test_agent import FakeLLM, _call
+
+    class Rejecting:
+        built_tags: list = []
+        def build(self, *a, **k):
+            raise SandboxError("caller passed a file named 'Dockerfile'")
+        def run(self, *a, **k):
+            raise AssertionError("never reached")
+        def remove_image(self, tag): pass
+
+    script = tmp_path / "s.py"
+    script.write_text("print(1)\n")
+    monkeypatch.setattr(module, "load_env", lambda *a, **k: [])
+    monkeypatch.setattr(module, "daemon_error", lambda: None)
+    monkeypatch.setattr(module, "make_llm", lambda spec: FakeLLM(_call()))
+    monkeypatch.setattr(module, "DockerSandbox", lambda *a, **k: Rejecting())
+
+    assert module.main([str(script)]) == EXIT_USAGE
+    assert "cannot reach Docker" not in capsys.readouterr().err

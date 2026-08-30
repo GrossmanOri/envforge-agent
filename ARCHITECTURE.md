@@ -180,7 +180,7 @@ They need error types that retain provider wire data, so the trace module owns
 that design rather than adding half a trace to the repair loop.
 
 ### ADR-014: the engine seam is a labelled vocabulary, not a topology
-Decided 2026-08-27. `envforge/events.py` holds the twelve kinds an engine may yield, and
+Decided 2026-08-27. `envforge/events.py` holds the thirteen kinds an engine may yield, and
 `Event` refuses anything else at construction. The plain loop and the LangGraph port both
 honour it, which a node-shaped interface could not be: a plain loop has no nodes.
 
@@ -191,7 +191,7 @@ against a container and there is no honest ranking there, while the question a r
 asks is answered by `authors() == {US}` or not.
 
 The labels are declared per kind and are the union over every path emitting it, so
-`finished` carries `INPUT` because one of its five paths names the language the caller
+`finished` carries `INPUT` because one of its six emission sites names the language the caller
 asked for. Rejected: a label chosen at each emission, which is more precise and is not a
 contract, since nothing can check that an emitter filled it in honestly.
 

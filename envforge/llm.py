@@ -258,17 +258,27 @@ class AnthropicLLM:
         if client is not None:
             self._client = client
             return
-        self._client = anthropic.Anthropic()
+        try:
+            self._client = anthropic.Anthropic()
+        except anthropic.AnthropicError as exc:
+            # A named profile that is missing or corrupt makes the constructor itself
+            # raise. Left uncaught this was the same traceback the credential check was
+            # added to remove, just moved one line earlier.
+            raise ProviderUnavailable(f"anthropic credentials: {exc}",
+                                      kind="no_key") from exc
         # Asked of the constructed client rather than of the environment, and asked here
         # rather than left to request time. This SDK resolves credentials from several
         # places and raises nothing when it finds none, deferring to the first request
         # and raising `TypeError` there, which is not an exception any handler in this
         # program was looking for: a missing key crashed the run with a traceback.
         #
-        # Reading the client's own resolved values keeps `ANTHROPIC_AUTH_TOKEN` working,
-        # which checking the one environment variable would have broken.
-        if not getattr(self._client, "api_key", None) and \
-                not getattr(self._client, "auth_token", None):
+        # All three slots, not two. The first version read `api_key` and `auth_token`
+        # only, which told anyone authenticated through `ant auth login` that their key
+        # was not set: `credentials` is where the SDK puts a profile's bearer token and
+        # a workload identity, and it is as valid as the other two. The test enshrined
+        # the bug, since deleting two environment variables cannot reveal a third slot.
+        if not any(getattr(self._client, name, None)
+                   for name in ("api_key", "auth_token", "credentials")):
             raise MissingKey("ANTHROPIC_API_KEY")
 
     def build_request(self, system: str, user: str, tool: Tool) -> dict[str, Any]:

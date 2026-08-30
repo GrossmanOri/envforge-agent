@@ -22,7 +22,7 @@ it cost; nothing yet decides what that behaviour means. The model also has no to
 reads the script once and writes a Dockerfile, which makes this a workflow with a feedback
 loop rather than an agent.
 
-285 tests, 272 of which need neither Docker nor an API key. Both suites run on every push
+290 tests, 277 of which need neither Docker nor an API key. Both suites run on every push
 and every pull request.
 
 ## The default provider, decided 2026-08-22
@@ -196,6 +196,48 @@ One correction to the review: it estimated the images at 21GB. Layers are shared
 `docker system df` reports 540MB. The clutter was real and the number was not.
 
 276 tests pass.
+
+## The fourth review, and a regression the fix itself introduced, 2026-08-30
+Blocked again, and the blocking finding was a regression created by the previous round's
+fix. Worth recording in full, because the failure is not the bug but the way it survived.
+
+**The credential check locked out a working credential.** The Anthropic SDK resolves
+credentials from three slots and the check read two, so anyone authenticated through a
+profile rather than an environment variable was told their key was not set. A crash was
+traded for a lockout.
+
+The test enshrined it. It deleted two environment variables, which cannot reveal a third
+slot, so on a machine authenticated by profile it passed *because* the code was wrong. The
+review also found the suite was host-dependent: with a profile variable exported, one test
+failed. A test that depends on the host cannot tell you which of the two things it proved.
+
+The same commit left a second traceback. The SDK's constructor raises when a named profile
+is missing or corrupt, which was uncaught, so the traceback that round three removed had
+simply moved one line earlier.
+
+**Two tests were fake, and only mutation showed it.** The review changed the code and
+checked whether the suite noticed. It did not, twice. The headline table was asserted by
+grepping the function's source, so deleting an entry while leaving the word in a nearby
+comment passed everything while a spent budget silently degraded from STOPPED to FAILED.
+And the rule that the daemon is re-probed on every build failure, not only the first, was
+prose: making it fire once left 271 tests green.
+
+Both are now set equality against a module constant, and a test that puts the daemon's
+death on the second build, where a first-only probe cannot see it.
+
+**Found by running it afterwards, not by any review.** A cold base image took longer to
+pull than the build timeout. The loop called that a broken Dockerfile, so it paid for a
+second call in which the model rewrote the identical 142 characters, and the build then
+worked because the pull had cached. `BuildResult` has carried `timed_out` all along and
+the loop ignored it. The model cannot see a clock, so asking it again is asking the wrong
+question at full price, and this is precisely what `agent.py`'s opening rule forbids. A
+build timeout is now its own ending and costs one call.
+
+Four stale record sentences went with it, one of them created by this branch: the
+vocabulary grew from twelve kinds to thirteen, and a paragraph reading "a fifth provenance
+was considered and refused" sat directly above the commit that added a fifth.
+
+290 tests pass.
 
 ## Keys come from a .env, reversed 2026-08-30
 The original decision said the key was read from the environment and never from a file.
@@ -714,7 +756,7 @@ The same review asked for raw request and response bodies on failed provider rep
 needs the provider error types to retain wire data, so it is deferred explicitly to the trace module's design rather than half-built here.
 
 ## The event vocabulary
-`envforge/events.py`. The twelve kinds an engine may yield, and who wrote every string in
+`envforge/events.py`. The kinds an engine may yield, and who wrote every string in
 each one. `Event` checks both at construction, so an engine that invents `node_entered`
 fails there rather than putting a record in the trace that nobody can label.
 
@@ -724,7 +766,7 @@ us, the model, a container or the files the run was handed, and neither can the
 trace module. Only the code that emits the event knows, so a label added later is a guess
 dressed up as a record.
 
-Authors are a set per string, not one value per event. Three of the twelve made that
+Authors are a set per string, not one value per event. Three of them made that
 necessary rather than tidy. `gate_rejected` carries a Dockerfile that is the model's on
 every path but one, since after two refusals the file we wrote ourselves goes through the
 same gate and can be rejected there too. `gate_rejected` is our own sentence quoting the model's line
@@ -734,14 +776,19 @@ written by the model. One value on either would have been false, and picking the
 trusted" one means ranking a model against a container, which has no honest answer.
 
 The labels are declared per kind, so a kind's set is the union over every path that emits
-it. `finished` is labelled `INPUT` because one of its five paths names the language the
+it. `finished` is labelled `INPUT` because one of its emission sites names the language the
 caller asked for, though the other four do not. Coarse, and chosen: a table can be checked
 and a label chosen at each emission cannot, and the point of a seam is that a second engine
 has to honour it.
 
-A fifth provenance was considered and refused. Docker's own words on `exec_failed` are the
+A fifth provenance was considered and refused here. Docker's own words on `exec_failed` are the
 daemon quoting the model's ENTRYPOINT, so the untrusted author is the model and the daemon
 is not a separate one. `TOOL` exists and nothing emits it; the tool loop will.
+
+That held until the command line, which added `PROVIDER` for the provider's own error
+text. The reasoning above is why: the daemon quoting the model is not a separate author,
+and an SDK reporting its own failure is. Overloading `TOOL` for it would have made
+`authors()` lie to the tool loop that is about to become `TOOL`'s real user.
 
 The test that closes the loop reads `agent.py` with `ast` and asserts the kinds emitted
 there are exactly the kinds declared. Construction covers one direction, a kind emitted

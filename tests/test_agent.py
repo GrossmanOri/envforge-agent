@@ -562,3 +562,25 @@ def test_the_whole_loop_against_a_real_daemon(tmp_path):
     assert outcome.ok and outcome.attempts == 1
     assert outcome.kind == "script_failed"       # it ran, and it exited 3
     assert outcome.run.exit_code == 3 and "from inside" in outcome.run.stdout
+
+
+def test_a_build_timeout_does_not_buy_a_repair(script):
+    """Found by running the tool, not by reading it.
+
+    A cold base image took longer to pull than the build timeout. The loop called that
+    a broken Dockerfile and paid for a second call, in which the model rewrote the
+    identical 142 characters and the build then succeeded because the pull had cached.
+    The model cannot see a clock, so asking it again is asking the wrong question at
+    full price, and this file's first rule is that a failure a rewrite cannot fix must
+    not spend an attempt.
+    """
+    llm = FakeLLM(_call(), _call(), _call())
+    sandbox = FakeSandbox(builds=[BuildResult(
+        ok=False, image="", exit_code=None, log="", truncated=False,
+        timed_out=True, seconds=300.0)])
+    events, kinds, outcome = drive(Agent(llm, sandbox, ALLOW), script)
+    assert kinds == ["asking", "wrote", "building", "build_failed", "finished"]
+    assert outcome.kind == "build_timeout" and not outcome.ok
+    assert "timed out" in outcome.reason
+    assert len(llm.prompts) == 1                 # one call, not three
+    assert llm.queue                             # the rest were never spent

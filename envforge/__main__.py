@@ -19,14 +19,14 @@ import argparse
 import re
 import sys
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Sequence
 
 from .agent import Agent, LANGUAGES, Outcome, language_for
 from .budget import DEFAULT as DEFAULT_BUDGET
 from .budget import Budget
 from .events import Event, Provenance
 from .gate import check
-from .llm import MissingKey, ProviderUnavailable, make_llm
+from .llm import MissingKey, make_llm
 from .sandbox import DockerSandbox, SandboxError, daemon_error
 from .workspace import WorkspaceError, gather
 
@@ -190,12 +190,7 @@ def report(outcome: Outcome) -> None:
     # Keyed to the kind, not to `ok`. `ok` means the tool did its job, which is true
     # even when the script it was watching failed, so keying the header to it printed
     # "ok" above an exit code of 1. The person and the shell now agree.
-    headline = {
-        "ran": "ok", "script_failed": "the script FAILED", "no_image": "FAILED",
-        "failed": "FAILED", "budget": "STOPPED", "unavailable": "STOPPED",
-        "unsupported": "REFUSED",
-    }.get(outcome.kind, "FAILED")
-    print(headline, "-", printable(outcome.reason))
+    print(HEADLINE_FOR_KIND[outcome.kind], "-", printable(outcome.reason))
     print(f"attempts {outcome.attempts}, "
           f"{outcome.usage.calls} model call(s), {outcome.usage.tokens} tokens")
     if outcome.used_fallback:
@@ -230,6 +225,21 @@ def report(outcome: Outcome) -> None:
         print("  (output was bounded before it reached here)")
 
 
+# Keyed rather than defaulted, and a module constant rather than an inline dict, so a
+# missing kind is a KeyError here and a set-equality failure in the tests. The first
+# version was an inline `.get(kind, "FAILED")` asserted by grepping this function's
+# source, and a review showed the assertion survived deleting an entry.
+HEADLINE_FOR_KIND = {
+    "ran": "ok",
+    "script_failed": "the script FAILED",
+    "no_image": "FAILED",
+    "build_timeout": "TIMED OUT",
+    "failed": "FAILED",
+    "budget": "STOPPED",
+    "unavailable": "STOPPED",
+    "unsupported": "REFUSED",
+}
+
 EXIT_FOR_KIND = {
     "ran": EXIT_OK,
     # The script ran and exited nonzero. A finding, not a malfunction: the tool did its
@@ -237,6 +247,7 @@ EXIT_FOR_KIND = {
     # distinguishing the two, so every failing script reported 0.
     "script_failed": EXIT_RUN_FAILED,
     "no_image": EXIT_NO_IMAGE,
+    "build_timeout": EXIT_NO_IMAGE,
     "failed": EXIT_NO_IMAGE,
     "unsupported": EXIT_USAGE,
     "budget": EXIT_BUDGET,
@@ -373,7 +384,12 @@ def main(argv: Sequence[str] | None = None, environ=None) -> int:
                     return EXIT_NO_DOCKER
             if event.kind == "finished":
                 outcome = event.data["outcome"]
-    except (OSError, SandboxError) as exc:
+    except SandboxError as exc:
+        # Our own precondition, not the daemon. Collapsing the two told an operator the
+        # daemon was broken when it was fine and the caller had made a mistake.
+        print(f"\n{printable(str(exc))}", file=sys.stderr)
+        return EXIT_USAGE
+    except OSError as exc:
         # No docker binary, or a daemon that is not running. Neither is a finding about
         # the script and neither is the model's fault, which is what made this worth
         # catching: without it a stopped daemon looked like three failed builds, spent

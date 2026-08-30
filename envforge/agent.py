@@ -183,7 +183,7 @@ Write the complete corrected Dockerfile."""
 # Every way a run can end. A closed set for the same reason the event vocabulary is one:
 # a caller switches on this, so an unlisted value is a caller reading a case it has never
 # handled.
-Kind = Literal["ran", "script_failed", "no_image", "failed",
+Kind = Literal["ran", "script_failed", "no_image", "failed", "build_timeout",
                "budget", "unavailable", "unsupported"]
 
 
@@ -452,6 +452,23 @@ class Agent:
             tag = f"envforge-{run_id}:attempt{attempt}"
             yield Event("building", f"building {tag}")
             build = self.sandbox.build(dockerfile, files, tag)
+            if not build.ok and build.timed_out:
+                # A timeout is not a Dockerfile defect, and this file's own first rule
+                # is that a failure a rewrite cannot fix must not spend an attempt.
+                # Found by running it: a cold base image took longer to pull than the
+                # build timeout, the loop called that a broken Dockerfile, and paid for
+                # a second call in which the model rewrote the identical 142 characters.
+                # The model cannot see a clock, so asking it again is asking the wrong
+                # question at full price.
+                reason = (f"the build timed out after {build.seconds:.0f}s. The image "
+                          f"may still be downloading, or the Dockerfile asks for more "
+                          f"work than the timeout allows")
+                yield Event("build_failed", reason)
+                yield Event("finished", reason, {"outcome": Outcome(
+                    ok=False, kind="build_timeout", reason=reason, dockerfile=dockerfile,
+                    build=build, attempts=attempt, usage=usage(), refusals=refusals,
+                    used_fallback=used_fallback, run_id=run_id)})
+                return
             if not build.ok:
                 yield Event("build_failed", f"build exited {build.exit_code}")
                 if used_fallback:

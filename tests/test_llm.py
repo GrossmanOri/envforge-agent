@@ -308,7 +308,7 @@ def test_make_llm_builds_each_provider(monkeypatch):
     assert groq.strict is False and str(groq._client.base_url).startswith(GROQ_BASE_URL)
 
 
-def test_anthropic_refuses_to_build_without_credentials(monkeypatch):
+def test_anthropic_refuses_to_build_without_credentials(monkeypatch, tmp_path):
     """Checked when the client is built, not by pattern-matching an error later.
 
     This SDK resolves credentials from several places and raises nothing when it finds
@@ -316,11 +316,50 @@ def test_anthropic_refuses_to_build_without_credentials(monkeypatch):
     every handler in the program and crashed a run with a traceback on the most common
     setup mistake there is.
     """
-    for variable in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+    # Every source isolated, not just the two obvious variables. The first version of
+    # this deleted two env vars and passed on a machine authenticated through a profile
+    # *because of* the bug it was meant to catch: the check read two of the SDK's three
+    # credential slots, so a profile user was told their key was not set. A test that
+    # depends on the host cannot tell you which of the two it proved.
+    for variable in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE",
+                     "ANTHROPIC_CONFIG_DIR"):
         monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
     with pytest.raises(MissingKey) as caught:
         AnthropicLLM("claude-sonnet-5")
     assert caught.value.variable == "ANTHROPIC_API_KEY"
+
+
+def test_a_profile_credential_is_credentials_too(monkeypatch):
+    """The regression this branch introduced and a review caught. The SDK resolves a
+    profile's bearer token into `client.credentials`, a third slot the check did not
+    read, so anyone authenticated through `ant auth login` was told their key was not
+    set. Asserted against the slot rather than against a real profile on disk, so the
+    test says the same thing on every machine."""
+    class ProfileClient:
+        api_key = None
+        auth_token = None
+        credentials = object()          # what a resolved profile leaves behind
+
+    import anthropic
+    monkeypatch.setattr(anthropic, "Anthropic", lambda *a, **k: ProfileClient())
+    AnthropicLLM("claude-sonnet-5")      # constructs, does not raise
+
+
+def test_a_broken_profile_is_a_provider_failure_not_a_traceback(monkeypatch):
+    """A named profile that is missing or corrupt makes the SDK constructor itself
+    raise. Uncaught, that was the same traceback the credential check was added to
+    remove, moved one line earlier."""
+    import anthropic
+    from envforge.llm import ProviderUnavailable
+
+    def explode(*a, **k):
+        raise anthropic.AnthropicError("profile 'work' not found")
+
+    monkeypatch.setattr(anthropic, "Anthropic", explode)
+    with pytest.raises(ProviderUnavailable) as caught:
+        AnthropicLLM("claude-sonnet-5")
+    assert caught.value.kind == "no_key"
 
 
 def test_an_auth_token_is_credentials_too(monkeypatch):
