@@ -166,7 +166,7 @@ truncation included, rather than successes alone. Rejected: dropping the bodies 
 the trace module exists, which would lose the wire JSON the trace is being built to record.
 
 Raw provider bodies for refusals, truncations and invalid replies are not yet preserved.
-They need error types that retain provider wire data, so the trace module in sitting 8 owns
+They need error types that retain provider wire data, so the trace module owns
 that design rather than adding half a trace to the repair loop.
 
 ### ADR-014: the engine seam is a labelled vocabulary, not a topology
@@ -185,7 +185,7 @@ The labels are declared per kind and are the union over every path emitting it, 
 asked for. Rejected: a label chosen at each emission, which is more precise and is not a
 contract, since nothing can check that an emitter filled it in honestly.
 
-Nothing reads the labels yet; sitting 8's trace does. They are written now because only
+Nothing reads the labels yet; the trace module will. They are written now because only
 the code emitting an event knows who wrote the strings in it, so this is the one property
 that cannot be added afterwards.
 
@@ -196,11 +196,11 @@ token total instead, and `max_attempts` stays alongside it: an attempt builds an
 runs a container, which is a cost tokens do not measure, so the two currencies keep two
 bounds.
 
-Part of the total is reserved and cannot be spent on investigation. Sitting 7's tool loop
-reads files before it writes anything, and a loop that spends its last token on one more
+Part of the total is reserved and cannot be spent on investigation. The tool loop
+will read files before it writes anything, and a loop that spends its last token on one more
 file read has bought knowledge it can no longer use. `can_investigate` asks the question
 with the reserve held back and `can_write` asks it without; nothing calls the first until
-sitting 7, and it exists now because a loop written against a turn counter is a rewrite
+the tool loop lands, and it exists now because a loop written against a turn counter is a rewrite
 rather than an argument.
 
 A spent budget falls back to the Dockerfile we write ourselves, the same shape as a second
