@@ -60,6 +60,12 @@ same gate before any build.
 17. No file in a build context may be named something the build itself interprets. A
     context file called `Dockerfile` replaces the gated one, and the container then runs
     instructions nothing checked.
+18. Every reply from the model is charged to the run's ledger, whether it was usable or
+    not. A refusal, a truncation and a schema failure all cost tokens, and a bound that
+    charged only for successes could be walked past by a loop that never succeeds.
+19. Every event an engine yields is one of a closed set, and every string it carries has
+    its authors declared. An engine cannot invent a kind, and no record reaches a reader
+    without saying whether we wrote it.
 
 Invariants 4 and 5 are asserted against the argv that `sandbox.py` actually builds, so
 dropping a flag from the code fails a test rather than passing review.
@@ -154,13 +160,67 @@ Decided 2026-08-25, revised 2026-08-27. `Outcome` held every `Call`, and a `Call
 full request and response JSON. Harmless at four small calls and megabytes once a tool loop
 runs fifteen turns, on the one event every consumer must hold. It now carries a `Usage` of
 counts and token totals plus a full UUID `run_id`; the whole `Call` rides the `wrote` event,
-which carries the same `run_id`. `Usage.calls` counts every request sent to the model, while
-its token totals count only replies that returned usage. Rejected: dropping the bodies until
+which carries the same `run_id`. `Usage.calls` counts every request sent to the model, and
+since invariant 18 its token totals count every reply that reported a usage, a refusal and a
+truncation included, rather than successes alone. Rejected: dropping the bodies until
 the trace module exists, which would lose the wire JSON the trace is being built to record.
 
 Raw provider bodies for refusals, truncations and invalid replies are not yet preserved.
 They need error types that retain provider wire data, so the trace module in sitting 8 owns
 that design rather than adding half a trace to the repair loop.
+
+### ADR-014: the engine seam is a labelled vocabulary, not a topology
+Decided 2026-08-27. `envforge/events.py` holds the twelve kinds an engine may yield, and
+`Event` refuses anything else at construction. The plain loop and the LangGraph port both
+honour it, which a node-shaped interface could not be: a plain loop has no nodes.
+
+Each kind declares the authors of its message and of every data key, as a set rather than
+one value, because most of these strings have more than one: `gate_rejected` is our
+sentence quoting the model's line. Choosing a single label would mean ranking a model
+against a container and there is no honest ranking there, while the question a renderer
+asks is answered by `authors() == {US}` or not.
+
+The labels are declared per kind and are the union over every path emitting it, so
+`finished` carries `INPUT` because one of its five paths names the language the caller
+asked for. Rejected: a label chosen at each emission, which is more precise and is not a
+contract, since nothing can check that an emitter filled it in honestly.
+
+Nothing reads the labels yet; sitting 8's trace does. They are written now because only
+the code emitting an event knows who wrote the strings in it, so this is the one property
+that cannot be added afterwards.
+
+### ADR-015: the model spend is bounded in tokens, with a reserve
+Decided 2026-08-27. `envforge/budget.py`. A turn cap measures nothing, because every turn
+resends everything before it and the tenth costs several times the first. The bound is a
+token total instead, and `max_attempts` stays alongside it: an attempt builds an image and
+runs a container, which is a cost tokens do not measure, so the two currencies keep two
+bounds.
+
+Part of the total is reserved and cannot be spent on investigation. Sitting 7's tool loop
+reads files before it writes anything, and a loop that spends its last token on one more
+file read has bought knowledge it can no longer use. `can_investigate` asks the question
+with the reserve held back and `can_write` asks it without; nothing calls the first until
+sitting 7, and it exists now because a loop written against a turn counter is a rewrite
+rather than an argument.
+
+A spent budget falls back to the Dockerfile we write ourselves, the same shape as a second
+refusal. Paying for everything up to that point and producing no image is the one outcome
+worth avoiding.
+
+The estimate gates and the provider's numbers record. `estimate` errs high in both halves,
+a characters-per-token rate below the real one and a reply assumed to run to the output
+ceiling, so the loop stops one call early rather than one call late. An overestimate is
+never written into the ledger and refunded later, because that pessimism would compound
+until the budget was a turn cap under another name. The ceiling half holds on all three
+providers: Anthropic is sent `max_tokens` and the two OpenAI-compatible ones are sent
+`max_completion_tokens`, which both document as the replacement for the deprecated name.
+Until 2026-08-30 `OpenAICompatLLM` sent no ceiling at all, so on that path one reply could
+overshoot the whole budget before the next call was refused, and `Truncated` could never
+fire. A bound that holds on one provider out of three is not a bound.
+
+`Budget` is frozen and holds no counters. An `Agent` is built once and may be run more
+than once, and a budget carrying its own spent total would let the first run bound the
+second.
 
 ## What crosses each boundary
 

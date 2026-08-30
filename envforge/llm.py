@@ -24,7 +24,19 @@ _JSON_TYPES: dict[str, type | tuple[type, ...]] = {
 
 
 class LLMError(Exception):
-    """The call did not produce usable arguments."""
+    """The call did not produce usable arguments.
+
+    It still cost tokens, and the tokens are carried here so the run's ledger can
+    charge for them. A truncated reply burned the whole output ceiling, which is what
+    truncation means, so a budget that only counted successes could be walked past by
+    a loop that never succeeds. Zero is the honest default: it means no reply reached
+    us to read a usage off, not that the call was free.
+    """
+
+    def __init__(self, message: str, input_tokens: int = 0, output_tokens: int = 0):
+        super().__init__(message)
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
 
 
 class InvalidArguments(LLMError):
@@ -40,8 +52,9 @@ class Refused(LLMError):
     script being judged also wrote part of the text the judge read.
     """
 
-    def __init__(self, message: str, reason: Any = None):
-        super().__init__(message)
+    def __init__(self, message: str, reason: Any = None,
+                 input_tokens: int = 0, output_tokens: int = 0):
+        super().__init__(message, input_tokens, output_tokens)
         self.reason = reason
 
 
@@ -108,6 +121,19 @@ def validate(arguments: Any, tool: Tool) -> dict[str, Any]:
     return arguments
 
 
+def charge(check, arguments: Any, tool: Tool, spent: tuple[int, int]) -> dict[str, Any]:
+    """Run `validate` and make sure a failure carries what the reply cost.
+
+    `validate` is called from both providers and knows nothing about tokens, and a
+    reply that fails its schema cost exactly as much as one that passes.
+    """
+    try:
+        return check(arguments, tool)
+    except InvalidArguments as exc:
+        exc.input_tokens, exc.output_tokens = spent
+        raise
+
+
 class AnthropicLLM:
     """The native SDK. Anthropic's OpenAI-compatibility layer ignores `strict`,
     so this is the only path that grammar-constrains Claude's arguments."""
@@ -133,21 +159,33 @@ class AnthropicLLM:
             "tool_choice": {"type": "tool", "name": tool.name},
         }
 
+    @staticmethod
+    def tokens(response: Any) -> tuple[int, int]:
+        """What the reply cost, read off the response rather than the request, and
+        read on the failing paths too. Defaults to zero only when there is no usage
+        to read, which is a missing measurement rather than a free call."""
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return 0, 0
+        return getattr(usage, "input_tokens", 0), getattr(usage, "output_tokens", 0)
+
     def call(self, system: str, user: str, tool: Tool) -> Call:
         request = self.build_request(system, user, tool)
         response = self._client.messages.create(**request)
+        spent = self.tokens(response)
         if response.stop_reason == "refusal":
             details = response.stop_details
             raise Refused(f"{self.model} declined: {details}",
-                          reason=details.model_dump(mode="json") if details else None)
+                          reason=details.model_dump(mode="json") if details else None,
+                          input_tokens=spent[0], output_tokens=spent[1])
         if response.stop_reason == "max_tokens":
-            raise Truncated(f"{self.model} hit {MAX_TOKENS} tokens")
+            raise Truncated(f"{self.model} hit {MAX_TOKENS} tokens", *spent)
         # Thinking is adaptive by default, so the tool call is rarely content[0].
         block = next((b for b in response.content if b.type == "tool_use"), None)
         if block is None:
-            raise LLMError(f"no tool_use block, stop_reason={response.stop_reason}")
+            raise LLMError(f"no tool_use block, stop_reason={response.stop_reason}", *spent)
         return Call(
-            arguments=validate(block.input, tool),
+            arguments=charge(validate, block.input, tool, spent),
             model=response.model,
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
@@ -191,6 +229,13 @@ class OpenAICompatLLM:
             function["strict"] = True
         return {
             "model": self.model,
+            # The same ceiling the Anthropic path sends. Without it the budget's
+            # estimate is a guess about a limit that does not exist: `estimate` adds
+            # MAX_TOKENS on the assumption a reply cannot exceed it, so one reply here
+            # could overshoot the whole budget before the next call is refused. It also
+            # gives `Truncated` something to fire on, which is otherwise unreachable
+            # on this path.
+            "max_completion_tokens": MAX_TOKENS,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -199,24 +244,34 @@ class OpenAICompatLLM:
             "tool_choice": {"type": "function", "function": {"name": tool.name}},
         }
 
+    @staticmethod
+    def tokens(response: Any) -> tuple[int, int]:
+        """The same measurement under this wire format's own names."""
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return 0, 0
+        return getattr(usage, "prompt_tokens", 0), getattr(usage, "completion_tokens", 0)
+
     def call(self, system: str, user: str, tool: Tool) -> Call:
         request = self.build_request(system, user, tool)
         response = self._client.chat.completions.create(**request)
+        spent = self.tokens(response)
         choice = response.choices[0]
         refusal = getattr(choice.message, "refusal", None)
         if refusal:
-            raise Refused(f"{self.model} declined: {refusal}", reason=refusal)
+            raise Refused(f"{self.model} declined: {refusal}", reason=refusal,
+                          input_tokens=spent[0], output_tokens=spent[1])
         if choice.finish_reason == "length":
-            raise Truncated(f"{self.model} ran out of output tokens")
+            raise Truncated(f"{self.model} ran out of output tokens", *spent)
         calls = choice.message.tool_calls or []
         if not calls:
-            raise LLMError(f"no tool call, finish_reason={choice.finish_reason}")
+            raise LLMError(f"no tool call, finish_reason={choice.finish_reason}", *spent)
         try:
             arguments = json.loads(calls[0].function.arguments)
         except json.JSONDecodeError as exc:
-            raise InvalidArguments(f"arguments were not JSON: {exc}") from exc
+            raise InvalidArguments(f"arguments were not JSON: {exc}", *spent) from exc
         return Call(
-            arguments=validate(arguments, tool),
+            arguments=charge(validate, arguments, tool, spent),
             model=response.model,
             input_tokens=response.usage.prompt_tokens,
             output_tokens=response.usage.completion_tokens,

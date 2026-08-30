@@ -13,6 +13,7 @@ from envforge.agent import (
     EVIDENCE_LIMIT, LANGUAGES, SCRIPT_LIMIT, Agent, Event, Outcome, Usage, bound,
     default_dockerfile, language_for,
 )
+from envforge.budget import Budget
 from envforge.llm import Call, InvalidArguments, Refused, Truncated
 from envforge.sandbox import BuildResult, DockerSandbox, Limits, RunResult
 from envforge.workspace import Files, gather
@@ -240,6 +241,49 @@ def test_two_refusals_fall_back_to_our_own_dockerfile(script):
     assert outcome.ok and outcome.used_fallback and outcome.refusals == ["a", "b"]
     assert sandbox.built == [default_dockerfile("python", "s.py")]
     assert llm.queue == []                  # it was never asked a third time
+
+
+# --- the token budget ----------------------------------------------------------------
+
+def test_a_spent_budget_falls_back_instead_of_asking(script):
+    """The same shape as a second refusal. A run that has spent its budget still
+    produces an image, because the alternative is paying for everything up to here
+    and having nothing to show for it."""
+    llm = FakeLLM(_call())
+    sandbox = FakeSandbox()
+    agent = Agent(llm, sandbox, ALLOW, budget=Budget(total=10, reserve=5))
+    events, kinds, outcome = drive(agent, script)
+    assert kinds[0] == "budget_spent" and "asking" not in kinds
+    assert outcome.ok and outcome.used_fallback and outcome.usage.calls == 0
+    assert sandbox.built == [default_dockerfile("python", "s.py")]
+    assert llm.prompts == []                         # it was never asked at all
+
+
+def test_a_reply_we_could_not_use_is_still_charged(script):
+    """A truncated reply burned the whole output ceiling. A ledger that charged only
+    for successes could be walked past forever by a loop that never succeeds."""
+    llm = FakeLLM(Truncated("hit the ceiling", 900, 16_000), _call())
+    events, kinds, outcome = drive(Agent(llm, FakeSandbox(), ALLOW), script)
+    assert "unusable_reply" in kinds and outcome.ok
+    assert outcome.usage.calls == 2
+    assert outcome.usage.input_tokens == 901 and outcome.usage.output_tokens == 16_001
+
+
+def test_a_refusal_is_charged_too(script):
+    llm = FakeLLM(Refused("no", reason="a", input_tokens=500, output_tokens=20), _call())
+    events, kinds, outcome = drive(Agent(llm, FakeSandbox(), ALLOW), script)
+    assert outcome.ok and outcome.usage.tokens == 500 + 20 + 2
+
+
+def test_one_run_does_not_spend_the_next_ones_budget(script):
+    """The budget is a policy and holds no counters, so an `Agent` built once and run
+    twice starts each run at zero. A mutable budget on the agent would let the first
+    run quietly bound the second."""
+    agent = Agent(FakeLLM(_call(), _call()), FakeSandbox(), ALLOW,
+                  budget=Budget(total=100_000, reserve=20_000))
+    first = drive(agent, script)[2]
+    second = drive(agent, script)[2]
+    assert first.usage == second.usage and second.ok
 
 
 def test_the_fallback_is_gated_like_everything_else(script):

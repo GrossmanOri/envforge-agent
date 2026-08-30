@@ -102,6 +102,22 @@ def test_openai_asks_for_strict_and_groq_does_not():
     assert groq_request["tool_choice"]["function"]["name"] == "write_dockerfile"
 
 
+def test_every_provider_sends_an_output_ceiling():
+    """ARCHITECTURE.md invariant 18 and ADR-015. `budget.estimate` assumes a reply
+    cannot exceed MAX_TOKENS, so a provider we do not send a ceiling to makes that
+    assumption false and lets one reply overshoot the whole budget. It is also the
+    only thing `Truncated` can fire on, so without it that path is unreachable.
+
+    `max_completion_tokens` rather than `max_tokens`: both OpenAI and Groq document
+    the latter as deprecated in favour of it, and OpenAI's newer models reject it.
+    """
+    for llm in (OpenAICompatLLM("gpt-5", client=object()),
+                OpenAICompatLLM("llama", strict=False, client=object())):
+        request = llm.build_request("s", "u", TOOL)
+        assert request["max_completion_tokens"] == MAX_TOKENS
+        assert "max_tokens" not in request
+
+
 def test_a_schema_that_strict_mode_would_reject_is_refused_at_construction():
     with pytest.raises(ValueError, match="additionalProperties"):
         Tool("t", "d", {"type": "object", "properties": {}, "required": ["a"]})
@@ -158,6 +174,43 @@ def test_anthropic_separates_the_ways_a_call_can_fail(stop_reason, expected):
     llm, _ = _anthropic(_anthropic_message(content=[], stop_reason=stop_reason))
     with pytest.raises(expected):
         llm.call("s", "u", TOOL)
+
+
+@pytest.mark.parametrize("stop_reason, expected", [
+    ("refusal", Refused),
+    ("max_tokens", Truncated),
+    ("end_turn", LLMError),
+])
+def test_a_reply_we_cannot_use_still_reports_what_it_cost(stop_reason, expected):
+    """The budget is only a bound if every call reaches the ledger. A truncated reply
+    burned the whole output ceiling, and a loop that kept truncating would otherwise
+    walk past a budget that never charged it anything."""
+    llm, _ = _anthropic(_anthropic_message(content=[], stop_reason=stop_reason))
+    with pytest.raises(expected) as caught:
+        llm.call("s", "u", TOOL)
+    assert caught.value.input_tokens == 1200 and caught.value.output_tokens == 340
+
+
+def test_a_reply_that_fails_the_schema_still_reports_what_it_cost():
+    """`validate` knows nothing about tokens, and a reply that fails it cost exactly
+    as much as one that passes."""
+    llm, _ = _anthropic(_anthropic_message(content=[
+        {"type": "tool_use", "id": "t", "name": "write_dockerfile",
+         "input": {"dockerfile": "FROM x", "base_image": "x", "entrypoint": "sh"}},
+    ]))
+    with pytest.raises(InvalidArguments) as caught:
+        llm.call("s", "u", TOOL)
+    assert caught.value.input_tokens == 1200 and caught.value.output_tokens == 340
+
+
+def test_openai_reports_what_an_unusable_reply_cost_under_its_own_names():
+    llm, _ = _openai(_openai_completion(tool_calls=[{
+        "id": "call_1", "type": "function",
+        "function": {"name": "write_dockerfile", "arguments": "{not json"},
+    }]), strict=False)
+    with pytest.raises(InvalidArguments) as caught:
+        llm.call("s", "u", TOOL)
+    assert caught.value.input_tokens == 900 and caught.value.output_tokens == 210
 
 
 def test_anthropic_validates_even_though_it_asked_for_strict():

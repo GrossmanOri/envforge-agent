@@ -2,10 +2,14 @@
 
 Nothing here judges what the script did. It decides one thing only, over and over:
 is this failure something a rewritten Dockerfile could fix. A failure that a rewrite
-cannot fix must not spend an attempt, because attempts are the only budget there is.
+cannot fix must not spend an attempt, because an attempt is the scarcer of the two
+things a run can spend: it builds an image and runs a container, which no count of
+tokens measures. `budget.py` bounds the other one.
 
 The loop yields events instead of printing. Sitting 5's graph engine and sitting 8's
-trace both attach here, and a caller that wants a CLI can render them.
+trace both attach here, and a caller that wants a CLI can render them. What may be
+yielded, and who wrote each string in it, is `events.py` rather than this file: the
+graph engine has to honour the same vocabulary, so it cannot be defined by one engine.
 """
 
 from __future__ import annotations
@@ -15,6 +19,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Protocol, Sequence
 
+from .budget import Budget, Usage
+from .budget import DEFAULT as DEFAULT_BUDGET
+from .events import Event
 from .llm import LLM, Call, InvalidArguments, LLMError, Refused, Tool, Truncated
 from .sandbox import BuildResult, RunResult, Sandbox
 from .workspace import Workspace
@@ -173,28 +180,6 @@ Write the complete corrected Dockerfile."""
 
 
 @dataclass(frozen=True)
-class Event:
-    """One thing that happened, in order. `data` is for machines, `message` for people."""
-
-    kind: str
-    message: str
-    data: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class Usage:
-    """What a run cost, as numbers rather than payloads.
-
-    `calls` counts requests sent to the model, including replies we could not use.
-    Token totals count only replies that returned their usage to us.
-    """
-
-    calls: int = 0
-    input_tokens: int = 0
-    output_tokens: int = 0
-
-
-@dataclass(frozen=True)
 class Outcome:
     """Carried on the final event rather than returned, because a generator's return
     value is invisible to anything that does not drive it by hand, and a graph engine
@@ -266,26 +251,37 @@ class Agent:
     without a gate is a loop that can build one unchecked."""
 
     def __init__(self, llm: LLM, sandbox: Sandbox, gate: Gate,
-                 max_attempts: int = 3, max_refusals: int = 1) -> None:
+                 max_attempts: int = 3, max_refusals: int = 1,
+                 budget: Budget = DEFAULT_BUDGET) -> None:
         self.llm, self.sandbox, self.gate = llm, sandbox, gate
         self.max_attempts, self.max_refusals = max_attempts, max_refusals
+        # Two currencies, two bounds. `max_attempts` bounds container work, since every
+        # attempt builds an image and runs it, and that cost is not measured in tokens.
+        # The budget bounds what the model is paid, which a count of attempts cannot
+        # bound at all once a single attempt can take many turns.
+        self.budget = budget
 
-    def _write(self, language: str, name: str, text: str,
-               previous: str | None, evidence: str | None) -> Call:
-        """One forced tool call, whether this is a first attempt, a retry after an
-        unusable reply, or a repair. A repair carries the previous Dockerfile whole
-        and only the latest evidence, never an accumulated history. A retry has no
-        previous Dockerfile to carry, so it needs its own template: reusing FIRST
-        would compute the evidence and then silently drop it."""
+    @staticmethod
+    def _prompt(language: str, name: str, text: str,
+                previous: str | None, evidence: str | None) -> str:
+        """The user half of one forced tool call, whether this is a first attempt, a
+        retry after an unusable reply, or a repair. A repair carries the previous
+        Dockerfile whole and only the latest evidence, never an accumulated history.
+        A retry has no previous Dockerfile to carry, so it needs its own template:
+        reusing FIRST would compute the evidence and then silently drop it.
+
+        Built separately from the call because the budget has to be asked about a
+        prompt before the prompt is sent, and the only honest estimate of a call's
+        cost is made from the text that call will carry.
+        """
         if previous is not None:
             template = REPAIR          # there is a Dockerfile to correct
         elif evidence is not None:
             template = RETRY           # the reply was unusable, so there is not
         else:
             template = FIRST
-        user = template.format(language=language, name=name, text=text,
+        return template.format(language=language, name=name, text=text,
                                previous=previous, evidence=evidence)
-        return self.llm.call(SYSTEM, user, WRITE_DOCKERFILE)
 
     @staticmethod
     def _dead_end(reason: str, *, attempt: int, usage: Usage, refusals: list[Any],
@@ -329,6 +325,14 @@ class Agent:
         def usage() -> Usage:
             return Usage(calls, input_tokens, output_tokens)
 
+        def charge(reply: Call | LLMError) -> None:
+            """Add what a reply cost to the ledger, whether we could use it or not.
+            A truncated reply burned the whole output ceiling; a budget that charged
+            only for successes could be walked past by a loop that never succeeds."""
+            nonlocal input_tokens, output_tokens
+            input_tokens += reply.input_tokens
+            output_tokens += reply.output_tokens
+
         dockerfile: str | None = None
         base_image: str = ""
         previous: str | None = None
@@ -340,11 +344,25 @@ class Agent:
             attempt += 1
 
             while dockerfile is None:
+                user = self._prompt(language, script, text, previous, evidence)
+                if not self.budget.can_write(usage(), SYSTEM, user):
+                    # The same shape as a second refusal: the model stops being asked
+                    # and we write the Dockerfile ourselves. A spent budget degrades a
+                    # run rather than ending it with nothing, and the alternative is
+                    # paying for everything up to here and having no image to show.
+                    yield Event("budget_spent",
+                                f"{usage().tokens} of {self.budget.total} tokens spent, "
+                                "using our own Dockerfile")
+                    dockerfile = default_dockerfile(language, script)
+                    base_image = LANGUAGES[language].base_image
+                    used_fallback = True
+                    break
                 yield Event("asking", f"attempt {attempt}: asking for a Dockerfile")
                 calls += 1
                 try:
-                    call = self._write(language, script, text, previous, evidence)
+                    call = self.llm.call(SYSTEM, user, WRITE_DOCKERFILE)
                 except Refused as exc:
+                    charge(exc)
                     refusals.append(exc.reason)
                     yield Event("refused", str(exc), {"reason": exc.reason})
                     if len(refusals) <= self.max_refusals:
@@ -355,12 +373,12 @@ class Agent:
                     yield Event("fell_back", "refused twice, using our own Dockerfile")
                 except (InvalidArguments, Truncated, LLMError) as exc:
                     # Repairable, but by rewriting the reply rather than the image.
+                    charge(exc)
                     yield Event("unusable_reply", str(exc))
                     evidence = str(exc)   # RETRY's own heading already says what it is
                     break
                 else:
-                    input_tokens += call.input_tokens
-                    output_tokens += call.output_tokens
+                    charge(call)
                     dockerfile = call.arguments["dockerfile"]
                     base_image = call.arguments["base_image"]
                     # The whole Call, bodies included, goes on the event rather than

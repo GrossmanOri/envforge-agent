@@ -1,10 +1,17 @@
 # Status
 
-Updated 2026-08-24, end of sitting 5.
+Updated 2026-08-30, sitting 6 merged and sitting 7 briefed.
 
 ## Where we are
-Sitting 5 complete: `envforge/gate.py` and `tests/test_gate.py`. The loop can no longer be
-constructed without a gate, and now there is a real one to give it.
+All five of sitting 6's shapes are built: the workspace, the build context taken as
+contents, the outcome slimmed to totals, the event vocabulary, and the token budget.
+Nothing in the plan now blocks the tool loop. 232 tests pass.
+
+A review of the branch before merge found two things worth carrying forward, and both are
+in the sitting 7 brief at the end of this file. A spent budget currently degrades quietly
+into a build nobody judged, and a provider failure such as a dead API key is not caught at
+all, so it kills the run without an outcome. Neither is a bug in the budget; both are the
+run being unable to say honestly that it failed.
 
 ## What sitting 5 produced
 An allowlist of six instructions and nothing else: FROM, COPY, RUN, USER, CMD, ENTRYPOINT.
@@ -96,8 +103,8 @@ boundary. Anyone can publish there, so `FROM eviluser/backdoor:1.0` is inside th
 as written. The registry-host rule stops the daemon pulling from a host the attacker
 named; it does not make the image trustworthy.
 
-Sitting 4 of 11 complete: `envforge/agent.py` and `tests/test_agent.py`.
-207 tests, 194 needing neither Docker nor an API key, 13 against the real daemon.
+Sitting 4 complete: `envforge/agent.py` and `tests/test_agent.py`.
+231 tests today, 218 needing neither Docker nor an API key, 13 against the real daemon.
 
 ## What sitting 4 produced
 The plain repair loop. It defines `write_dockerfile` against the schema `Tool` already
@@ -497,11 +504,128 @@ unsupported language, and carried on `wrote`. `Usage.calls` now counts every req
 including a refusal, while token totals remain limited to replies that returned usage.
 Two new tests cover the full ID and the unsupported-language path. 207 tests pass.
 
+That last sentence held for four days only. The budget piece below found that the failures
+were the replies not returning a usage, so the totals now count every reply, and the
+contrast between `calls` and tokens that this paragraph draws no longer exists.
+
 The same review asked for raw request and response bodies on failed provider replies. That
 needs the provider error types to retain wire data, so it is deferred explicitly to sitting
 8's trace design and recorded in `private/LATER.md` rather than half-built here.
 
-Still to come in sitting 6: the event names, and the token budget.
+## Sitting 6, fourth of five
+`envforge/events.py`. The twelve kinds an engine may yield, and who wrote every string in
+each one. `Event` checks both at construction, so an engine that invents `node_entered`
+fails there rather than putting a record in the trace that nobody can label.
+
+The closed set is the smaller half. The labels are the reason this had to happen before
+the LangGraph port and before the trace: a reader cannot tell whether a string came from
+us, the model, a container or the files the run was handed, and neither can sitting 8's
+trace module. Only the code that emits the event knows, so a label added later is a guess
+dressed up as a record.
+
+Authors are a set per string, not one value per event. Three of the twelve made that
+necessary rather than tidy. `gate_rejected` carries a Dockerfile that is the model's on
+every path but one, since after two refusals the file we wrote ourselves goes through the
+same gate and can be rejected there too. `gate_rejected` is our own sentence quoting the model's line
+back at it, since the gate's reason includes the offending line verbatim. And the `call`
+on `wrote` holds a request carrying our system prompt and the script, and a response
+written by the model. One value on either would have been false, and picking the "least
+trusted" one means ranking a model against a container, which has no honest answer.
+
+The labels are declared per kind, so a kind's set is the union over every path that emits
+it. `finished` is labelled `INPUT` because one of its five paths names the language the
+caller asked for, though the other four do not. Coarse, and chosen: a table can be checked
+and a label chosen at each emission cannot, and the point of a seam is that a second engine
+has to honour it.
+
+A fifth provenance was considered and refused. Docker's own words on `exec_failed` are the
+daemon quoting the model's ENTRYPOINT, so the untrusted author is the model and the daemon
+is not a separate one. `TOOL` exists and nothing emits it; sitting 7 does.
+
+The test that closes the loop reads `agent.py` with `ast` and asserts the kinds emitted
+there are exactly the kinds declared. Construction covers one direction, a kind emitted
+but never declared; this covers the other, a kind declared but never emitted. It asserts
+each `Event(` call has a literal first argument, so a computed kind turns the check red
+instead of quietly incomplete.
+
+Nothing consumes the labels yet, which is the fair criticism of this piece. The answer is
+that emission is the only place the answer exists, not that a consumer is imminent.
+
+215 tests pass.
+
+## Sitting 6, fifth of five
+`envforge/budget.py`. The model spend is bounded in tokens, and `max_attempts` stays where
+it is. Two currencies, two bounds: an attempt builds an image and runs a container, which
+no count of tokens measures, while a count of attempts stops measuring the bill the moment
+one attempt can take many turns.
+
+A turn cap measures nothing on its own, because every turn resends everything before it.
+Sitting 7 makes that sharp rather than theoretical: each file the model reads stays in the
+conversation for every turn after it.
+
+Part of the total is reserved and cannot be spent on looking around. `can_investigate`
+asks with the reserve held back, `can_write` asks without it, and the gap between them is
+the whole idea: investigation is worth nothing if there is not enough left afterwards to
+turn it into a Dockerfile. Nothing calls `can_investigate` until sitting 7. It is here now
+because a tool loop written against a turn counter is a rewrite later rather than an
+argument, which is the test every one of the five shapes had to pass.
+
+A spent budget falls back to the Dockerfile we write ourselves, exactly like a second
+refusal. Paying for everything up to that point and producing no image is the one ending
+worth engineering against.
+
+The estimate gates and the provider's numbers record. `estimate` errs high twice over, a
+characters-per-token rate below the real one and a reply assumed to run to the output
+ceiling, so the loop stops one call early rather than one call late. An overestimate is
+never written into the ledger and refunded, because that pessimism compounds until the
+budget is a turn cap wearing a different name. The ceiling half was an Anthropic truth only
+when this was written, and stopped being one on 30 August, below.
+
+`Budget` is frozen and holds no counters, so an `Agent` built once and run twice starts
+each run at zero. A budget carrying its own spent total would let the first run quietly
+bound the second, and a test drives the same agent twice to hold that.
+
+## The tokens nobody was charging for, found before this piece merged
+The budget was written first and reviewed before the loop used it, and the review found
+that it could not bound anything. `Refused`, `Truncated` and `InvalidArguments` all raise
+out of `llm.py` before any usage is recorded, so a reply we could not use cost tokens that
+the ledger never saw.
+
+Truncation is the case that matters. A truncated reply consumed the entire output ceiling,
+which is what truncation means, so it is the most expensive reply there is and it was the
+one charged at zero. A loop that kept truncating would have walked past the budget
+forever.
+
+`LLMError` now carries `input_tokens` and `output_tokens`, every raise site in both
+providers reads the usage off the response it already has, and `validate` failures are
+charged through a small wrapper because `validate` itself knows nothing about tokens. Zero
+remains the default and now means one thing only: no reply reached us to read a usage off.
+
+This does not reopen the sitting 8 deferral. That one is about keeping raw request and
+response bodies for failed replies, which needs error types that retain wire data. Two
+integers are not that.
+
+## The bound that only bound one provider, 2026-08-30
+A clean-context review of the branch found that `OpenAICompatLLM` sent no output ceiling.
+Anthropic was sent `max_tokens` and the other two were sent nothing, while `estimate` added
+`MAX_TOKENS` to every guess on the assumption that a reply cannot exceed it.
+
+So on two providers out of three the assumption was simply false. One reply could run past
+the whole budget before `can_write` got the chance to refuse the next call, and `Truncated`
+had nothing to fire on, since truncation is the provider enforcing a ceiling we never sent.
+The budget read as a bound and was one only under Anthropic.
+
+Both OpenAI-compatible providers are now sent `max_completion_tokens`, which Groq's own
+reference and OpenAI both document as the replacement for the deprecated `max_tokens`, and
+which OpenAI's newer models require. A test asserts the ceiling is in the request for both,
+and asserts the deprecated name is absent.
+
+The lesson is the one this file keeps recording. The gap was disclosed honestly in three
+places, ADR-015, the `budget.py` header and the sitting note, and every one of them called
+it a known gap in the estimate. None of them said the bound itself did not hold, which is
+the sentence that would have made someone fix it.
+
+232 tests pass.
 
 ## Prompts move to a module, decided 2026-08-25
 Before the tool loop, and as `envforge/prompts.py` rather than as text files.
@@ -645,9 +769,82 @@ with ARCHITECTURE.md and STATUS.md.
 
 ## Next
 Sitting 6 is the five shapes, which needs no model at all.
-Sitting 7 is the tool loop, whose entry ticket is one live Anthropic call and whose exit
-ticket is a run where the investigation demonstrably changed the outcome. Sitting 8 is the
-LangGraph port as a real two-node cycle. The plan is twelve sittings now, not eleven.
+Sitting 7 is the CLI, whose exit ticket is `python -m envforge script.py` against a real
+Anthropic call. Changed 2026-08-30 from the tool loop, which moves to sitting 8: nothing has
+been run end to end yet, and the loop is better judged against a real run than against a
+test. Sitting 9 is the LangGraph port as a real two-node cycle. The plan is twelve sittings
+now, not eleven, and the brief below is the current one.
+
+## Brief for sitting 7: make it runnable
+Written 2026-08-30, before the code, so the argument can be attacked first. Replaces an
+earlier draft of this brief that made sitting 7 the tool loop.
+
+**The audit above still blocks this, and goes first.** `~/Projects/envforge/` holds `v1`,
+`private` and `agent`, and the two unused GitHub repositories are still undecided. That was
+Ori's condition on 25 August and nothing here changes it. It is also cheaper to do before a
+CLI than after, because packaging is the first thing that has to know which directory is
+the project.
+
+### Why the CLI and not the tool loop
+Six sittings in, there is no `__main__.py`. README says so plainly: nothing can be run from
+a shell. Every part built so far is exercised only by tests and by driving it from a Python
+prompt. That is the real cost the project is carrying, and it is larger than any design
+question currently open.
+
+Building the tool loop first adds a fifth part to a machine nobody has run end to end. The
+loop also gets better if it lands second, because it can then be judged by what it does to
+a real run instead of by what a test asserts about it.
+
+### What sitting 7 builds
+`envforge/__main__.py`. One script in, one verdict out. `python -m envforge script.py`
+against a real Anthropic call, and a run that a person can read the output of.
+
+Three things fall out of it that are on this list because a CLI cannot ship without them,
+not because they are interesting on their own.
+
+**A provider failure has to stop the run properly.** `agent.py` catches
+`(InvalidArguments, Truncated, LLMError)`. A dead API key raises `AuthenticationError`, an
+exhausted account raises `PermissionDeniedError` with `.type == "billing_error"`, and a
+rate limit raises `RateLimitError`. None of those is an `LLMError`, so today each one
+escapes the generator: traceback, no `finished` event, no outcome, spend unrecorded. A
+command line tool that dies this way on an expired key is not shippable.
+
+These must never reach the fallback path. A refusal is an HTTP 200 with
+`stop_reason == "refusal"`; every failure above is an exception with no response body, so
+the protocol separates them cleanly and only our code loses the distinction. If a dead key
+were ever mapped onto the refusal path we would build our own Dockerfile, run it, and print
+a normal-looking verdict for a run the model never saw. For a tool whose only output is a
+judgment about untrusted code, saying "fine" when the judge never arrived is the worst
+failure available. Note that 403 covers both billing and permissions, so the `.type` has to
+be read rather than the status code.
+
+**A spent budget has to stop the run too, rather than degrade it.** Today it behaves like a
+second refusal: writes our own Dockerfile, builds it, reports `ok`. The two do not mean the
+same thing. Two refusals is the model judging the script, which is information about the
+script. A spent budget is information about us. Falling back there prints a verdict that no
+judgment went into.
+
+**The budget becomes configurable, because the CLI is where configuration belongs.**
+Precedence, the ordinary one: an explicit constructor argument, then `ENVFORGE_TOKEN_BUDGET`,
+then the default. A `--token-budget` flag if it is free to add. Only the total is exposed.
+The reserve stays internal and is derived from it, because the reserve is arithmetic about
+one worst-case write call and not a number anyone should have to reason about.
+
+The default stays generous on purpose. Once a bound budget ends the run loudly, hitting it
+means something went wrong rather than that an allowance ran out, and there is no reason to
+keep the ceiling tight.
+
+### What moves to sitting 8
+The tool loop, with `can_investigate` getting its first caller and `TOOL` its first
+emitter. Every tool result is attacker-controlled text and goes through `bound()` before it
+reaches a prompt.
+
+### Settled, so it is not reopened
+The reserve is a fixed token count, not a fraction of the total. Sized as one worst-case
+producing call: the prompt plus the output ceiling, which is 32,000 today. A fraction would
+lock away more the more generous the total, which is backwards, since a bigger budget does
+not make the final write call more expensive. The code already does this and needs no
+change. Ori raised it, Gemini agreed, recorded here so the next reader does not re-derive it.
 
 ## Superseded
 Sitting 5: the LangGraph port. The same loop as graph nodes behind one interface, with the
@@ -660,5 +857,10 @@ reason we stop. `ANTHROPIC_API_KEY` in the environment, never in a file.
 Nothing blocks sitting 3 now.
 
 ## Sittings
-1 cage (done) | 2 sandbox (done) | 3 llm (next) | 4 plain loop | 5 LangGraph port |
-6 gate | 7 verdict | 8 trace | 9 prompts | 10 failures and cost | 11 packaging
+1 cage (done) | 2 sandbox (done) | 3 llm (done) | 4 plain loop (done) | 5 gate (done) |
+6 the five shapes (done) | 7 tool loop | 8 LangGraph port | 9 trace | 10 verdict |
+11 prompts and cost | 12 packaging
+
+The numbering from 5 onwards no longer matches the plan file, and this line is what the
+repository actually did rather than what was planned. 6 to 12 are Ori's to confirm or
+renumber; the names are taken from the Next paragraph above, which is the newer record.
