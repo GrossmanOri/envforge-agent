@@ -4,7 +4,7 @@ Tools and the sandbox ask for names and contents. Neither is given a path, so
 there is no path for anything to manipulate. Everything that could go wrong with
 a filesystem happens once, here, at ingestion, rather than on every read.
 
-That single choke point is the point. A `requirements.txt` sitting next to an
+That single choke point is the point. A `requirements.txt` beside an
 untrusted script was not chosen by anyone: it was discovered. Resolving it once
 and checking where it actually landed is a rule that holds forever. Checking a
 path at each use is a rule that holds until somebody adds a use.

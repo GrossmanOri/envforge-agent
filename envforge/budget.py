@@ -2,7 +2,7 @@
 
 The bound is tokens rather than turns because a turn is not a fixed size. Every turn
 resends everything before it, so the tenth costs several times the first, and a cap of
-"ten turns" says nothing about the bill. Sitting 7's tool loop makes that acute: the
+"ten turns" says nothing about the bill. The tool loop makes that acute: the
 model reads files before it writes anything, and each thing it reads stays in the
 conversation for every turn after.
 
@@ -12,7 +12,7 @@ A part of the total is reserved and cannot be spent on looking around. Investiga
 only worth anything if there is enough left afterwards for the call that turns it into a
 Dockerfile, and a loop that spends its last token on one more file read has paid for
 knowledge it can no longer use. `can_investigate` is that rule and has no caller until
-sitting 7; `can_write` is the same question without the reserve, and today every call is
+the tool loop lands; `can_write` is the same question without the reserve, and today every call is
 that call.
 
 The estimate decides, the provider's numbers record. `estimate` is a guess and errs high
@@ -98,7 +98,7 @@ class Budget:
 
     def can_investigate(self, usage: Usage, *texts: str) -> bool:
         """Room for a call that only learns something, leaving the reserve untouched.
-        Nothing asks this yet. Sitting 7's tool loop is the caller, and the question
+        Nothing asks this yet. The tool loop is the caller, and the question
         has to exist before that loop is written, or the loop is written against a
         counter and converting it later is a rewrite rather than an argument."""
         return usage.tokens + estimate(*texts) + self.reserve <= self.total

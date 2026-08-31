@@ -6,8 +6,8 @@ cannot fix must not spend an attempt, because an attempt is the scarcer of the t
 things a run can spend: it builds an image and runs a container, which no count of
 tokens measures. `budget.py` bounds the other one.
 
-The loop yields events instead of printing. Sitting 5's graph engine and sitting 8's
-trace both attach here, and a caller that wants a CLI can render them. What may be
+The loop yields events instead of printing. The graph engine and the trace module
+both attach here, and a caller that wants a CLI can render them. What may be
 yielded, and who wrote each string in it, is `events.py` rather than this file: the
 graph engine has to honour the same vocabulary, so it cannot be defined by one engine.
 """
@@ -230,7 +230,7 @@ def default_dockerfile(language: str, name: str) -> str:
 
 
 class Gate(Protocol):
-    """Sitting 6 implements this. It returns a reason to refuse, or None to allow.
+    """The gate implements this. It returns a reason to refuse, or None to allow.
 
     `base_image` and `allowed_files` are passed rather than inferred. The model
     declares its base image as a separate field precisely so the gate can check it
