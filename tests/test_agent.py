@@ -19,7 +19,7 @@ from envforge.sandbox import BuildResult, DockerSandbox, Limits, RunResult
 from envforge.workspace import Files, gather
 
 GOOD = "FROM python:3.12-slim\nCOPY s.py /app/s.py\nENTRYPOINT [\"python\", \"/app/s.py\"]\n"
-def ALLOW(dockerfile, base_image, allowed_files):   # the sitting 6 gate, stubbed open
+def ALLOW(dockerfile, base_image, allowed_files):   # the real gate, stubbed open
     return None
 
 
@@ -185,7 +185,7 @@ def test_a_script_exiting_126_to_look_broken_does_not_buy_a_repair(script, exit_
 def test_the_script_choosing_how_to_die_is_not_a_repair(script, exit_code, timed_out):
     """0 is success, 1 is the script raising, 137 is the kernel killing it, and a
     timeout means the run happened and took too long. All four are observed
-    behaviour, which is the verdict's problem in sitting 7, not the loop's."""
+    behaviour, which is the verdict's problem, not the loop's."""
     llm = FakeLLM(_call())
     sandbox = FakeSandbox(runs=[_run(exit_code=exit_code, timed_out=timed_out)])
     events, kinds, outcome = drive(Agent(llm, sandbox, ALLOW), script)

@@ -32,8 +32,15 @@ ROOT = Path(__file__).resolve().parent.parent
 # Every Markdown file that ships in the public repository. Discovered rather than listed,
 # so a new record is covered the day it is added instead of the day someone remembers.
 PUBLIC_DOCS = sorted(
-    p for p in ROOT.glob("*.md")
-    if p.is_file()
+    p for p in (
+        [p for p in ROOT.glob("*.md") if p.is_file()]
+        + list((ROOT / "envforge").glob("*.py"))
+        + list((ROOT / "tests").glob("*.py"))
+    )
+    # This file states the patterns, so it necessarily contains every one of them. It is
+    # the only exemption, and it is named rather than pattern-matched so that adding a
+    # second one is a visible decision instead of a widened glob.
+    if p.name != "test_records.py"
 )
 
 BANNED = {

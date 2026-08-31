@@ -10,7 +10,7 @@ can label.
 The labels are the part that cannot be added later. A reader of the finished trace
 cannot tell whether a string was written by us, by the model, by a container or by the
 files the run was handed, and neither can the trace module: only the code that emits
-the event knows. Sitting 8 renders these records, and a renderer that guesses wrong
+the event knows. The trace module renders these records, and a renderer that guesses wrong
 about which text is attacker-controlled guesses wrong in a browser.
 
 Nothing consumes the labels yet. They are written now because emission is the only
@@ -38,7 +38,7 @@ class Provenance(Enum):
     # controls if they control anything.
     INPUT = "input"
     MODEL = "model"
-    # A tool result. Nothing emits one yet; sitting 7's tool loop does.
+    # A tool result. Nothing emits one yet; the tool loop will.
     TOOL = "tool"
     CONTAINER = "container"
 

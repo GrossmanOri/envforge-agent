@@ -84,7 +84,7 @@ def test_script_args_land_after_the_image():
 
 
 def test_argv_is_a_list_of_separate_words():
-    """A string command re-splits on spaces and arrived as one flag in sitting 1."""
+    """A string command re-splits on spaces, and once arrived as a single flag."""
     assert all(isinstance(word, str) and " " not in word for word in _sample_run_argv())
 
 
