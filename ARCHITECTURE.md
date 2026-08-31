@@ -191,7 +191,7 @@ against a container and there is no honest ranking there, while the question a r
 asks is answered by `authors() == {US}` or not.
 
 The labels are declared per kind and are the union over every path emitting it, so
-`finished` carries `INPUT` because one of its six emission sites names the language the caller
+`finished` carries `INPUT` because one of its seven emission sites names the language the caller
 asked for. Rejected: a label chosen at each emission, which is more precise and is not a
 contract, since nothing can check that an emitter filled it in honestly.
 
@@ -279,9 +279,17 @@ SDKs share no hierarchy; 403 is read further, since an exhausted account and a k
 model access are the same status and only the provider's error type separates them.
 
 The exit code carries the distinction to the shell. `1` is the script running and exiting
-nonzero, which is a result. `3` through `6` are this tool being unable to work: no provider,
-no budget, no Docker, no Dockerfile that builds. A caller that collapsed them would treat a
-dead key as a verdict about the code it was given.
+nonzero, which is a result. `3` through `7` are this tool being unable to work: no provider
+or no credentials, no budget, no Docker, no Dockerfile that builds, and the provider
+refusing the request we sent. A caller that collapsed them would treat a dead key as a
+verdict about the code it was given.
+
+`7` is ours rather than theirs, and it is the same event ADR-008 settled one layer down: a
+400 is the API rejecting our request exactly as docker exit 125 is the CLI rejecting our
+command. A malformed request to the provider and a malformed docker command share it.
+`build_timeout` deliberately shares `6` with the other ways a run ends without a working
+image, because a caller's action is the same in all of them, which is to look at the build
+rather than to retry.
 
 The code is chosen from a typed `Outcome.kind` and never from the words in `reason`. A
 first version matched substrings, and `reason` splices in the gate's quoted line, which

@@ -22,7 +22,7 @@ it cost; nothing yet decides what that behaviour means. The model also has no to
 reads the script once and writes a Dockerfile, which makes this a workflow with a feedback
 loop rather than an agent.
 
-292 tests, 279 of which need neither Docker nor an API key. Both suites run on every push
+296 tests, 283 of which need neither Docker nor an API key. Both suites run on every push
 and every pull request.
 
 ## The default provider, decided 2026-08-22
@@ -238,6 +238,49 @@ vocabulary grew from twelve kinds to thirteen, and a paragraph reading "a fifth 
 was considered and refused" sat directly above the commit that added a fifth.
 
 290 tests pass.
+
+## The fifth review, scoped to the fixes nothing had checked, 2026-08-31
+The three most recent commits had never been read by anything but their author, so a review
+was run against that range alone and told not to accept it on the strength of the earlier
+rounds. It blocked, on the third instance of one pattern.
+
+**A fix that moved the traceback instead of removing it.** `MissingKey` is a subclass of
+`ProviderUnavailable`, and both command line entry points caught only the subclass, so the
+parent, which the SDK constructor raises for a missing or malformed credential profile,
+escaped as a traceback and exit 1. Exit 1 is defined here as the script running and
+failing, so a setup mistake reported itself as a finding about the sample, and the
+traceback bypassed the escaping, putting an environment-derived path on the terminal raw.
+
+The test that was supposed to cover this asserted `AnthropicLLM` raises the right type. Its
+name claimed a property of the command, and nothing checked the command. That is the same
+shape as the fake tests the previous round found, and it is the third round in a row where
+a fix was correct in the library and absent from the program. The new test drives `main`.
+
+**A mutation survived, and it was the whole content of the previous commit.** Flattening
+the agent's kind to `unavailable` left every test green, because one test proved the
+provider layer produces `rejected` and another built the outcome by hand. Nothing joined
+them. The path worked, so this was a coverage hole rather than a live bug, but it is the
+hole shape that blocked round four.
+
+**Unmapped statuses were still escaping.** 402, 409, 413 and 422 re-raised out of the
+generator with no outcome and unrecorded spend, which is the failure the wrapper exists to
+prevent. Enumerating statuses always misses the next one, so anything unmapped now falls to
+a side rather than to the floor: a 4xx is the provider refusing what we sent, anything else
+is the provider not serving us.
+
+Also from the same review, and accepted: a malformed docker command is our bug rather than
+the caller's, so `SandboxError` moves from exit 2 to exit 7, which is what 7 was created to
+mean; and `--check` was reporting a rejection as exit 3 while a run reported it as 7.
+
+**Two of its arguments were declined, with reasons.** It suggested separating a
+context-window 400 from a malformed-request 400. Both providers return the same error type,
+so the split would need the provider's prose, which is exactly the substring matching
+invariant 22 bans. It also suggested one free rebuild on a build timeout, since buildkit
+keeps the pulled layers and the incident that motivated the ending would then have
+succeeded. That is a good idea and it is a behaviour change, so it went to LATER rather
+than into a branch already blocked five times.
+
+296 tests pass.
 
 ## Keys come from a .env, reversed 2026-08-30
 The original decision said the key was read from the environment and never from a file.
@@ -777,7 +820,7 @@ trusted" one means ranking a model against a container, which has no honest answ
 
 The labels are declared per kind, so a kind's set is the union over every path that emits
 it. `finished` is labelled `INPUT` because one of its emission sites names the language the
-caller asked for, though the other four do not. Coarse, and chosen: a table can be checked
+caller asked for, though the others do not. Coarse, and chosen: a table can be checked
 and a label chosen at each emission cannot, and the point of a seam is that a second engine
 has to honour it.
 

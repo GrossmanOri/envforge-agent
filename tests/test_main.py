@@ -383,7 +383,13 @@ def test_the_daemon_is_re_probed_on_every_build_failure_not_only_the_first(monke
 def test_our_own_precondition_is_not_reported_as_a_broken_daemon(tmp_path, monkeypatch, capsys):
     """`SandboxError` means we handed the sandbox something invalid; an `OSError` means
     Docker is unreachable. Collapsing them told an operator the daemon was broken when
-    it was fine and the caller had made a mistake."""
+    it was fine.
+
+    It exits 7 rather than 2. SandboxError's own docstring says our docker command was
+    wrong, and ADR-008 calls docker exit 125 our code being broken, which is exactly
+    what 7 was created to mean. Exit 2 told the caller they had typed something wrong,
+    which is a different accusation and the wrong one.
+    """
     import envforge.__main__ as module
     from envforge.sandbox import SandboxError
     from tests.test_agent import FakeLLM, _call
@@ -403,7 +409,7 @@ def test_our_own_precondition_is_not_reported_as_a_broken_daemon(tmp_path, monke
     monkeypatch.setattr(module, "make_llm", lambda spec: FakeLLM(_call()))
     monkeypatch.setattr(module, "DockerSandbox", lambda *a, **k: Rejecting())
 
-    assert module.main([str(script)]) == EXIT_USAGE
+    assert module.main([str(script)]) == EXIT_BAD_REQUEST
     assert "cannot reach Docker" not in capsys.readouterr().err
 
 
@@ -418,3 +424,81 @@ def test_a_rejected_request_is_our_bug_and_not_a_dead_provider():
     assert exit_code_for(rejected) == EXIT_BAD_REQUEST
     assert exit_code_for(gone) == EXIT_UNAVAILABLE
     assert EXIT_BAD_REQUEST != EXIT_UNAVAILABLE
+
+
+def test_a_broken_credential_profile_does_not_crash_the_command(tmp_path, monkeypatch, capsys):
+    """The blocker a fifth review found, and the third time a fix was defeated at its
+    call site.
+
+    `MissingKey` is a subclass of `ProviderUnavailable`, and both entry points caught
+    only the subclass, so a plain `ProviderUnavailable` from the SDK constructor, which
+    a missing or malformed credential profile raises, escaped as a traceback and exit 1.
+    Exit 1 is defined here as the script running and failing, so a setup mistake was
+    reporting itself as a finding about the sample. The traceback also bypassed
+    `printable`, putting an environment-derived path on the terminal unescaped.
+
+    Asserted through `main`, not through the library, because the previous test asserted
+    the library and its name claimed a property of the command.
+    """
+    import envforge.__main__ as module
+    from envforge.llm import ProviderUnavailable
+
+    def broken(spec):
+        raise ProviderUnavailable("anthropic credentials: profile 'work' not found",
+                                  kind="no_key")
+
+    monkeypatch.setattr(module, "load_env", lambda *a, **k: [])
+    monkeypatch.setattr(module, "make_llm", broken)
+    script = tmp_path / "s.py"
+    script.write_text("print(1)\n")
+
+    assert module.main(["--check"]) == EXIT_UNAVAILABLE
+    assert module.main([str(script)]) == EXIT_UNAVAILABLE
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_a_rejected_request_reaches_the_shell_as_seven(tmp_path, monkeypatch):
+    """A mutation survived here: flattening the agent's kind to "unavailable" left every
+    test green, because one test proved `reachable` produces "rejected" and another built
+    the Outcome by hand. Nothing joined them, which is the coverage hole that blocked an
+    earlier round."""
+    import envforge.__main__ as module
+    from envforge.llm import ProviderUnavailable
+    from tests.test_agent import FakeLLM, FakeSandbox
+
+    sandbox = FakeSandbox()
+    llm = FakeLLM(ProviderUnavailable("rejected: 400 prompt is too long", kind="rejected"))
+    script = tmp_path / "s.py"
+    script.write_text("print(1)\n")
+    monkeypatch.setattr(module, "load_env", lambda *a, **k: [])
+    monkeypatch.setattr(module, "daemon_error", lambda: None)
+    monkeypatch.setattr(module, "make_llm", lambda spec: llm)
+    monkeypatch.setattr(module, "DockerSandbox", lambda *a, **k: sandbox)
+
+    assert module.main([str(script)]) == EXIT_BAD_REQUEST
+
+
+def test_the_headline_values_are_asserted_and_not_only_the_keys():
+    """Set equality checks keys. A mutation changing "OUR BUG" to "FAILED" survived, so
+    the one thing the table exists to say was untested."""
+    assert HEADLINE_FOR_KIND["rejected"] == "OUR BUG"
+    assert HEADLINE_FOR_KIND["ran"] == "ok"
+    assert HEADLINE_FOR_KIND["script_failed"] == "the script FAILED"
+    assert HEADLINE_FOR_KIND["build_timeout"] == "TIMED OUT"
+
+
+def test_every_status_the_provider_can_return_is_typed():
+    """Unmapped statuses re-raised, so 402, 409, 413 and 422 left the generator as
+    tracebacks. Enumerating statuses always misses the next one, so anything unmapped
+    now falls to a side rather than to the floor."""
+    import anthropic, httpx2 as httpx
+    from envforge.llm import ProviderUnavailable, reachable
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    for status in (400, 402, 409, 413, 422, 451, 500, 502, 529):
+        response = httpx.Response(status, request=request,
+                                  json={"error": {"type": "x", "message": "m"}})
+        exc = anthropic.APIStatusError("e", response=response, body=None)
+        with pytest.raises(ProviderUnavailable) as caught:
+            reachable(lambda: (_ for _ in ()).throw(exc))
+        expected = "rejected" if 400 <= status < 500 else "server"
+        assert caught.value.kind in (expected, "unavailable"), status

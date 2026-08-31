@@ -65,7 +65,7 @@ spent, Docker unavailable, no Dockerfile that would build, or the provider refus
 request we sent, which is our bug rather than theirs. Those say nothing about the
 script and a caller should fix its setup rather than read a verdict into them.
 
-292 tests, 279 of which need neither Docker nor an API key. Both suites run on every push
+296 tests, 283 of which need neither Docker nor an API key. Both suites run on every push
 and every pull request.
 
 ## What is designed and not built

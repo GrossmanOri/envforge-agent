@@ -26,7 +26,7 @@ from .budget import DEFAULT as DEFAULT_BUDGET
 from .budget import Budget
 from .events import Event, Provenance
 from .gate import check
-from .llm import MissingKey, make_llm
+from .llm import MissingKey, ProviderUnavailable, make_llm
 from .sandbox import DockerSandbox, SandboxError, daemon_error
 from .workspace import WorkspaceError, gather
 
@@ -111,6 +111,14 @@ def check_key(spec: str) -> int:
     except MissingKey as exc:
         print(f"{printable(exc.variable)} is not set", file=sys.stderr)
         return EXIT_UNAVAILABLE
+    except ProviderUnavailable as exc:
+        # The parent, not only the subclass. Catching `MissingKey` alone let a plain
+        # `ProviderUnavailable` from the SDK constructor, which a broken or missing
+        # credential profile raises, escape both entry points as a traceback and exit 1.
+        # Exit 1 is defined here as the script running and failing, so a setup mistake
+        # was reporting itself as a finding about the sample.
+        print(printable(str(exc)), file=sys.stderr)
+        return EXIT_UNAVAILABLE
     except ValueError as exc:
         print(f"bad provider spec: {printable(str(exc))}", file=sys.stderr)
         return EXIT_USAGE
@@ -129,7 +137,8 @@ def check_key(spec: str) -> int:
         reported = getattr(exc, "type", "") or type(exc).__name__
         print(f"{printable(spec)}: FAILED ({printable(str(status))} "
               f"{printable(str(reported))}) {printable(str(exc))}", file=sys.stderr)
-        return EXIT_UNAVAILABLE
+        # The same rejection must not be exit 3 here and exit 7 in a run.
+        return EXIT_BAD_REQUEST if status == 400 else EXIT_UNAVAILABLE
 
     wanted = spec.partition(":")[2]
     names = [getattr(m, "id", "") for m in models]
@@ -355,6 +364,9 @@ def main(argv: Sequence[str] | None = None, environ=None) -> int:
         print(f"{printable(exc.variable)} is not set. Put it in the environment or in "
               f"the project's .env; see .env.example.", file=sys.stderr)
         return EXIT_UNAVAILABLE
+    except ProviderUnavailable as exc:
+        print(printable(str(exc)), file=sys.stderr)
+        return EXIT_UNAVAILABLE
     except ValueError as exc:
         print(f"bad provider spec: {printable(str(exc))}", file=sys.stderr)
         return EXIT_USAGE
@@ -391,8 +403,12 @@ def main(argv: Sequence[str] | None = None, environ=None) -> int:
     except SandboxError as exc:
         # Our own precondition, not the daemon. Collapsing the two told an operator the
         # daemon was broken when it was fine and the caller had made a mistake.
+        # Our bug, not the caller's. SandboxError's own docstring says our docker
+        # command was wrong, and ADR-008 calls docker 125 our code being broken, which
+        # is exactly what exit 7 was created to mean. Exit 2 told the caller they had
+        # typed something wrong.
         print(f"\n{printable(str(exc))}", file=sys.stderr)
-        return EXIT_USAGE
+        return EXIT_BAD_REQUEST
     except OSError as exc:
         # No docker binary, or a daemon that is not running. Neither is a finding about
         # the script and neither is the model's fault, which is what made this worth

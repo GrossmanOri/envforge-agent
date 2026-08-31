@@ -237,7 +237,12 @@ def reachable(send):
             # answer and not enough to serve, which is theirs to fix and ours to report.
             kind = "server"
         if kind is None:
-            raise
+            # Nothing unmapped may escape. 402, 409, 413 and 422 were all leaving the
+            # generator as tracebacks, which is the same failure this wrapper exists to
+            # prevent, and enumerating statuses will always miss the next one. A 4xx is
+            # the provider refusing what we sent, which is ours to fix; anything else is
+            # the provider not serving us.
+            kind = "rejected" if 400 <= status < 500 else "unavailable"
         raise ProviderUnavailable(f"{kind}: {exc}", kind=kind) from exc
 
 
