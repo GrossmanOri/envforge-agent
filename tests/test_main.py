@@ -14,7 +14,7 @@ import pytest
 from envforge.__main__ import (
     EXIT_BUDGET, EXIT_NO_DOCKER, EXIT_OK, EXIT_RUN_FAILED, EXIT_UNAVAILABLE,
     EXIT_USAGE,
-    EXIT_NO_IMAGE, EXIT_FOR_KIND, HEADLINE_FOR_KIND,
+    EXIT_NO_IMAGE, EXIT_BAD_REQUEST, EXIT_FOR_KIND, HEADLINE_FOR_KIND,
     budget_from, exit_code_for, load_env, main, printable, render, report,
 )
 from envforge.agent import Outcome, Usage
@@ -40,7 +40,8 @@ def test_a_script_that_ran_and_failed_is_not_the_same_as_this_tool_failing():
     assert exit_code_for(Outcome(ok=False, kind="unavailable", reason="")) == EXIT_UNAVAILABLE
     # All of them are distinct, which is the property a caller depends on.
     assert len({EXIT_OK, EXIT_RUN_FAILED, EXIT_USAGE, EXIT_UNAVAILABLE,
-                EXIT_BUDGET, EXIT_NO_DOCKER, EXIT_NO_IMAGE}) == 7
+                EXIT_BUDGET, EXIT_NO_DOCKER, EXIT_NO_IMAGE,
+                EXIT_BAD_REQUEST}) == 8
 
 
 def test_every_kind_has_an_exit_code():
@@ -404,3 +405,16 @@ def test_our_own_precondition_is_not_reported_as_a_broken_daemon(tmp_path, monke
 
     assert module.main([str(script)]) == EXIT_USAGE
     assert "cannot reach Docker" not in capsys.readouterr().err
+
+
+def test_a_rejected_request_is_our_bug_and_not_a_dead_provider():
+    """400 is the provider answering and refusing what we sent, so reporting it as
+    "the model could not be reached" was a false sentence in our own output, and exit 3
+    told a caller to retry something retrying cannot fix. It is the same event as docker
+    exit 125 one layer up, which ADR-008 already calls our own code being broken."""
+    rejected = Outcome(ok=False, kind="rejected",
+                       reason="the provider rejected our request")
+    gone = Outcome(ok=False, kind="unavailable", reason="401")
+    assert exit_code_for(rejected) == EXIT_BAD_REQUEST
+    assert exit_code_for(gone) == EXIT_UNAVAILABLE
+    assert EXIT_BAD_REQUEST != EXIT_UNAVAILABLE

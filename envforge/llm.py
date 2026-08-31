@@ -212,9 +212,16 @@ def reachable(send):
                 raise ProviderUnavailable(f"could not reach the provider: {exc}",
                                           kind="network") from exc
             raise
-        # 400 and 408 were the last two escaping. A 400 is what both providers return
-        # for a prompt over the context window, which this tool can produce by feeding a
-        # long log into a repair, so it is reachable rather than theoretical.
+        # 400 is the provider rejecting the request we sent, which is not the provider
+        # being unavailable and must not be reported as one: the model was reached and
+        # answered. It is the same event as docker exit 125 one layer up, and ADR-008
+        # already settled what that means, which is that our own code is broken.
+        #
+        # Two causes share the status. A prompt over the context window, which this tool
+        # can produce by feeding a long log into a repair, and a malformed request, which
+        # is a bug in us. Neither is fixed by retrying and neither is the provider's
+        # fault, so they share an ending; the message carries which one the provider
+        # said it was, since that is the only thing that separates them.
         kind = {400: "rejected", 401: "auth", 408: "network",
                 429: "rate_limit"}.get(status)
         if status == 403:

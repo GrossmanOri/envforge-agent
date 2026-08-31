@@ -22,7 +22,7 @@ it cost; nothing yet decides what that behaviour means. The model also has no to
 reads the script once and writes a Dockerfile, which makes this a workflow with a feedback
 loop rather than an agent.
 
-290 tests, 277 of which need neither Docker nor an API key. Both suites run on every push
+292 tests, 279 of which need neither Docker nor an API key. Both suites run on every push
 and every pull request.
 
 ## The default provider, decided 2026-08-22

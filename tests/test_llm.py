@@ -17,7 +17,7 @@ import pytest
 from envforge.llm import (
     GROQ_BASE_URL, MAX_TOKENS, AnthropicLLM, Call, InvalidArguments, LLMError,
     MissingKey, OpenAICompatLLM, ProviderUnavailable, Refused, Tool, Truncated,
-    make_llm, validate,
+    make_llm, reachable, validate,
 )
 
 SCHEMA = {
@@ -389,3 +389,17 @@ def test_the_auth_backstop_does_not_swallow_our_own_mistakes():
 
     with pytest.raises(MissingKey):
         reachable(sdk_says)
+
+
+def test_a_400_says_the_provider_refused_us_not_that_it_was_unreachable():
+    """The model was reached and answered. Two causes share the status, a prompt over
+    the context window and a malformed request, and neither is the provider being down
+    nor fixed by retrying."""
+    import httpx2 as httpx
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    response = httpx.Response(400, request=request,
+                              json={"error": {"type": "invalid_request_error", "message": "too long"}})
+    exc = anthropic.BadRequestError("too long", response=response, body=None)
+    with pytest.raises(ProviderUnavailable) as caught:
+        reachable(lambda: (_ for _ in ()).throw(exc))
+    assert caught.value.kind == "rejected"       # not "unavailable"

@@ -184,7 +184,7 @@ Write the complete corrected Dockerfile."""
 # a caller switches on this, so an unlisted value is a caller reading a case it has never
 # handled.
 Kind = Literal["ran", "script_failed", "no_image", "failed", "build_timeout",
-               "budget", "unavailable", "unsupported"]
+               "budget", "unavailable", "rejected", "unsupported"]
 
 
 @dataclass(frozen=True)
@@ -405,10 +405,21 @@ class Agent:
                     # verdict on a run the model never saw. Ends the run, saying which
                     # kind, because a dead key and an empty account need different
                     # actions from whoever is reading.
-                    reason = f"the model could not be reached ({exc.kind}): {exc}"
+                    # A rejected request is not an unreachable provider, and saying so
+                    # was a false sentence in our own output: the model was reached and
+                    # it answered. The distinction matters to whoever reads the exit
+                    # code, because one of these is worth retrying and the other is a
+                    # bug in us.
+                    if exc.kind == "rejected":
+                        reason = (f"the provider rejected our request, which is our bug "
+                                  f"rather than theirs: {exc}")
+                    else:
+                        reason = f"the model could not be reached ({exc.kind}): {exc}"
                     yield Event("provider_unavailable", reason, {"kind": exc.kind})
                     yield Event("finished", reason, {"outcome": Outcome(
-                        ok=False, kind="unavailable", reason=reason, attempts=attempt,
+                        ok=False,
+                        kind="rejected" if exc.kind == "rejected" else "unavailable",
+                        reason=reason, attempts=attempt,
                         usage=usage(), refusals=refusals, run_id=run_id)})
                     return
                 except (InvalidArguments, Truncated, LLMError) as exc:

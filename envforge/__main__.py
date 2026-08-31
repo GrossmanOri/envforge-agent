@@ -43,6 +43,8 @@ EXIT_UNAVAILABLE = 3
 EXIT_BUDGET = 4
 EXIT_NO_DOCKER = 5
 EXIT_NO_IMAGE = 6
+# Our own request was refused. Not the provider being down, so retrying is wrong.
+EXIT_BAD_REQUEST = 7
 
 
 # The only variables a `.env` may set. An allowlist, like the gate, and for the same
@@ -237,6 +239,7 @@ HEADLINE_FOR_KIND = {
     "failed": "FAILED",
     "budget": "STOPPED",
     "unavailable": "STOPPED",
+    "rejected": "OUR BUG",
     "unsupported": "REFUSED",
 }
 
@@ -252,6 +255,7 @@ EXIT_FOR_KIND = {
     "unsupported": EXIT_USAGE,
     "budget": EXIT_BUDGET,
     "unavailable": EXIT_UNAVAILABLE,
+    "rejected": EXIT_BAD_REQUEST,
 }
 
 

@@ -59,12 +59,13 @@ there is.
 **The command line**, `envforge/__main__.py`. `python -m envforge script.py` takes a script
 and prints what it did, and `python -m envforge --check` verifies the API key without
 spending a call. The exit code separates what a caller must not confuse. `0` is a clean run and `1` is
-the script running and exiting nonzero, which is a finding about the sample. `3`, `4`, `5`
-and `6` are this tool being unable to do its job: no credentials or the model unreachable,
-the token budget spent, Docker unavailable, or no Dockerfile that would build. Those say nothing about the
+the script running and exiting nonzero, which is a finding about the sample. `3` through `7` are this
+tool being unable to do its job: no credentials or the model unreachable, the token budget
+spent, Docker unavailable, no Dockerfile that would build, or the provider refusing the
+request we sent, which is our bug rather than theirs. Those say nothing about the
 script and a caller should fix its setup rather than read a verdict into them.
 
-290 tests, 277 of which need neither Docker nor an API key. Both suites run on every push
+292 tests, 279 of which need neither Docker nor an API key. Both suites run on every push
 and every pull request.
 
 ## What is designed and not built
