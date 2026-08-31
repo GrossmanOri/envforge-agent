@@ -179,6 +179,42 @@ def _connection_errors() -> tuple[type[BaseException], ...]:
     return tuple(found) or (OSError,)
 
 
+def kind_for_status(status: int, reported: str = "") -> str:
+    """What an HTTP status from a provider means to us.
+
+    Its own function because there were two copies. `reachable` widened `rejected` to
+    every 4xx while the `--check` command stayed on 400 alone, so the same 422 was "our
+    bug, do not retry" from a run and "provider unavailable, retry" from `--check`. Two
+    entry points disagreeing about one event is what this exists to prevent.
+
+    `reported` is the provider's own error type, needed only where a status is genuinely
+    ambiguous: 403 is both an exhausted account and a key without model access.
+    """
+    if status == 402:
+        # Payment Required is an empty account, which is the same event as a 403 billing
+        # error and needs the same action. A blanket 4xx rule had it reported as our own
+        # malformed request, telling someone out of credit not to retry and that the bug
+        # was theirs.
+        return "billing"
+    if status == 403:
+        return "billing" if "billing" in reported else "permission"
+    if status == 404:
+        return "no_such_model"
+    if status in (401,):
+        return "auth"
+    if status in (408,):
+        return "network"
+    if status == 429:
+        return "rate_limit"
+    if status >= 500:
+        return "server"
+    if 400 <= status < 500:
+        # Anything else the provider refuses. Enumerating statuses always misses the
+        # next one, so unmapped 4xx falls to a side rather than to the floor.
+        return "rejected"
+    return "unavailable"
+
+
 def reachable(send):
     """Call the provider, and turn "we could not reach it" into one typed failure.
 
@@ -222,27 +258,7 @@ def reachable(send):
         # is a bug in us. Neither is fixed by retrying and neither is the provider's
         # fault, so they share an ending; the message carries which one the provider
         # said it was, since that is the only thing that separates them.
-        kind = {400: "rejected", 401: "auth", 408: "network",
-                429: "rate_limit"}.get(status)
-        if status == 403:
-            reported = getattr(exc, "type", "") or ""
-            kind = "billing" if "billing" in reported else "permission"
-        elif status == 404:
-            # A model name that does not exist, which is almost always a typo in the
-            # spec. Not repairable by asking again, so it ends the run rather than
-            # spending three attempts on it.
-            kind = "no_such_model"
-        elif status >= 500:
-            # 500, 503, and Anthropic's 529 overloaded. The provider is up enough to
-            # answer and not enough to serve, which is theirs to fix and ours to report.
-            kind = "server"
-        if kind is None:
-            # Nothing unmapped may escape. 402, 409, 413 and 422 were all leaving the
-            # generator as tracebacks, which is the same failure this wrapper exists to
-            # prevent, and enumerating statuses will always miss the next one. A 4xx is
-            # the provider refusing what we sent, which is ours to fix; anything else is
-            # the provider not serving us.
-            kind = "rejected" if 400 <= status < 500 else "unavailable"
+        kind = kind_for_status(status, getattr(exc, "type", "") or "")
         raise ProviderUnavailable(f"{kind}: {exc}", kind=kind) from exc
 
 

@@ -494,11 +494,74 @@ def test_every_status_the_provider_can_return_is_typed():
     import anthropic, httpx2 as httpx
     from envforge.llm import ProviderUnavailable, reachable
     request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
-    for status in (400, 402, 409, 413, 422, 451, 500, 502, 529):
+    expectations = {400: "rejected", 402: "billing", 409: "rejected", 413: "rejected",
+                    422: "rejected", 451: "rejected", 500: "server", 502: "server",
+                    529: "server"}
+    for status in expectations:
         response = httpx.Response(status, request=request,
                                   json={"error": {"type": "x", "message": "m"}})
         exc = anthropic.APIStatusError("e", response=response, body=None)
         with pytest.raises(ProviderUnavailable) as caught:
             reachable(lambda: (_ for _ in ()).throw(exc))
-        expected = "rejected" if 400 <= status < 500 else "server"
-        assert caught.value.kind in (expected, "unavailable"), status
+        # `in (expected, "unavailable")` accepted every answer, so this test could not
+        # fail and the mutation it was written to kill survived: flattening the mapping
+        # to "unavailable" left the whole suite green. An assertion with an escape hatch
+        # is not an assertion.
+        assert caught.value.kind == expectations[status], status
+
+
+def test_check_and_a_run_agree_about_every_status():
+    """Two entry points carried two copies of the status mapping. `reachable` widened
+    `rejected` to every 4xx and `check_key` stayed on 400 alone, so a 422 was "our bug,
+    do not retry" from a run and "provider unavailable, retry" from `--check`, for one
+    event. They call the same function now, and this asserts they agree rather than
+    trusting that they do."""
+    from envforge.llm import kind_for_status
+    for status in (400, 401, 402, 403, 404, 408, 409, 413, 422, 429, 451, 500, 529):
+        kind = kind_for_status(status, "")
+        from_run = EXIT_FOR_KIND["rejected" if kind == "rejected" else "unavailable"]
+        from_check = EXIT_BAD_REQUEST if kind == "rejected" else EXIT_UNAVAILABLE
+        assert from_run == from_check, status
+
+
+def test_an_empty_account_is_billing_and_not_our_bug():
+    """402 is Payment Required, which is an exhausted account and the same event as a
+    403 billing error. A blanket 4xx rule reported it as our own malformed request,
+    telling someone out of credit not to retry and that the fault was ours."""
+    from envforge.llm import kind_for_status
+    assert kind_for_status(402) == "billing"
+    assert kind_for_status(403, "billing_error") == "billing"
+    assert EXIT_FOR_KIND["unavailable"] == EXIT_UNAVAILABLE
+
+
+def test_every_headline_and_exit_value_is_asserted_not_only_the_keys():
+    """Set equality checks keys. Mutating `budget` from STOPPED to FAILED survived, and
+    so did `unavailable` to `ok`, which would print `ok` above exit 3. Mutating
+    `build_timeout`'s exit code to 0 survived too, while the ADR sentence added in the
+    same commit says it deliberately shares 6."""
+    assert HEADLINE_FOR_KIND == {
+        "ran": "ok", "script_failed": "the script FAILED", "no_image": "FAILED",
+        "failed": "FAILED", "build_timeout": "TIMED OUT", "budget": "STOPPED",
+        "unavailable": "STOPPED", "rejected": "OUR BUG", "unsupported": "REFUSED",
+    }
+    assert EXIT_FOR_KIND == {
+        "ran": EXIT_OK, "script_failed": EXIT_RUN_FAILED, "no_image": EXIT_NO_IMAGE,
+        "failed": EXIT_NO_IMAGE, "build_timeout": EXIT_NO_IMAGE,
+        "unsupported": EXIT_USAGE, "budget": EXIT_BUDGET,
+        "unavailable": EXIT_UNAVAILABLE, "rejected": EXIT_BAD_REQUEST,
+    }
+
+
+def test_an_unreadable_script_is_not_a_traceback(tmp_path, capsys):
+    """`gather` raises `PermissionError`, an `OSError`, which `main` did not guard: raw
+    traceback, path unescaped, and exit 1, which means the script ran and failed. The
+    same shape as the credential crash, and there was no top-level backstop."""
+    import os
+    script = tmp_path / "s.py"
+    script.write_text("print(1)\n")
+    os.chmod(script, 0o000)
+    try:
+        assert main([str(script)]) == EXIT_USAGE
+        assert "Traceback" not in capsys.readouterr().err
+    finally:
+        os.chmod(script, 0o644)

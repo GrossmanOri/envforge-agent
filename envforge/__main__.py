@@ -26,7 +26,7 @@ from .budget import DEFAULT as DEFAULT_BUDGET
 from .budget import Budget
 from .events import Event, Provenance
 from .gate import check
-from .llm import MissingKey, ProviderUnavailable, make_llm
+from .llm import MissingKey, ProviderUnavailable, kind_for_status, make_llm
 from .sandbox import DockerSandbox, SandboxError, daemon_error
 from .workspace import WorkspaceError, gather
 
@@ -125,7 +125,7 @@ def check_key(spec: str) -> int:
 
     client = getattr(llm, "_client", None)
     if client is None or not hasattr(client, "models"):
-        print(f"{spec}: key present. This provider has no cheap way to verify it "
+        print(f"{printable(spec)}: key present. This provider has no cheap way to verify it "
               f"without spending a call, so it was not checked further.")
         return EXIT_OK
     try:
@@ -137,12 +137,18 @@ def check_key(spec: str) -> int:
         reported = getattr(exc, "type", "") or type(exc).__name__
         print(f"{printable(spec)}: FAILED ({printable(str(status))} "
               f"{printable(str(reported))}) {printable(str(exc))}", file=sys.stderr)
-        # The same rejection must not be exit 3 here and exit 7 in a run.
-        return EXIT_BAD_REQUEST if status == 400 else EXIT_UNAVAILABLE
+        # The same rule a run uses, called rather than copied. This carried its own
+        # mapping and stayed on 400 alone while `reachable` widened to every 4xx, so a
+        # 422 was "our bug, do not retry" from a run and "provider unavailable, retry"
+        # from here, for one event. Two entry points disagreeing is the thing to avoid.
+        if not isinstance(status, int):
+            return EXIT_UNAVAILABLE
+        kind = kind_for_status(status, str(reported))
+        return EXIT_BAD_REQUEST if kind == "rejected" else EXIT_UNAVAILABLE
 
     wanted = spec.partition(":")[2]
     names = [getattr(m, "id", "") for m in models]
-    print(f"{spec}: key works, {len(names)} model(s) visible.")
+    print(f"{printable(spec)}: key works, {len(names)} model(s) visible.")
     if names and wanted not in names:
         # Not fatal. The listing is paginated and a model missing from it may still
         # answer, so this is a warning rather than a refusal to proceed.
@@ -351,7 +357,11 @@ def main(argv: Sequence[str] | None = None, environ=None) -> int:
 
     try:
         workspace = gather(args.script, LANGUAGES[language].siblings)
-    except WorkspaceError as exc:
+    except (WorkspaceError, OSError) as exc:
+        # `OSError` as well as our own type. `gather` raises `PermissionError` on a
+        # script it cannot read, which is an OSError and was not guarded, so the run
+        # died with a raw traceback carrying an unescaped path and exit 1, meaning the
+        # script ran and failed. The same shape as the credential crash one commit ago.
         print(f"cannot read {printable(str(args.script))}: {printable(str(exc))}",
               file=sys.stderr)
         return EXIT_USAGE

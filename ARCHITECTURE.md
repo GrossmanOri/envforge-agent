@@ -285,8 +285,11 @@ refusing the request we sent. A caller that collapsed them would treat a dead ke
 verdict about the code it was given.
 
 `7` is ours rather than theirs, and it is the same event ADR-008 settled one layer down: a
-400 is the API rejecting our request exactly as docker exit 125 is the CLI rejecting our
-command. A malformed request to the provider and a malformed docker command share it.
+4xx is the API rejecting our request exactly as docker exit 125 is the CLI rejecting our
+command. A malformed request to the provider and a malformed docker command share it. The
+statuses a provider gives its own meaning to are read out first, so 401, 403, 404, 408, 429
+and 402 keep theirs; everything else in the 4xx range falls here, because enumerating
+statuses always misses the next one.
 `build_timeout` deliberately shares `6` with the other ways a run ends without a working
 image, because a caller's action is the same in all of them, which is to look at the build
 rather than to retry.

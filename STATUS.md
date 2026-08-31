@@ -22,7 +22,8 @@ it cost; nothing yet decides what that behaviour means. The model also has no to
 reads the script once and writes a Dockerfile, which makes this a workflow with a feedback
 loop rather than an agent.
 
-296 tests, 283 of which need neither Docker nor an API key. Both suites run on every push
+300 tests, 287 of which need neither Docker nor an API key. The rest skip
+automatically when no daemon is present. Both suites run on every push
 and every pull request.
 
 ## The default provider, decided 2026-08-22
@@ -281,6 +282,48 @@ succeeded. That is a good idea and it is a behaviour change, so it went to LATER
 than into a branch already blocked five times.
 
 296 tests pass.
+
+## The sixth review, and a test that could not fail, 2026-08-31
+Scoped to the previous commit alone. Two blockers, and the first is the worst thing in this
+whole branch.
+
+**I wrote an assertion with an escape hatch.** The new status test read
+`assert kind in (expected, "unavailable")`, and since `"unavailable"` was always accepted
+the assertion held for every possible answer. The test could not fail. The review proved it
+by flattening the mapping to `"unavailable"` and watching the suite stay green, which meant
+a 402 or a 422 would print "the model could not be reached", the exact false sentence the
+commit before it existed to remove, and CI would not have noticed.
+
+Tightened to `== expected`, and then mutated again by hand to confirm it now goes red. That
+second step is the one worth keeping as a habit: a test written to kill a mutation should be
+run against that mutation before it is believed.
+
+**Two entry points carried two copies of one rule.** `reachable` widened `rejected` to
+every 4xx while `--check` stayed on 400 alone, so a 422 was "our bug, do not retry" from a
+run and "provider unavailable, retry" from `--check`, for one event. The record already
+claimed they had been made to agree, which was true only for 400. The mapping is now one
+named function that both call, and a test asserts they agree across thirteen statuses.
+
+**A blanket rule got a real case wrong.** 402 is Payment Required, which is an exhausted
+account and the same event as a 403 billing error. Sweeping every 4xx into `rejected` told
+someone out of credit that the fault was ours and not to retry. Statuses a provider gives
+its own meaning to are read first now, and only the rest fall through.
+
+**A traceback was still reachable.** An unreadable script raises `PermissionError` out of
+the workspace, which is an `OSError` and was not guarded, so the run died with a raw
+traceback carrying an unescaped path and exit 1, meaning the script ran and failed. The same
+shape as the credential crash, one commit later.
+
+**And a documented command did not work.** README and CLAUDE.md both call `python -m pytest`
+the suite that needs no daemon, and without Docker thirteen tests errored rather than
+skipping. A `conftest.py` skips them when no daemon answers, so the sentence is true rather
+than reworded. CI still runs them explicitly against a real daemon.
+
+Also asserted: every headline and every exit value, not only the keys. Mutating `budget`
+from STOPPED to FAILED had survived, and so had `unavailable` to `ok`, which would have
+printed `ok` above exit 3.
+
+300 tests pass, 287 without a daemon.
 
 ## Keys come from a .env, reversed 2026-08-30
 The original decision said the key was read from the environment and never from a file.
