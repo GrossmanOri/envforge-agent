@@ -17,23 +17,320 @@ deterministic gate every Dockerfile passes before a build, the repair loop, the 
 that is the only code here handling a path, the closed event vocabulary with its provenance
 labels, and the token budget.
 
-Not built: the verdict, the trace, and the command line entry point. There is no
-`__main__.py`, so **this cannot yet be run from a shell**, and nothing decides what a run
-means. The model also has no tools: it reads the script once and writes a Dockerfile, which
-makes this a workflow with a feedback loop rather than an agent.
+Not built: the verdict and the trace. The command line reports what a script did and what
+it cost; nothing yet decides what that behaviour means. The model also has no tools: it
+reads the script once and writes a Dockerfile, which makes this a workflow with a feedback
+loop rather than an agent.
 
-240 tests, 227 of which need neither Docker nor an API key. Both suites run on every push
+301 tests, 288 of which need neither Docker nor an API key. The rest skip
+automatically when no daemon is present. Both suites run on every push
 and every pull request.
 
-## The default provider, decided 2026-08-22 and not yet built
+## The default provider, decided 2026-08-22
 `anthropic:claude-sonnet-5`. The native SDK with strict tool use, which is the only path
 that grammar-constrains Claude's arguments, and cheap enough that the capped repair loop can
 spend its attempts without cost being the reason a run stops.
 
-Stated as a decision rather than as behaviour, because `make_llm(spec)` requires a spec and
-there is no default anywhere in the code. Nothing chooses a provider today, since nothing
-starts a run without being handed one. The default lands with the command line entry point,
-which is the first caller that will have to pick one.
+This was a decision with nothing implementing it until 30 August: `make_llm(spec)` requires
+a spec, and nothing chose one because nothing started a run without being handed one. The
+command line was the first caller that had to pick, and it is where the default now lives,
+as `DEFAULT_SPEC` in `envforge/__main__.py`.
+
+## It runs, 2026-08-30
+`envforge/__main__.py`. The first caller this project has had. Everything under it was
+driven by tests until now, and the first real run is the only reason the two things below
+were found rather than deferred again.
+
+The run, verbatim, against a script importing `requests` and reaching for the network:
+
+    asking               attempt 1: asking for a Dockerfile
+    wrote                got 142 characters
+    building             building envforge-c32a02687da...:attempt1
+    running              running envforge-c32a02687da...:attempt1
+    finished             the script ran and exited 0
+
+    --- the Dockerfile that was built ---
+    FROM python:3.11-slim
+    COPY hello.py /app/hello.py
+    RUN ["pip", "install", "--no-cache-dir", "requests"]
+    ENTRYPOINT ["python", "/app/hello.py"]
+
+    --- what the script did (exit 0) ---
+    [stdout, written by the container, not by us]
+      | resolving example.com ...
+      | network refused, as expected: ConnectionError
+      | done
+
+One model call, 1692 tokens. The build had network, since pip needed it, and the run did
+not, which is the line the whole design rests on and which had never been demonstrated
+outside a test before.
+
+**Two failures a command line cannot ship with.** Both are the same mistake in different
+places: a run that cannot say honestly that it failed.
+
+A spent budget fell back to the Dockerfile we write ourselves, copying the shape of a
+second refusal. A refusal is the model judging the script, which is information about the
+script. A spent budget is information about us. Building on it printed a verdict no
+judgment went into and called it a success. It now ends the run, which is also what makes a
+generous ceiling safe: hitting it means something went wrong rather than that an allowance
+ran out.
+
+A provider failure was not caught at all. A dead key, an empty account and a rate limit are
+none of the three `LLMError` types the loop handles, so each escaped the generator: no
+outcome, no `finished` event, and whatever had been spent unrecorded. They are now one
+`ProviderUnavailable`, deliberately not an `LLMError` so it cannot reach the repair path.
+If it ever did, we would build our own Dockerfile, run it, and print an ordinary-looking
+verdict on a run the model never saw.
+
+**The first report hid the product.** It printed the exit code and stopped, so the actual
+output of the script, which is the only thing this tool exists to show, was not there. Found
+by running it, not by reading it. The report now ends with what the container wrote,
+labelled as the container's words rather than ours.
+
+**Where the leak test was too narrow.** It scanned Markdown only, and eleven pieces of
+internal vocabulary were still in the Python files, including one in a docstring here.
+It now scans `envforge/*.py` and `tests/*.py` too. One match was a genuine English use of
+the word, reworded rather than exempted, because an exemption list is where a strict check
+starts leaking.
+
+268 tests pass, 13 of them against the real daemon.
+
+## What the review found in the command line, 2026-08-30
+Blocked on first pass. Seven findings, two of them holes this change opened. Every one was
+demonstrated by running something, not by reading the diff, which is the whole reason the
+step exists.
+
+**A sample could redirect our API traffic.** `load_env` read `./.env`. This tool analyses
+samples nobody trusts, and running it from the sample's own directory is the natural
+workflow, so a `.env` shipped beside a sample was loaded into the process and obeyed.
+Setting `ANTHROPIC_BASE_URL` pointed the client at another host, which sends the key there
+and lets the sample choose the Dockerfile the gate is handed. Reproduced before the fix:
+the variable went from unset to `https://evil.example/v1/`.
+
+Fixed with two rules rather than one. The path is fixed to the project's own directory and
+never the working directory, and the names are an allowlist, because "the file is ours" is
+a weaker guarantee than it sounds once a file is copied between machines and pasted from
+instructions.
+
+**A filename could steer the exit code.** `exit_code_for` matched substrings of the
+outcome's `reason`, and `reason` splices in the gate's quoted line, which contains the
+script's filename. A script named `x could not be reached.py` produced exit 3, telling a
+caller to retry a provider that had answered perfectly well. `Outcome` now carries a typed
+`kind` set where the outcome is built, and the exit code switches on that. Prose the sample
+influences can no longer reach a machine-readable result.
+
+The same finding had a second half worth more than the first: nothing coupled the producer
+to the consumer, so rewording one sentence in the loop changed what the shell learned while
+every test still passed. There is now a test that drives the real loop to each terminal
+state and asserts the code a shell would actually get.
+
+**Four provider failures still escaped.** The typed wrapper matched connection errors on
+the class name, and `APITimeoutError` does not contain the word, though it subclasses the
+connection error in both SDKs. Timeouts, 500, 503, Anthropic's 529 and a 404 from a
+mistyped model name all escaped as tracebacks, each reproducing exactly the failure this
+change claimed to have fixed. Matching is now by inheritance, and 404 and 5xx have their
+own kinds.
+
+**Container output could repaint the terminal.** `report` printed what a sample wrote
+straight to the TTY, so a sample could clear the screen, set the window title and paint a
+convincing `ok` summary, erasing the label saying the output was not ours. Control
+characters are now escaped. The gate has refused non-printables for this exact reason since
+August; the report was the one attacker-controlled channel to a terminal without the rule.
+
+**Docker being absent or stopped was unhandled.** A stopped daemon looked like three failed
+builds, spent three paid repair calls on a Dockerfile that was already correct, and then
+reported the script as having run and failed. It now has its own exit code.
+
+**`--check` was broken for two of three providers.** It passed `limit` to `models.list()`,
+which the OpenAI SDK does not accept, so a working OpenAI or Groq key was reported as
+unusable and the bare `except` hid that it was our bug.
+
+**Two stale sentences and a stale table row**, all saying a spent budget falls back, and one
+claiming no command line exists. Retired in the same commit.
+
+The provenance value was wrong too: `provider_unavailable` was labelled `TOOL`, and the
+provider's error text is neither a tool result nor the model's words. `PROVIDER` was added
+rather than overloading `TOOL`, whose real user is about to be the tool loop.
+
+272 tests pass.
+
+## The second review, and the fix that was defeated by its own call site, 2026-08-30
+Blocked again. Two of the seven fixes from the first pass did not hold, and both were
+invisible in a diff: the suite was green while a failed run reported success and while a
+sample's configuration was still being read.
+
+**The `.env` fix never ran in production.** The function pinned the path to the project's
+own directory. `main` then called it as `load_env(Path.cwd())`, so the parameter won and
+the constant was never used. The test passed because it called the function rather than the
+program. The allowlist added at the same time did hold, so the redirect was blocked, but a
+sample could still choose which account paid for the run and remove the cost ceiling.
+
+The lesson is narrow and worth keeping: a fix inside a function proves nothing about the
+program until a test drives the entry point. The replacement test calls `main` from a
+hostile directory, which is the only version of the check that could ever have failed.
+
+**A failed run exited 0.** `Outcome.kind` was set on five terminal paths and missed on the
+sixth, the one that gives up after three attempts. Its default was `"ran"`, so the CLI
+printed FAILED and told the shell everything was fine. `Kind` is now a closed `Literal`
+with no default, which turns the same mistake into a `TypeError` at construction.
+
+The same finding had a second half. The success path set `"ran"` whatever the container did,
+so a script exiting nonzero also reported 0 and the documented meaning of exit 1 was
+unreachable. Three records described a behaviour the code could not produce.
+
+**Five smaller ones.** 400 and 408 still escaped the provider wrapper, and a 400 is what
+both providers return for a prompt over the context window, which this tool can produce.
+`printable` kept newlines, so a single string reaching the summary could paint whole forged
+lines with no control character in it, and it let bidirectional overrides through, which
+reverse a line's reading order without one either. A stopped daemon still cost three paid
+repair calls before reporting the script as having run. A `docker version` probe before the
+loop covers the daemon being down at the start; a third review showed the probe alone was
+not enough, since a daemon that stops mid-run makes every build fail with exit 1, which the
+loop reads as a repairable Dockerfile problem. The probe is now repeated on the first build
+failure, before a repair is paid for. `evidence = str(exc)` was the one evidence path with no bound, and a
+provider message carrying model-chosen text put 200,000 characters into the next prompt.
+And 108 images had accumulated. Cleanup went into the CLI's `finally`, which a third
+review showed covered only the CLI: the Docker test suite still leaked one image per run,
+because the seam existed and the tests using that seam did not. Both clean up now.
+
+One correction to the review: it estimated the images at 21GB. Layers are shared, so
+`docker system df` reports 540MB. The clutter was real and the number was not.
+
+276 tests pass.
+
+## The fourth review, and a regression the fix itself introduced, 2026-08-30
+Blocked again, and the blocking finding was a regression created by the previous round's
+fix. Worth recording in full, because the failure is not the bug but the way it survived.
+
+**The credential check locked out a working credential.** The Anthropic SDK resolves
+credentials from three slots and the check read two, so anyone authenticated through a
+profile rather than an environment variable was told their key was not set. A crash was
+traded for a lockout.
+
+The test enshrined it. It deleted two environment variables, which cannot reveal a third
+slot, so on a machine authenticated by profile it passed *because* the code was wrong. The
+review also found the suite was host-dependent: with a profile variable exported, one test
+failed. A test that depends on the host cannot tell you which of the two things it proved.
+
+The same commit left a second traceback. The SDK's constructor raises when a named profile
+is missing or corrupt, which was uncaught, so the traceback that round three removed had
+simply moved one line earlier.
+
+**Two tests were fake, and only mutation showed it.** The review changed the code and
+checked whether the suite noticed. It did not, twice. The headline table was asserted by
+grepping the function's source, so deleting an entry while leaving the word in a nearby
+comment passed everything while a spent budget silently degraded from STOPPED to FAILED.
+And the rule that the daemon is re-probed on every build failure, not only the first, was
+prose: making it fire once left 271 tests green.
+
+Both are now set equality against a module constant, and a test that puts the daemon's
+death on the second build, where a first-only probe cannot see it.
+
+**Found by running it afterwards, not by any review.** A cold base image took longer to
+pull than the build timeout. The loop called that a broken Dockerfile, so it paid for a
+second call in which the model rewrote the identical 142 characters, and the build then
+worked because the pull had cached. `BuildResult` has carried `timed_out` all along and
+the loop ignored it. The model cannot see a clock, so asking it again is asking the wrong
+question at full price, and this is precisely what `agent.py`'s opening rule forbids. A
+build timeout is now its own ending and costs one call.
+
+Four stale record sentences went with it, one of them created by this branch: the
+vocabulary grew from twelve kinds to thirteen, and a paragraph reading "a fifth provenance
+was considered and refused" sat directly above the commit that added a fifth.
+
+290 tests pass.
+
+## The fifth review, scoped to the fixes nothing had checked, 2026-08-31
+The three most recent commits had never been read by anything but their author, so a review
+was run against that range alone and told not to accept it on the strength of the earlier
+rounds. It blocked, on the third instance of one pattern.
+
+**A fix that moved the traceback instead of removing it.** `MissingKey` is a subclass of
+`ProviderUnavailable`, and both command line entry points caught only the subclass, so the
+parent, which the SDK constructor raises for a missing or malformed credential profile,
+escaped as a traceback and exit 1. Exit 1 is defined here as the script running and
+failing, so a setup mistake reported itself as a finding about the sample, and the
+traceback bypassed the escaping, putting an environment-derived path on the terminal raw.
+
+The test that was supposed to cover this asserted `AnthropicLLM` raises the right type. Its
+name claimed a property of the command, and nothing checked the command. That is the same
+shape as the fake tests the previous round found, and it is the third round in a row where
+a fix was correct in the library and absent from the program. The new test drives `main`.
+
+**A mutation survived, and it was the whole content of the previous commit.** Flattening
+the agent's kind to `unavailable` left every test green, because one test proved the
+provider layer produces `rejected` and another built the outcome by hand. Nothing joined
+them. The path worked, so this was a coverage hole rather than a live bug, but it is the
+hole shape that blocked round four.
+
+**Unmapped statuses were still escaping.** 402, 409, 413 and 422 re-raised out of the
+generator with no outcome and unrecorded spend, which is the failure the wrapper exists to
+prevent. Enumerating statuses always misses the next one, so anything unmapped now falls to
+a side rather than to the floor: a 4xx is the provider refusing what we sent, anything else
+is the provider not serving us.
+
+Also from the same review, and accepted: a malformed docker command is our bug rather than
+the caller's, so `SandboxError` moves from exit 2 to exit 7, which is what 7 was created to
+mean; and `--check` was reporting a rejection as exit 3 while a run reported it as 7.
+
+**Two of its arguments were declined, with reasons.** It suggested separating a
+context-window 400 from a malformed-request 400. Both providers return the same error type,
+so the split would need the provider's prose, which is exactly the substring matching
+invariant 22 bans. It also suggested one free rebuild on a build timeout, since buildkit
+keeps the pulled layers and the incident that motivated the ending would then have
+succeeded. That is a good idea and it is a behaviour change, so it went to LATER rather
+than into a branch already blocked five times.
+
+296 tests pass.
+
+## The sixth review, and a test that could not fail, 2026-08-31
+Scoped to the previous commit alone. Two blockers, and the first is the worst thing in this
+whole branch.
+
+**I wrote an assertion with an escape hatch.** The new status test read
+`assert kind in (expected, "unavailable")`, and since `"unavailable"` was always accepted
+the assertion held for every possible answer. The test could not fail. The review proved it
+by flattening the mapping to `"unavailable"` and watching the suite stay green, which meant
+a 402 or a 422 would print "the model could not be reached", the exact false sentence the
+commit before it existed to remove, and CI would not have noticed.
+
+Tightened to `== expected`, and then mutated again by hand to confirm it now goes red. That
+second step is the one worth keeping as a habit: a test written to kill a mutation should be
+run against that mutation before it is believed.
+
+**Two entry points carried two copies of one rule.** `reachable` widened `rejected` to
+every 4xx while `--check` stayed on 400 alone, so a 422 was "our bug, do not retry" from a
+run and "provider unavailable, retry" from `--check`, for one event. The record already
+claimed they had been made to agree, which was true only for 400. The mapping is now one
+named function that both call.
+
+The test written for that was worthless and a seventh review proved it. It computed both
+sides from the same value, so it asserted that two constants matched, thirteen times, and
+it survived putting the exact bug back. The replacement drives `check_key` and `main` for
+real and compares what each returns, and it was run against that mutation before being
+believed. That last step is the difference between a test and a hope, and skipping it is
+how the previous two rounds shipped assertions that could not fail.
+
+**A blanket rule got a real case wrong.** 402 is Payment Required, which is an exhausted
+account and the same event as a 403 billing error. Sweeping every 4xx into `rejected` told
+someone out of credit that the fault was ours and not to retry. Statuses a provider gives
+its own meaning to are read first now, and only the rest fall through.
+
+**A traceback was still reachable.** An unreadable script raises `PermissionError` out of
+the workspace, which is an `OSError` and was not guarded, so the run died with a raw
+traceback carrying an unescaped path and exit 1, meaning the script ran and failed. The same
+shape as the credential crash, one commit later.
+
+**And a documented command did not work.** README and CLAUDE.md both call `python -m pytest`
+the suite that needs no daemon, and without Docker thirteen tests errored rather than
+skipping. A `conftest.py` skips them when no daemon answers, so the sentence is true rather
+than reworded. CI still runs them explicitly against a real daemon.
+
+Also asserted: every headline and every exit value, not only the keys. Mutating `budget`
+from STOPPED to FAILED had survived, and so had `unavailable` to `ok`, which would have
+printed `ok` above exit 3.
+
+300 tests pass, 287 without a daemon.
 
 ## Keys come from a .env, reversed 2026-08-30
 The original decision said the key was read from the environment and never from a file.
@@ -552,7 +849,7 @@ The same review asked for raw request and response bodies on failed provider rep
 needs the provider error types to retain wire data, so it is deferred explicitly to the trace module's design rather than half-built here.
 
 ## The event vocabulary
-`envforge/events.py`. The twelve kinds an engine may yield, and who wrote every string in
+`envforge/events.py`. The kinds an engine may yield, and who wrote every string in
 each one. `Event` checks both at construction, so an engine that invents `node_entered`
 fails there rather than putting a record in the trace that nobody can label.
 
@@ -562,7 +859,7 @@ us, the model, a container or the files the run was handed, and neither can the
 trace module. Only the code that emits the event knows, so a label added later is a guess
 dressed up as a record.
 
-Authors are a set per string, not one value per event. Three of the twelve made that
+Authors are a set per string, not one value per event. Three of them made that
 necessary rather than tidy. `gate_rejected` carries a Dockerfile that is the model's on
 every path but one, since after two refusals the file we wrote ourselves goes through the
 same gate and can be rejected there too. `gate_rejected` is our own sentence quoting the model's line
@@ -572,14 +869,19 @@ written by the model. One value on either would have been false, and picking the
 trusted" one means ranking a model against a container, which has no honest answer.
 
 The labels are declared per kind, so a kind's set is the union over every path that emits
-it. `finished` is labelled `INPUT` because one of its five paths names the language the
-caller asked for, though the other four do not. Coarse, and chosen: a table can be checked
+it. `finished` is labelled `INPUT` because one of its emission sites names the language the
+caller asked for, though the others do not. Coarse, and chosen: a table can be checked
 and a label chosen at each emission cannot, and the point of a seam is that a second engine
 has to honour it.
 
-A fifth provenance was considered and refused. Docker's own words on `exec_failed` are the
+A fifth provenance was considered and refused here. Docker's own words on `exec_failed` are the
 daemon quoting the model's ENTRYPOINT, so the untrusted author is the model and the daemon
 is not a separate one. `TOOL` exists and nothing emits it; the tool loop will.
+
+That held until the command line, which added `PROVIDER` for the provider's own error
+text. The reasoning above is why: the daemon quoting the model is not a separate author,
+and an SDK reporting its own failure is. Overloading `TOOL` for it would have made
+`authors()` lie to the tool loop that is about to become `TOOL`'s real user.
 
 The test that closes the loop reads `agent.py` with `ast` and asserts the kinds emitted
 there are exactly the kinds declared. Construction covers one direction, a kind emitted
@@ -609,9 +911,9 @@ turn it into a Dockerfile. Nothing calls `can_investigate` until the tool loop l
 because a tool loop written against a turn counter is a rewrite later rather than an
 argument, which is the test every one of the five shapes had to pass.
 
-A spent budget falls back to the Dockerfile we write ourselves, exactly like a second
-refusal. Paying for everything up to that point and producing no image is the one ending
-worth engineering against.
+A spent budget fell back to the Dockerfile we write ourselves, exactly like a second
+refusal. That changed on 30 August, below: it now ends the run, because a verdict no
+judgment went into should not be reported as a success.
 
 The estimate gates and the provider's numbers record. `estimate` errs high twice over, a
 characters-per-token rate below the real one and a reply assumed to run to the output

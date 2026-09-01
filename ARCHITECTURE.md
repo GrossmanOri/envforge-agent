@@ -66,6 +66,16 @@ same gate before any build.
 19. Every event an engine yields is one of a closed set, and every string it carries has
     its authors declared. An engine cannot invent a kind, and no record reaches a reader
     without saying whether we wrote it.
+20. A run that cannot reach the model, or that exhausts its token budget, ends with
+    `ok` false and never falls back to a Dockerfile we wrote. Neither is a finding about
+    the script, and a verdict no judgment went into must not be reported as a success.
+21. Configuration is never read from a directory the sample controls. The `.env` is read
+    from the package's own directory only, and only four variable names are accepted from
+    it, so a file shipped beside a sample can neither supply credentials nor redirect
+    where the model call goes.
+22. What the shell learns comes from a typed `Outcome.kind`, never from matching words in
+    a sentence. `reason` splices in filenames and provider text, so a sample could
+    otherwise choose the exit code.
 
 Invariants 4 and 5 are asserted against the argv that `sandbox.py` actually builds, so
 dropping a flag from the code fails a test rather than passing review.
@@ -170,7 +180,7 @@ They need error types that retain provider wire data, so the trace module owns
 that design rather than adding half a trace to the repair loop.
 
 ### ADR-014: the engine seam is a labelled vocabulary, not a topology
-Decided 2026-08-27. `envforge/events.py` holds the twelve kinds an engine may yield, and
+Decided 2026-08-27. `envforge/events.py` holds the thirteen kinds an engine may yield, and
 `Event` refuses anything else at construction. The plain loop and the LangGraph port both
 honour it, which a node-shaped interface could not be: a plain loop has no nodes.
 
@@ -181,7 +191,7 @@ against a container and there is no honest ranking there, while the question a r
 asks is answered by `authors() == {US}` or not.
 
 The labels are declared per kind and are the union over every path emitting it, so
-`finished` carries `INPUT` because one of its five paths names the language the caller
+`finished` carries `INPUT` because one of its seven emission sites names the language the caller
 asked for. Rejected: a label chosen at each emission, which is more precise and is not a
 contract, since nothing can check that an emitter filled it in honestly.
 
@@ -203,9 +213,9 @@ with the reserve held back and `can_write` asks it without; nothing calls the fi
 the tool loop lands, and it exists now because a loop written against a turn counter is a rewrite
 rather than an argument.
 
-A spent budget falls back to the Dockerfile we write ourselves, the same shape as a second
-refusal. Paying for everything up to that point and producing no image is the one outcome
-worth avoiding.
+A spent budget ended the run as of 2026-08-30, and this paragraph used to say the
+opposite: that it fell back to the Dockerfile we write ourselves, the same shape as a
+second refusal. Invariant 20 and ADR-017 hold the current rule and the argument for it.
 
 The estimate gates and the provider's numbers record. `estimate` errs high in both halves,
 a characters-per-token rate below the real one and a reply assumed to run to the output
@@ -234,16 +244,77 @@ a checked-in example is what someone cloning this expects, and every step betwee
 and a first run is a step where they stop. Rejected: the OS keychain, which is safer again
 and asks a new reader to learn a platform-specific command before anything works.
 
+Amended 2026-08-30 after a review: the file is read from the directory holding the package
+and never from the working directory, and only `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+`GROQ_API_KEY` and `ENVFORGE_TOKEN_BUDGET` are accepted from it. The first version read
+`./.env`, and since this tool is normally run from the directory holding the sample under
+analysis, that let a sample ship configuration the process obeyed. See invariant 21.
+
 What holds the line is that `.env` is in `.gitignore` and `.env.example` carries
 placeholders only, and both are asserted by a test rather than remembered. The failure this
 guards is not the file existing; it is the day a real key is pasted into the example and
 committed to a public repository, which no convention prevents and a test does.
 
+### ADR-017: the command line, and the two failures it forced
+Decided 2026-08-30. `envforge/__main__.py`. `python -m envforge script.py` runs one script
+end to end and `--check` verifies the key without spending a call. It is the first caller
+this project has had: everything under it was driven by tests until now.
+
+Two failures were fixed because a command line cannot ship with them, and both are the same
+mistake in different places. A run has to be able to say honestly that it failed.
+
+A spent budget used to fall back to the Dockerfile we write ourselves, copying the shape of
+a second refusal. The two do not mean the same thing. A refusal is the model judging the
+script, which is information about the script. A spent budget is information about us, and
+building on it prints a verdict no judgment went into. It now ends the run. That is also
+what allows the ceiling to be generous, since hitting it then means something went wrong
+rather than that an allowance ran out.
+
+A provider failure was not caught at all. `AuthenticationError`, `PermissionDeniedError`
+and `RateLimitError` are none of the three `LLMError` types the loop handles, so each one
+escaped the generator: no outcome, and whatever had been spent unrecorded. `llm.reachable`
+now turns them into one `ProviderUnavailable`, deliberately not an `LLMError` so it cannot
+reach the repair path. Matched on HTTP status rather than exception class, because the two
+SDKs share no hierarchy; 403 is read further, since an exhausted account and a key without
+model access are the same status and only the provider's error type separates them.
+
+The exit code carries the distinction to the shell. `1` is the script running and exiting
+nonzero, which is a result. `3` through `7` are this tool being unable to work: no provider
+or no credentials, no budget, no Docker, no Dockerfile that builds, and the provider
+refusing the request we sent. A caller that collapsed them would treat a dead key as a
+verdict about the code it was given.
+
+`7` is ours rather than theirs, and it is the same event ADR-008 settled one layer down: a
+4xx is the API rejecting our request exactly as docker exit 125 is the CLI rejecting our
+command. A malformed request to the provider and a malformed docker command share it. The
+statuses a provider gives its own meaning to are read out first, so 401, 403, 404, 408, 429
+and 402 keep theirs; everything else in the 4xx range falls here, because enumerating
+statuses always misses the next one.
+`build_timeout` deliberately shares `6` with the other ways a run ends without a working
+image, because a caller's action is the same in all of them, which is to look at the build
+rather than to retry.
+
+The code is chosen from a typed `Outcome.kind` and never from the words in `reason`. A
+first version matched substrings, and `reason` splices in the gate's quoted line, which
+carries the script's filename: a sample named "x could not be reached.py" produced the exit
+code meaning "retry, the provider was down". `Kind` has no default, because the version
+that had one reported a failed run as a success on the single path that forgot to set it.
+
+Configuration is the environment first, then the project's own `.env`, with
+`--token-budget` and `ENVFORGE_TOKEN_BUDGET` for the total only. The reserve stays internal:
+it is arithmetic about one worst-case producing call, not a number anyone should have to
+reason about.
+
+The `.env` is read from the directory holding the package and never from the working
+directory, and only four variable names are accepted from it. Both rules exist because this
+tool is normally run from the directory holding the sample it is analysing, so reading
+`./.env` let an untrusted sample supply configuration this process then obeyed.
+
 ## What crosses each boundary
 
 | from | to | payload |
 |---|---|---|
-| CLI | agent | script path, model spec, caps  *(no CLI exists yet)* |
+| CLI | agent | a `Workspace` of names and contents, a language, and script arguments |
 | agent | LLM | script text, language, bounded failure evidence |
 | LLM | gate | Dockerfile text, declared base image |
 | gate | sandbox | approved Dockerfile, or a rejection reason |

@@ -16,7 +16,8 @@ import pytest
 
 from envforge.llm import (
     GROQ_BASE_URL, MAX_TOKENS, AnthropicLLM, Call, InvalidArguments, LLMError,
-    OpenAICompatLLM, Refused, Tool, Truncated, make_llm, validate,
+    MissingKey, OpenAICompatLLM, ProviderUnavailable, Refused, Tool, Truncated,
+    make_llm, reachable, validate,
 )
 
 SCHEMA = {
@@ -275,8 +276,26 @@ def test_groq_will_not_borrow_the_openai_key(monkeypatch):
     openai default the key would send an OpenAI secret to Groq's servers."""
     monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
-    with pytest.raises(ValueError, match="GROQ_API_KEY"):
+    # `MissingKey` rather than `ValueError`: a missing key is not a malformed spec, and
+    # reporting it as one told the user to fix something they had typed correctly.
+    with pytest.raises(MissingKey) as caught:
         make_llm("groq:llama-3.3-70b-versatile")
+    assert caught.value.variable == "GROQ_API_KEY"
+
+
+def test_a_missing_key_is_a_provider_failure_and_not_a_usage_error(monkeypatch):
+    """Every provider, one behaviour. The Anthropic SDK is the interesting one: it does
+    not raise at construction at all, deferring auth to request time, where it raises
+    `TypeError`. That is not an `LLMError`, not a `ProviderUnavailable` and not an
+    `OSError`, so it escaped every handler in the program and crashed the run with a
+    traceback on the most common setup mistake there is."""
+    for variable in ("OPENAI_API_KEY", "GROQ_API_KEY"):
+        monkeypatch.delenv(variable, raising=False)
+    for spec in ("openai:gpt-5", "groq:llama"):
+        with pytest.raises(MissingKey):
+            make_llm(spec)
+    # And a MissingKey is a ProviderUnavailable, so the loop's handler already covers it.
+    assert issubclass(MissingKey, ProviderUnavailable)
 
 
 def test_make_llm_builds_each_provider(monkeypatch):
@@ -287,3 +306,100 @@ def test_make_llm_builds_each_provider(monkeypatch):
     assert isinstance(make_llm("openai:gpt-5"), OpenAICompatLLM)
     groq = make_llm("groq:llama-3.3-70b-versatile")
     assert groq.strict is False and str(groq._client.base_url).startswith(GROQ_BASE_URL)
+
+
+def test_anthropic_refuses_to_build_without_credentials(monkeypatch, tmp_path):
+    """Checked when the client is built, not by pattern-matching an error later.
+
+    This SDK resolves credentials from several places and raises nothing when it finds
+    none, deferring to the first request and raising `TypeError` there. That escaped
+    every handler in the program and crashed a run with a traceback on the most common
+    setup mistake there is.
+    """
+    # Every source isolated, not just the two obvious variables. The first version of
+    # this deleted two env vars and passed on a machine authenticated through a profile
+    # *because of* the bug it was meant to catch: the check read two of the SDK's three
+    # credential slots, so a profile user was told their key was not set. A test that
+    # depends on the host cannot tell you which of the two it proved.
+    for variable in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE",
+                     "ANTHROPIC_CONFIG_DIR"):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    with pytest.raises(MissingKey) as caught:
+        AnthropicLLM("claude-sonnet-5")
+    assert caught.value.variable == "ANTHROPIC_API_KEY"
+
+
+def test_a_profile_credential_is_credentials_too(monkeypatch):
+    """The regression this branch introduced and a review caught. The SDK resolves a
+    profile's bearer token into `client.credentials`, a third slot the check did not
+    read, so anyone authenticated through `ant auth login` was told their key was not
+    set. Asserted against the slot rather than against a real profile on disk, so the
+    test says the same thing on every machine."""
+    class ProfileClient:
+        api_key = None
+        auth_token = None
+        credentials = object()          # what a resolved profile leaves behind
+
+    import anthropic
+    monkeypatch.setattr(anthropic, "Anthropic", lambda *a, **k: ProfileClient())
+    AnthropicLLM("claude-sonnet-5")      # constructs, does not raise
+
+
+def test_a_broken_profile_is_a_provider_failure_not_a_traceback(monkeypatch):
+    """A named profile that is missing or corrupt makes the SDK constructor itself
+    raise. Uncaught, that was the same traceback the credential check was added to
+    remove, moved one line earlier."""
+    import anthropic
+    from envforge.llm import ProviderUnavailable
+
+    def explode(*a, **k):
+        raise anthropic.AnthropicError("profile 'work' not found")
+
+    monkeypatch.setattr(anthropic, "Anthropic", explode)
+    with pytest.raises(ProviderUnavailable) as caught:
+        AnthropicLLM("claude-sonnet-5")
+    assert caught.value.kind == "no_key"
+
+
+def test_an_auth_token_is_credentials_too(monkeypatch):
+    """Checking the one environment variable would have broken this. The client's own
+    resolved values are what get asked, so the SDK's other supported method keeps
+    working."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "sk-ant-token")
+    AnthropicLLM("claude-sonnet-5")          # constructs, does not raise
+
+
+def test_the_auth_backstop_does_not_swallow_our_own_mistakes():
+    """The backstop matched the word "auth" at first, which would have turned any
+    TypeError from our own code that happened to mention authentication into "your key
+    is missing". It matches the SDK's specific phrase now."""
+    from envforge.llm import reachable
+
+    def our_bug():
+        raise TypeError("author() takes 2 positional arguments but 3 were given")
+
+    with pytest.raises(TypeError):           # re-raised, not relabelled
+        reachable(our_bug)
+
+    def sdk_says():
+        raise TypeError("Could not resolve authentication method. Expected one of "
+                        "api_key, auth_token, or credentials to be set.")
+
+    with pytest.raises(MissingKey):
+        reachable(sdk_says)
+
+
+def test_a_400_says_the_provider_refused_us_not_that_it_was_unreachable():
+    """The model was reached and answered. Two causes share the status, a prompt over
+    the context window and a malformed request, and neither is the provider being down
+    nor fixed by retrying."""
+    import httpx2 as httpx
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    response = httpx.Response(400, request=request,
+                              json={"error": {"type": "invalid_request_error", "message": "too long"}})
+    exc = anthropic.BadRequestError("too long", response=response, body=None)
+    with pytest.raises(ProviderUnavailable) as caught:
+        reachable(lambda: (_ for _ in ()).throw(exc))
+    assert caught.value.kind == "rejected"       # not "unavailable"

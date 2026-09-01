@@ -39,6 +39,47 @@ class LLMError(Exception):
         self.output_tokens = output_tokens
 
 
+class ProviderUnavailable(Exception):
+    """We could not reach the model at all: a dead key, an empty account, a rate limit,
+    a network failure.
+
+    Deliberately not an `LLMError`. The loop catches the three `LLMError` types as
+    repairable, meaning the reply was unusable and a rewritten prompt might do better.
+    Nothing about this is repairable, and asking again spends money to fail identically.
+
+    The distinction that matters is not the retry policy though, it is what the run is
+    allowed to conclude. A refusal is a successful HTTP 200 with `stop_reason` set to
+    `refusal`, and it is the model judging the script, which is a finding. Everything
+    here is an exception with no response body at all, and it is our infrastructure
+    failing, which is not a finding about anything. If these ever reached the refusal
+    path we would build our own Dockerfile, run it, and report an ordinary-looking
+    verdict on a run the model never saw. For a tool whose only product is a judgment
+    about untrusted code, saying "fine" when the judge never arrived is the worst
+    failure available.
+
+    `kind` names which one, because the HTTP status does not: an exhausted account and a
+    key without model access are both 403, separated only by the error type the provider
+    reports.
+    """
+
+    def __init__(self, message: str, kind: str = "unavailable"):
+        super().__init__(message)
+        self.kind = kind
+
+
+class MissingKey(ProviderUnavailable):
+    """No usable credentials for this provider.
+
+    A subclass of `ProviderUnavailable` so the loop's handler already covers it, and its
+    own type so callers can stop reporting it as a malformed spec. It was reported as a
+    usage error, which told a user to fix something they had typed correctly.
+    """
+
+    def __init__(self, variable: str):
+        super().__init__(f"{variable} is not set", kind="no_key")
+        self.variable = variable
+
+
 class InvalidArguments(LLMError):
     """Arguments came back but do not satisfy the schema. Repairable."""
 
@@ -121,6 +162,106 @@ def validate(arguments: Any, tool: Tool) -> dict[str, Any]:
     return arguments
 
 
+def _connection_errors() -> tuple[type[BaseException], ...]:
+    """The connection-failure base class of whichever SDKs are installed.
+
+    Imported lazily and tolerantly so this module still works with only one of them
+    present, which is the reason the original check matched on a class name instead.
+    Matching the base class is what makes a timeout count, since both SDKs derive their
+    timeout error from their connection error.
+    """
+    found: list[type[BaseException]] = []
+    for module in ("anthropic", "openai"):
+        try:
+            found.append(__import__(module).APIConnectionError)
+        except (ImportError, AttributeError):
+            continue
+    return tuple(found) or (OSError,)
+
+
+def kind_for_status(status: int, reported: str = "") -> str:
+    """What an HTTP status from a provider means to us.
+
+    Its own function because there were two copies. `reachable` widened `rejected` to
+    every 4xx while the `--check` command stayed on 400 alone, so the same 422 was "our
+    bug, do not retry" from a run and "provider unavailable, retry" from `--check`. Two
+    entry points disagreeing about one event is what this exists to prevent.
+
+    `reported` is the provider's own error type, needed only where a status is genuinely
+    ambiguous: 403 is both an exhausted account and a key without model access.
+    """
+    if status == 402:
+        # Payment Required is an empty account, which is the same event as a 403 billing
+        # error and needs the same action. A blanket 4xx rule had it reported as our own
+        # malformed request, telling someone out of credit not to retry and that the bug
+        # was theirs.
+        return "billing"
+    if status == 403:
+        return "billing" if "billing" in reported else "permission"
+    if status == 404:
+        return "no_such_model"
+    if status in (401,):
+        return "auth"
+    if status in (408,):
+        return "network"
+    if status == 429:
+        return "rate_limit"
+    if status >= 500:
+        return "server"
+    if 400 <= status < 500:
+        # Anything else the provider refuses. Enumerating statuses always misses the
+        # next one, so unmapped 4xx falls to a side rather than to the floor.
+        return "rejected"
+    return "unavailable"
+
+
+def reachable(send):
+    """Call the provider, and turn "we could not reach it" into one typed failure.
+
+    Both SDKs raise their own exception classes, and neither is an `LLMError`, so
+    without this they escape the loop's handlers entirely: the run dies mid-generator
+    with a traceback, no outcome, and whatever was already spent unrecorded.
+
+    Matched by HTTP status rather than by class name, because the two SDKs do not share
+    a hierarchy and the statuses are the part both agree on. 403 is read further, since
+    an exhausted account and a key that cannot use the model are the same status and
+    only the provider's own error type separates them.
+    """
+    try:
+        return send()
+    except Exception as exc:               # noqa: BLE001 - narrowed immediately below
+        status = getattr(exc, "status_code", None)
+        if isinstance(exc, TypeError) and "resolve authentication" in str(exc):
+            # A backstop, not the mechanism. Credentials are checked when the client is
+            # built, so this only fires if that check is bypassed or the SDK changes
+            # where it resolves them from. Matched on the SDK's specific phrase rather
+            # than on the word "auth", which would have swallowed any TypeError from our
+            # own code that happened to mention authentication.
+            raise MissingKey("ANTHROPIC_API_KEY") from exc
+        if status is None:
+            # No HTTP response at all: DNS, TLS, a dropped connection, a timeout.
+            # Matched by inheritance rather than by class name. The name test that was
+            # here first missed `APITimeoutError`, which subclasses the connection error
+            # in both SDKs but does not contain "connection", so a timed-out call went
+            # back to escaping the loop entirely.
+            if isinstance(exc, _connection_errors()):
+                raise ProviderUnavailable(f"could not reach the provider: {exc}",
+                                          kind="network") from exc
+            raise
+        # 400 is the provider rejecting the request we sent, which is not the provider
+        # being unavailable and must not be reported as one: the model was reached and
+        # answered. It is the same event as docker exit 125 one layer up, and ADR-008
+        # already settled what that means, which is that our own code is broken.
+        #
+        # Two causes share the status. A prompt over the context window, which this tool
+        # can produce by feeding a long log into a repair, and a malformed request, which
+        # is a bug in us. Neither is fixed by retrying and neither is the provider's
+        # fault, so they share an ending; the message carries which one the provider
+        # said it was, since that is the only thing that separates them.
+        kind = kind_for_status(status, getattr(exc, "type", "") or "")
+        raise ProviderUnavailable(f"{kind}: {exc}", kind=kind) from exc
+
+
 def charge(check, arguments: Any, tool: Tool, spent: tuple[int, int]) -> dict[str, Any]:
     """Run `validate` and make sure a failure carries what the reply cost.
 
@@ -142,7 +283,31 @@ class AnthropicLLM:
         import anthropic
 
         self.model = model
-        self._client = client if client is not None else anthropic.Anthropic()
+        if client is not None:
+            self._client = client
+            return
+        try:
+            self._client = anthropic.Anthropic()
+        except anthropic.AnthropicError as exc:
+            # A named profile that is missing or corrupt makes the constructor itself
+            # raise. Left uncaught this was the same traceback the credential check was
+            # added to remove, just moved one line earlier.
+            raise ProviderUnavailable(f"anthropic credentials: {exc}",
+                                      kind="no_key") from exc
+        # Asked of the constructed client rather than of the environment, and asked here
+        # rather than left to request time. This SDK resolves credentials from several
+        # places and raises nothing when it finds none, deferring to the first request
+        # and raising `TypeError` there, which is not an exception any handler in this
+        # program was looking for: a missing key crashed the run with a traceback.
+        #
+        # All three slots, not two. The first version read `api_key` and `auth_token`
+        # only, which told anyone authenticated through `ant auth login` that their key
+        # was not set: `credentials` is where the SDK puts a profile's bearer token and
+        # a workload identity, and it is as valid as the other two. The test enshrined
+        # the bug, since deleting two environment variables cannot reveal a third slot.
+        if not any(getattr(self._client, name, None)
+                   for name in ("api_key", "auth_token", "credentials")):
+            raise MissingKey("ANTHROPIC_API_KEY")
 
     def build_request(self, system: str, user: str, tool: Tool) -> dict[str, Any]:
         return {
@@ -171,7 +336,7 @@ class AnthropicLLM:
 
     def call(self, system: str, user: str, tool: Tool) -> Call:
         request = self.build_request(system, user, tool)
-        response = self._client.messages.create(**request)
+        response = reachable(lambda: self._client.messages.create(**request))
         spent = self.tokens(response)
         if response.stop_reason == "refusal":
             details = response.stop_details
@@ -216,7 +381,7 @@ class OpenAICompatLLM:
         # as a 401 from the wrong provider halfway through a run.
         key = os.environ.get(api_key_env)
         if not key:
-            raise ValueError(f"{api_key_env} is not set")
+            raise MissingKey(api_key_env)
         self._client = openai.OpenAI(base_url=base_url, api_key=key)
 
     def build_request(self, system: str, user: str, tool: Tool) -> dict[str, Any]:
@@ -254,7 +419,7 @@ class OpenAICompatLLM:
 
     def call(self, system: str, user: str, tool: Tool) -> Call:
         request = self.build_request(system, user, tool)
-        response = self._client.chat.completions.create(**request)
+        response = reachable(lambda: self._client.chat.completions.create(**request))
         spent = self.tokens(response)
         choice = response.choices[0]
         refusal = getattr(choice.message, "refusal", None)

@@ -14,7 +14,7 @@ from envforge.agent import (
     default_dockerfile, language_for,
 )
 from envforge.budget import Budget
-from envforge.llm import Call, InvalidArguments, Refused, Truncated
+from envforge.llm import Call, InvalidArguments, ProviderUnavailable, Refused, Truncated
 from envforge.sandbox import BuildResult, DockerSandbox, Limits, RunResult
 from envforge.workspace import Files, gather
 
@@ -58,14 +58,28 @@ class FakeLLM:
 
 
 class FakeSandbox:
+    """Conforms to the whole `Sandbox` protocol, cleanup included.
+
+    It did not, and the gap was invisible until a review substituted it into `main`:
+    the run finished correctly and then the program died reaching for `built_tags`,
+    after the answer had been produced and before it was printed. A test double that
+    implements only the interesting half is how an unused seam rots.
+    """
+
     def __init__(self, builds=(), runs=()):
         self.builds, self.runs = list(builds), list(runs)
         self.built = []
+        self.built_tags = []
+        self.removed = []
 
     def build(self, dockerfile, files, tag):
         self.built.append(dockerfile)
+        self.built_tags.append(tag)
         self.context = dict(files)
         return self.builds.pop(0) if self.builds else _build()
+
+    def remove_image(self, tag):
+        self.removed.append(tag)
 
     def run(self, image, args=()):
         return self.runs.pop(0) if self.runs else _run()
@@ -245,18 +259,55 @@ def test_two_refusals_fall_back_to_our_own_dockerfile(script):
 
 # --- the token budget ----------------------------------------------------------------
 
-def test_a_spent_budget_falls_back_instead_of_asking(script):
-    """The same shape as a second refusal. A run that has spent its budget still
-    produces an image, because the alternative is paying for everything up to here
-    and having nothing to show for it."""
+def test_a_spent_budget_ends_the_run_rather_than_degrading_it(script):
+    """A spent budget is not a second refusal, and used to be treated as one.
+
+    A refusal is the model judging the script, which is information about the script
+    and a fair reason to fall back to a Dockerfile we wrote. A spent budget is
+    information about us: the ceiling was too low, or something looped. Building on it
+    prints a verdict that no judgment went into and labels it a success, and a report
+    nobody can trust is worse than no report.
+
+    Ending here is also what lets the ceiling be generous. Once hitting it means
+    something went wrong rather than that an allowance ran out, there is no reason to
+    keep it tight.
+    """
     llm = FakeLLM(_call())
     sandbox = FakeSandbox()
     agent = Agent(llm, sandbox, ALLOW, budget=Budget(total=10, reserve=5))
     events, kinds, outcome = drive(agent, script)
-    assert kinds[0] == "budget_spent" and "asking" not in kinds
-    assert outcome.ok and outcome.used_fallback and outcome.usage.calls == 0
-    assert sandbox.built == [default_dockerfile("python", "s.py")]
-    assert llm.prompts == []                         # it was never asked at all
+    assert kinds == ["budget_spent", "finished"]
+    assert not outcome.ok and not outcome.used_fallback
+    assert "budget exhausted" in outcome.reason
+    assert sandbox.built == []                       # nothing was built on a spent budget
+    assert llm.prompts == []                         # and it was never asked at all
+
+
+def test_a_provider_we_cannot_reach_ends_the_run_and_never_falls_back(script):
+    """A dead key is not a finding about the script.
+
+    Before this it was not caught at all: `ProviderUnavailable` is deliberately not an
+    `LLMError`, and the loop's handlers only cover those, so the exception escaped the
+    generator. The run died with a traceback, no `finished` event, no outcome, and
+    whatever had already been spent unrecorded.
+
+    It must also never reach the fallback path. Doing so would build our own Dockerfile,
+    run it, and report an ordinary-looking verdict on a run the model never saw, which
+    for a tool whose only product is a judgment about untrusted code is the worst
+    available failure.
+    """
+    for kind, message in [("auth", "auth: 401 invalid x-api-key"),
+                          ("billing", "billing: 403 credit balance too low"),
+                          ("rate_limit", "rate_limit: 429 slow down"),
+                          ("network", "could not reach the provider")]:
+        llm = FakeLLM(ProviderUnavailable(message, kind=kind), _call())
+        sandbox = FakeSandbox()
+        events, kinds, outcome = drive(Agent(llm, sandbox, ALLOW), script)
+        assert kinds == ["asking", "provider_unavailable", "finished"], kind
+        assert not outcome.ok and not outcome.used_fallback, kind
+        assert kind in outcome.reason, kind
+        assert sandbox.built == []                   # nothing was built
+        assert llm.queue                             # and it was not asked a second time
 
 
 def test_a_reply_we_could_not_use_is_still_charged(script):
@@ -497,9 +548,39 @@ def test_the_whole_loop_against_a_real_daemon(tmp_path):
     script = tmp_path / "hello.py"
     script.write_text("import sys; print('from inside'); sys.exit(3)\n")
     dockerfile = default_dockerfile("python", "hello.py")
-    agent = Agent(FakeLLM(_call(dockerfile)),
-                  DockerSandbox(Limits(run_timeout=60.0)), ALLOW)
-    events = list(agent.run(gather(script), "python"))
+    sandbox = DockerSandbox(Limits(run_timeout=60.0))
+    try:
+        agent = Agent(FakeLLM(_call(dockerfile)), sandbox, ALLOW)
+        events = list(agent.run(gather(script), "python"))
+    finally:
+        # The suite leaked one image per run, which is how a machine ended up holding
+        # a hundred of them. Cleanup lived only in the CLI, so the seam existed and the
+        # tests exercising that seam did not use it.
+        for tag in sandbox.built_tags:
+            sandbox.remove_image(tag)
     outcome = events[-1].data["outcome"]
     assert outcome.ok and outcome.attempts == 1
+    assert outcome.kind == "script_failed"       # it ran, and it exited 3
     assert outcome.run.exit_code == 3 and "from inside" in outcome.run.stdout
+
+
+def test_a_build_timeout_does_not_buy_a_repair(script):
+    """Found by running the tool, not by reading it.
+
+    A cold base image took longer to pull than the build timeout. The loop called that
+    a broken Dockerfile and paid for a second call, in which the model rewrote the
+    identical 142 characters and the build then succeeded because the pull had cached.
+    The model cannot see a clock, so asking it again is asking the wrong question at
+    full price, and this file's first rule is that a failure a rewrite cannot fix must
+    not spend an attempt.
+    """
+    llm = FakeLLM(_call(), _call(), _call())
+    sandbox = FakeSandbox(builds=[BuildResult(
+        ok=False, image="", exit_code=None, log="", truncated=False,
+        timed_out=True, seconds=300.0)])
+    events, kinds, outcome = drive(Agent(llm, sandbox, ALLOW), script)
+    assert kinds == ["asking", "wrote", "building", "build_failed", "finished"]
+    assert outcome.kind == "build_timeout" and not outcome.ok
+    assert "timed out" in outcome.reason
+    assert len(llm.prompts) == 1                 # one call, not three
+    assert llm.queue                             # the rest were never spent

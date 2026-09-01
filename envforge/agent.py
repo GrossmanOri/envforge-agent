@@ -17,12 +17,13 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Protocol, Sequence
+from typing import Any, Iterator, Literal, Protocol, Sequence
 
 from .budget import Budget, Usage
 from .budget import DEFAULT as DEFAULT_BUDGET
 from .events import Event
-from .llm import LLM, Call, InvalidArguments, LLMError, Refused, Tool, Truncated
+from .llm import (LLM, Call, InvalidArguments, LLMError, ProviderUnavailable,
+                  Refused, Tool, Truncated)
 from .sandbox import BuildResult, RunResult, Sandbox
 from .workspace import Workspace
 
@@ -179,6 +180,13 @@ Your most recent usable Dockerfile is above. Here is the latest problem:
 Write the complete corrected Dockerfile."""
 
 
+# Every way a run can end. A closed set for the same reason the event vocabulary is one:
+# a caller switches on this, so an unlisted value is a caller reading a case it has never
+# handled.
+Kind = Literal["ran", "script_failed", "no_image", "failed", "build_timeout",
+               "budget", "unavailable", "rejected", "unsupported"]
+
+
 @dataclass(frozen=True)
 class Outcome:
     """Carried on the final event rather than returned, because a generator's return
@@ -194,6 +202,17 @@ class Outcome:
 
     ok: bool
     reason: str
+    # What kind of ending this was, as a value rather than a sentence. `reason` splices
+    # in filenames, gate text and provider messages, so anything matching on its words
+    # is reading attacker-influenced prose: a script named
+    # "x could not be reached.py" was enough to turn a failed run into "we could not
+    # reach the model", which tells a caller to retry something that did not happen.
+    #
+    # No default, deliberately. The first version defaulted to "ran", and one terminal
+    # path that forgot to set it therefore reported a failed run as a success and exited
+    # 0 while printing FAILED. A missing value is now a TypeError at construction, which
+    # is a test failure rather than a wrong answer to a caller.
+    kind: Kind
     dockerfile: str | None = None
     build: BuildResult | None = None
     run: RunResult | None = None
@@ -291,7 +310,8 @@ class Agent:
         go wrong with a Dockerfile we wrote ourselves, and in all three the honest
         move is to stop and say which, never to ask the model again."""
         return Event("finished", reason, {"outcome": Outcome(
-            ok=False, reason=reason, dockerfile=dockerfile, build=build, run=run,
+            ok=False, kind="failed", reason=reason, dockerfile=dockerfile,
+            build=build, run=run,
             attempts=attempt, usage=usage, refusals=refusals, used_fallback=True,
             run_id=run_id)})
 
@@ -311,7 +331,7 @@ class Agent:
             supported = ", ".join(sorted(LANGUAGES))
             yield Event("finished", f"{language} is not supported",
                         {"outcome": Outcome(
-                            ok=False,
+                            ok=False, kind="unsupported",
                             reason=f"this agent handles {supported}, not {language!r}",
                             run_id=run_id)})
             return
@@ -346,17 +366,25 @@ class Agent:
             while dockerfile is None:
                 user = self._prompt(language, script, text, previous, evidence)
                 if not self.budget.can_write(usage(), SYSTEM, user):
-                    # The same shape as a second refusal: the model stops being asked
-                    # and we write the Dockerfile ourselves. A spent budget degrades a
-                    # run rather than ending it with nothing, and the alternative is
-                    # paying for everything up to here and having no image to show.
-                    yield Event("budget_spent",
-                                f"{usage().tokens} of {self.budget.total} tokens spent, "
-                                "using our own Dockerfile")
-                    dockerfile = default_dockerfile(language, script)
-                    base_image = LANGUAGES[language].base_image
-                    used_fallback = True
-                    break
+                    # A spent budget ends the run. It used to fall back to the
+                    # Dockerfile we write ourselves, copying the shape of a second
+                    # refusal, and the two do not mean the same thing. A refusal is the
+                    # model judging the script, which is information about the script.
+                    # A spent budget is information about us: the ceiling was too low or
+                    # something looped. Building on it prints a verdict that no judgment
+                    # went into and calls it a success, and a report nobody can trust is
+                    # worse than no report. Ending here is also what allows the ceiling
+                    # to be set generously, since hitting it now means something went
+                    # wrong rather than that an allowance ran out.
+                    spent = usage()
+                    reason = (f"token budget exhausted: {spent.tokens} of "
+                              f"{self.budget.total} spent over {spent.calls} call(s), "
+                              f"and the next one needs room this run does not have")
+                    yield Event("budget_spent", reason)
+                    yield Event("finished", reason, {"outcome": Outcome(
+                        ok=False, kind="budget", reason=reason, attempts=attempt,
+                        usage=spent, refusals=refusals, run_id=run_id)})
+                    return
                 yield Event("asking", f"attempt {attempt}: asking for a Dockerfile")
                 calls += 1
                 try:
@@ -371,11 +399,38 @@ class Agent:
                     base_image = LANGUAGES[language].base_image
                     used_fallback = True
                     yield Event("fell_back", "refused twice, using our own Dockerfile")
+                except ProviderUnavailable as exc:
+                    # Not repairable, and not a finding about the script. Asking again
+                    # spends money to fail identically, and falling back would print a
+                    # verdict on a run the model never saw. Ends the run, saying which
+                    # kind, because a dead key and an empty account need different
+                    # actions from whoever is reading.
+                    # A rejected request is not an unreachable provider, and saying so
+                    # was a false sentence in our own output: the model was reached and
+                    # it answered. The distinction matters to whoever reads the exit
+                    # code, because one of these is worth retrying and the other is a
+                    # bug in us.
+                    if exc.kind == "rejected":
+                        reason = (f"the provider rejected our request, which is our bug "
+                                  f"rather than theirs: {exc}")
+                    else:
+                        reason = f"the model could not be reached ({exc.kind}): {exc}"
+                    yield Event("provider_unavailable", reason, {"kind": exc.kind})
+                    yield Event("finished", reason, {"outcome": Outcome(
+                        ok=False,
+                        kind="rejected" if exc.kind == "rejected" else "unavailable",
+                        reason=reason, attempts=attempt,
+                        usage=usage(), refusals=refusals, run_id=run_id)})
+                    return
                 except (InvalidArguments, Truncated, LLMError) as exc:
                     # Repairable, but by rewriting the reply rather than the image.
                     charge(exc)
                     yield Event("unusable_reply", str(exc))
-                    evidence = str(exc)   # RETRY's own heading already says what it is
+                    # Bounded like every other evidence path. This one was missed:
+                    # a provider message carrying model-chosen text put 200,000
+                    # characters into the next prompt, which the budget's estimate
+                    # was nowhere near large enough to refuse.
+                    evidence = bound(str(exc), EVIDENCE_LIMIT)
                     break
                 else:
                     charge(call)
@@ -408,6 +463,23 @@ class Agent:
             tag = f"envforge-{run_id}:attempt{attempt}"
             yield Event("building", f"building {tag}")
             build = self.sandbox.build(dockerfile, files, tag)
+            if not build.ok and build.timed_out:
+                # A timeout is not a Dockerfile defect, and this file's own first rule
+                # is that a failure a rewrite cannot fix must not spend an attempt.
+                # Found by running it: a cold base image took longer to pull than the
+                # build timeout, the loop called that a broken Dockerfile, and paid for
+                # a second call in which the model rewrote the identical 142 characters.
+                # The model cannot see a clock, so asking it again is asking the wrong
+                # question at full price.
+                reason = (f"the build timed out after {build.seconds:.0f}s. The image "
+                          f"may still be downloading, or the Dockerfile asks for more "
+                          f"work than the timeout allows")
+                yield Event("build_failed", reason)
+                yield Event("finished", reason, {"outcome": Outcome(
+                    ok=False, kind="build_timeout", reason=reason, dockerfile=dockerfile,
+                    build=build, attempts=attempt, usage=usage(), refusals=refusals,
+                    used_fallback=used_fallback, run_id=run_id)})
+                return
             if not build.ok:
                 yield Event("build_failed", f"build exited {build.exit_code}")
                 if used_fallback:
@@ -443,10 +515,16 @@ class Agent:
                             f"{bound(result.start_error, EVIDENCE_LIMIT)}")
                 continue
 
-            # The script ran. What it did is the verdict's problem, not the loop's.
+            # The script ran. What it *means* is the verdict's problem, but whether it
+            # succeeded is observable here and the caller needs it: a run that ends in a
+            # nonzero exit is a finding, and reporting it as an unqualified success made
+            # the documented meaning of exit 1 unreachable.
             yield Event("finished", f"the script ran and exited {result.exit_code}",
                         {"outcome": Outcome(
-                            ok=True, reason="the script ran", dockerfile=dockerfile,
+                            ok=True,
+                            kind="ran" if result.exit_code == 0 else "script_failed",
+                            reason=f"the script ran and exited {result.exit_code}",
+                            dockerfile=dockerfile,
                             build=build, run=result, attempts=attempt, usage=usage(),
                             refusals=refusals, used_fallback=used_fallback,
                             run_id=run_id)})
@@ -454,7 +532,8 @@ class Agent:
 
         yield Event("finished", f"gave up after {attempt} attempts",
                     {"outcome": Outcome(
-                        ok=False, reason=f"no Dockerfile worked in {attempt} attempts",
+                        ok=False, kind="no_image",
+                        reason=f"no Dockerfile worked in {attempt} attempts",
                         dockerfile=previous, attempts=attempt, usage=usage(),
                         refusals=refusals, used_fallback=used_fallback,
                         run_id=run_id)})
