@@ -353,6 +353,9 @@ class Agent:
             input_tokens += reply.input_tokens
             output_tokens += reply.output_tokens
 
+        # Run-scoped, not attempt-scoped: the free rebuild is offered once per run, so a
+        # Dockerfile that always times out cannot buy a fresh retry on every attempt.
+        rebuilt_after_timeout = False
         dockerfile: str | None = None
         base_image: str = ""
         previous: str | None = None
@@ -464,16 +467,31 @@ class Agent:
             yield Event("building", f"building {tag}")
             build = self.sandbox.build(dockerfile, files, tag)
             if not build.ok and build.timed_out:
-                # A timeout is not a Dockerfile defect, and this file's own first rule
-                # is that a failure a rewrite cannot fix must not spend an attempt.
-                # Found by running it: a cold base image took longer to pull than the
-                # build timeout, the loop called that a broken Dockerfile, and paid for
-                # a second call in which the model rewrote the identical 142 characters.
-                # The model cannot see a clock, so asking it again is asking the wrong
-                # question at full price.
-                reason = (f"the build timed out after {build.seconds:.0f}s. The image "
-                          f"may still be downloading, or the Dockerfile asks for more "
-                          f"work than the timeout allows")
+                # A timeout is not a Dockerfile defect, and this file's own first rule is
+                # that a failure a rewrite cannot fix must not spend an attempt. The model
+                # cannot see a clock, so asking it again is asking the wrong question at
+                # full price.
+                #
+                # But it can be worth trying the same file again, once, for free. The
+                # incident this branch was written for was a cold base image taking longer
+                # to pull than the ceiling, and buildkit keeps the layers it managed to
+                # pull, so the second attempt starts warm and usually finishes. That costs
+                # wall clock and no tokens, which is the one retry this loop can afford to
+                # give away.
+                #
+                # Once, not until it works. A Dockerfile that genuinely asks for more work
+                # than the timeout allows would otherwise retry forever at full build cost,
+                # and the honest ending for that is the timeout ending below.
+                if not rebuilt_after_timeout:
+                    rebuilt_after_timeout = True
+                    yield Event("build_failed",
+                                f"the build timed out after {build.seconds:.0f}s. Trying "
+                                f"the same Dockerfile once more, which costs no tokens: a "
+                                f"partly-pulled image is kept and the retry starts warm")
+                    continue
+                reason = (f"the build timed out after {build.seconds:.0f}s, twice. The "
+                          f"Dockerfile asks for more work than the timeout allows, or the "
+                          f"image cannot be pulled from here")
                 yield Event("build_failed", reason)
                 yield Event("finished", reason, {"outcome": Outcome(
                     ok=False, kind="build_timeout", reason=reason, dockerfile=dockerfile,

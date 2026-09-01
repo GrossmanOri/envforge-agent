@@ -22,7 +22,7 @@ it cost; nothing yet decides what that behaviour means. The model also has no to
 reads the script once and writes a Dockerfile, which makes this a workflow with a feedback
 loop rather than an agent.
 
-301 tests, 288 of which need neither Docker nor an API key. The rest skip
+302 tests, 289 of which need neither Docker nor an API key. The rest skip
 automatically when no daemon is present. Both suites run on every push
 and every pull request.
 
@@ -331,6 +331,28 @@ from STOPPED to FAILED had survived, and so had `unavailable` to `ok`, which wou
 printed `ok` above exit 3.
 
 300 tests pass, 287 without a daemon.
+
+## The free rebuild a timeout is worth, 2026-08-31
+The seventh review argued for this and it went to the backlog rather than into a branch
+that had been blocked five times. Taken up now that the command line has merged.
+
+A build timeout ended the run. That was right about the model, which cannot see a clock, so
+asking it to fix a file that timed out produces the identical file at full price. It was
+wrong about the build: buildkit keeps the layers a cancelled pull managed to fetch, so the
+same Dockerfile often succeeds on a second try, and the incident that motivated the ending
+was exactly that, a cold base image pulling past the ceiling.
+
+So the first timeout buys one rebuild of the identical file, which costs wall clock and no
+tokens. Once, not until it works, because a Dockerfile that genuinely asks for more work
+than the timeout allows would otherwise retry forever at full build cost, and the honest
+ending for that is the one already there. The flag is run-scoped rather than
+attempt-scoped, so a file that always times out cannot buy a fresh retry every attempt.
+
+Both properties were mutation-tested before being believed: removing the rebuild fails two
+tests, and making it unbounded fails one. That step is what the last three rounds were
+missing.
+
+302 tests pass.
 
 ## Keys come from a .env, reversed 2026-08-30
 The original decision said the key was read from the environment and never from a file.
