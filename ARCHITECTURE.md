@@ -70,12 +70,67 @@ same gate before any build.
     Dockerfile we wrote. It is not a finding about the script, and a verdict no judgment
     went into must not be reported as a success.
 21. Configuration is never read from a directory the sample controls. The `.env` is read
-    from the package's own directory only, and only four variable names are accepted from
-    it, so a file shipped beside a sample can neither supply credentials nor redirect
-    where the model call goes.
+    from the package's own directory only, and only an allowlist of variable names is
+    accepted from it, so a file shipped beside a sample can neither supply credentials
+    nor redirect where the model call goes. The allowlist is three names today: it said
+    four here until the token budget was deleted and took the fourth with it.
 22. What the shell learns comes from a typed `Outcome.kind`, never from matching words in
     a sentence. `reason` splices in filenames and provider text, so a sample could
     otherwise choose the exit code.
+23. The model chooses what it reads and never what the loop does. A tool call cannot
+    spend an attempt, reach the gate, start a build, or change the attempt count.
+24. One prompt holds at most `SCRIPT_LIMIT + MAX_LOOKS * SLICE_LIMIT` characters of the
+    script directly, plus at most `DOCKERFILE_LIMIT + EVIDENCE_LIMIT` of text written by
+    the model or produced by a build, either of which may quote the sample back. The cap
+    on tool calls is what makes the first term true, so it is a security control and not
+    a budget: without it a model that asks for region after region has reassembled the
+    sample one slice at a time without breaking a single other rule.
+
+    The second term is not padding, and this invariant was false without it for the
+    length of one review. Every untrusted string entering a prompt is bounded except,
+    originally, the previous Dockerfile: the model wrote it, `previous` is not reset
+    between attempts, and it is replayed whole into every repair. A model that writes
+    what it read into comment lines, which the gate permits, therefore carried its
+    slices into the next attempt on top of that attempt's own fresh look budget.
+    Measured before the fix: 25,326 characters of a 40,000 character sample in a single
+    prompt against a ceiling then claimed to be 16,384, growing linearly with
+    `max_attempts`. The lesson is the one this project keeps relearning: a bound stated
+    over the direct path is not a bound, because the interesting channel is the one
+    nobody counted as a channel.
+
+    The manifests are bounded separately, at `MANIFEST_LIMIT` each, and are a different
+    file rather than the script. They are untrusted by the same argument and are not
+    covered by the arithmetic above, which is about reassembling the sample.
+25. Every tool result is bounded and labelled where it is produced, not where it is
+    consumed. There is one function that creates a slice of the sample, which is the only
+    place the rule cannot be forgotten by a later caller.
+26. A search pattern is a literal, never a regular expression. The pattern is chosen by a
+    model that has just read attacker-controlled text, and `re` on a model-chosen pattern
+    is catastrophic backtracking on the host, which is the one machine here that is not
+    in a sandbox.
+27. Every reply is exactly one tool call. Parallel tool use is disabled on both providers,
+    because a second call in one reply never receives a result and would also make one
+    look return several slices.
+28. A gate rejection is repair evidence, so its size is a security property and not a
+    formatting one. The gate refuses a Dockerfile over `MAX_DOCKERFILE`, and a rejection
+    quotes at most `QUOTED_LINE` characters of the offending line. Both are the same rule
+    as 25, one module over: the reason is created in the gate, so the gate is where it is
+    bounded, rather than at each place a reason is later used.
+
+    This was invariant 24's second break, found after the first was fixed. Every
+    rejection names the line so the model can repair it, and that line is written by a
+    model that has just read the sample. One `WORKDIR` instruction carrying 200,000
+    characters put 202,705 of them into a single repair prompt. The agent bounds the
+    reason again on the way into the prompt, which the source cap makes unreachable
+    through the shipped gate and is kept anyway: `Gate` is a Protocol, and a guarantee
+    about what enters a prompt must not depend on which implementation is wired in.
+
+    The two numbers answer different questions and are deliberately not equal. The gate
+    asks whether this could be a Dockerfile at all, at 8KB. `DOCKERFILE_LIMIT` asks how
+    much of one may be replayed into a prompt, at 2KB. A file between them passes the
+    gate and comes back for repair with a marker in the middle, which is the correct
+    behaviour for a file that large: `bound` keeps the head and the tail, so `FROM` and
+    the command survive, and the marker says what was removed.
 
 Invariants 4 and 5 are asserted against the argv that `sandbox.py` actually builds, so
 dropping a flag from the code fails a test rather than passing review.
@@ -204,9 +259,29 @@ Decided 2026-08-27, reversed 2026-09-01. `envforge/budget.py` bounded model spen
 with a reserve held back for the call that has to produce a Dockerfile. The whole module is
 gone and this entry is kept as the record of a mistake rather than of a design.
 
-It could not fire. Seven calls is the worst a run can make, `max_attempts` caps it there,
-and seven worst-case calls estimate to 150,000 tokens against a 256,000 ceiling. Measured
-before deleting it, not assumed. A second lock on a door the first lock already held.
+It could not fire. Seven calls was the worst a run could make, `max_attempts` capped it
+there, and seven worst-case calls estimate to 150,000 tokens against a 256,000 ceiling.
+Measured before deleting it, not assumed. A second lock on a door the first lock already
+held.
+
+**That premise is gone, one change later, and the deletion is not being reversed on it
+yet.** The looking tools make the worst case sixteen calls rather than seven, and a run
+driven to it clears the same 256,000 ceiling: 320,000 tokens on one set of per-call input
+assumptions and 348,000 on another. The call count is the robust half and the token total
+is a modelling choice, so the claim to rely on is sixteen calls and that no plausible
+assumption keeps them under the ceiling. Sixteen and not the
+fifteen that `max_attempts * (MAX_LOOKS + 1)` suggests: a refusal does not spend an
+attempt, so it is a free extra call, which is a reminder that the arithmetic here should
+be driven rather than derived. It was derived first and was wrong by one. The argument above was sound and its arithmetic is no
+longer true, which is recorded here because an ADR whose reasoning has silently expired is
+worse than no ADR.
+
+Not reversed, because the reason the budget was deleted was that it was a bound nothing
+had ever hit, and a bound nothing has hit is still what a reinstated one would be: the
+number that actually stops a runaway run is `max_attempts`, which now caps looks as well
+as builds. What has changed is that "it cannot fire" is no longer the argument. If a
+ceiling comes back it should come back on evidence of a run that cost more than it should
+have, and this paragraph is the note to whoever reads that evidence first.
 
 `can_investigate`, the half that held the reserve back, was never called by anything. It
 was built for a tool loop that did not exist, on the argument that a loop written against a
@@ -300,16 +375,85 @@ Configuration is the environment first, then the project's own `.env`, which car
 credentials and nothing else.
 
 The `.env` is read from the directory holding the package and never from the working
-directory, and only four variable names are accepted from it. Both rules exist because this
-tool is normally run from the directory holding the sample it is analysing, so reading
-`./.env` let an untrusted sample supply configuration this process then obeyed.
+directory, and only an allowlist of variable names is accepted from it, three of them
+today. Both rules exist because this tool is normally run from the directory holding the
+sample it is analysing, so reading `./.env` let an untrusted sample supply configuration
+this process then obeyed.
+
+### ADR-018: the model may read the script, and nothing else
+
+Decided 2026-09-01. Two tools, `search_script` and `read_script`, and a conversation in
+the model layer to carry their results back.
+
+The problem is arithmetic. `SCRIPT_LIMIT` is 8,192 characters, and the bound is not
+negotiable: the script is attacker-controlled text on its way into a prompt, and it is
+resent on every repair. Most source files in this repository are longer than that, and so
+is `examples/deep_dependency.py`, the fixture this was built against: 16,980 characters, of
+which 8,788 are replaced by a marker before a model sees any of it. On a real script the
+Dockerfile is written from roughly the first and last quarter of a file.
+
+The fixture rather than a module, deliberately. Two earlier drafts of this paragraph
+counted a module and both went stale within the same change that wrote them, because
+editing the file moves the number. The fixture exists to be measured and nothing edits it.
+
+A dependency hides anywhere in the discarded middle. An import inside a function, a
+subprocess call to a command line tool, and neither appears at the top. Which region
+matters differs per script, so no deterministic rule finds it, and that is what makes this
+a decision only the model can make. It is the test this project applies before building a
+tool at all: "just put it in the prompt" has no answer here, because the bound is the
+answer to that.
+
+The same test is why the dependency manifest is **not** a tool. `requirements.txt` was
+gathered from the first day and went into every build context, and the prompt never
+mentioned it: a file we read, shipped to the daemon, and then asked the model to guess the
+contents of. There is no decision in it. It is short, we have it, and it is relevant to
+every script it was found beside, so it goes in the prompt. Wrapping it in a tool would
+let the model choose not to read a file we are certain it needs, and would have been
+agency as theatre.
+
+The caps are the security half. Four looks per attempt, 2,048 characters each, and the
+first of those is easy to misread as thrift. A model that asks for eight regions of a
+truncated file has reassembled the whole thing one slice at a time, and the bound on how
+much of the sample reaches a prompt is gone without a single rule having been broken. The
+cap is enforced by withdrawing the tools from the request rather than by asking the model
+to stop, because a rule written in a prompt is a request made of the thing the prompt is
+defending against.
+
+Three smaller decisions, each with a reason that is not taste.
+
+Two tools rather than one, because a strict schema requires every property in `required`,
+so a single tool covering both modes would either force the model to supply a character
+range while searching or need an optional field typed as a union, which our validator
+skips silently. The grammar constraint is worth more than the tidier menu.
+
+The search pattern is a literal and never a regular expression. It is chosen by a model
+that has just read attacker-controlled text, and `re` on such a pattern is catastrophic
+backtracking on the host doing the analysis, which is the one machine in this design that
+is not in a sandbox.
+
+The assistant turn is kept exactly as the provider returned it rather than rebuilt from
+the parsed arguments, because a reconstruction can only carry the parts of a reply this
+code models, and whatever it drops surfaces as a 400 on the following request rather than
+on the one that lost it. Extended thinking is the concrete case and is a contingency
+rather than today's behaviour: no `thinking` parameter is sent, and forced tool choice is
+documented as incompatible with it. The first version of this paragraph claimed thinking
+was on by default and that the round trip depended on it, which was unverified and is now
+not claimed.
+
+The three prompt templates were collapsed onto one shared context in the same change. The
+truncation notice and the manifest have to appear on a repair as well as on a first ask,
+and three copies of a paragraph is the shape where the third copy goes missing. That shape
+is what kept the manifest out of the prompt for months.
 
 ## What crosses each boundary
 
 | from | to | payload |
 |---|---|---|
 | CLI | agent | a `Workspace` of names and contents, a language, and script arguments |
-| agent | LLM | script text, language, bounded failure evidence |
+| agent | LLM | script text, language, bounded failure evidence, and the transcript of tool calls already answered |
+| LLM | agent | one tool call: a Dockerfile, or a request to look at part of the script |
+| agent | tools | the whole script, which is the only place it is held unbounded |
+| tools | agent | at most `SLICE_LIMIT` characters of the sample, labelled as the sample's words |
 | LLM | gate | Dockerfile text, declared base image |
 | gate | sandbox | approved Dockerfile, or a rejection reason |
 | sandbox | agent | exit code, bounded stdout and stderr, timing |

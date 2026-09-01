@@ -1,9 +1,19 @@
 """The model layer: one forced tool call, validated arguments, nothing hidden.
 
-Every provider is asked for exactly one named tool call and nothing else. The
-Dockerfile arrives as a schema-constrained argument rather than as prose we have
-to extract, because an extraction heuristic would sit between a model that just
-read attacker-controlled text and the gate that has to check it.
+Every provider is asked for exactly one tool call and nothing else. The Dockerfile
+arrives as a schema-constrained argument rather than as prose we have to extract,
+because an extraction heuristic would sit between a model that just read
+attacker-controlled text and the gate that has to check it.
+
+Forced, still, once there is more than one tool. The choice widened from "call this
+tool" to "call one of these tools" so the model can look at the script before writing
+about it; what did not widen is the model's option to answer in prose instead. There
+is no path here that returns free text, so nothing downstream ever has to parse any.
+
+Conversations rather than single questions, for the same reason: a tool result has to
+go back to the model that asked for it. The transcript is `Answered` values, and each
+provider renders them into its own message shape. Nothing above this module has ever
+seen a provider's JSON and that does not change here.
 """
 
 from __future__ import annotations
@@ -11,7 +21,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, Sequence
 
 MAX_TOKENS = 16000
 PROVIDERS = ("anthropic", "openai", "groq")
@@ -128,15 +138,57 @@ class Call:
     asked for, and the trace has to record what actually answered."""
 
     arguments: dict[str, Any]
+    # Which tool was called. Meaningless when one tool was offered and the whole
+    # answer when several were, which is why it has no default: a provider that
+    # forgets to set it is a TypeError here rather than a caller reading a name
+    # that was never chosen.
+    name: str
+    # The provider's own id for this call, needed to pair a result back to it.
+    tool_use_id: str
     model: str
     input_tokens: int
     output_tokens: int
     request: dict[str, Any]
     response: dict[str, Any]
+    # The assistant turn exactly as the provider returned it, kept whole so a
+    # follow-up request can replay it verbatim.
+    #
+    # Kept rather than rebuilt from `arguments`, because a reconstruction can only
+    # contain the parts of a reply this code already models. Anything else the
+    # provider put in that turn is dropped silently, and the failure would appear as
+    # a 400 on the *next* request rather than on the one that lost it.
+    #
+    # Extended thinking is the concrete case, and it is a contingency here rather than
+    # a description of today: `build_request` sends no `thinking` parameter, so these
+    # requests do not have it on, and Anthropic documents forced tool choice as
+    # incompatible with it anyway. If that ever changes, a turn carrying thinking
+    # blocks has to go back with them, and this field already does the right thing.
+    # An earlier version of this comment asserted thinking was on by default and that
+    # the round trip depended on it. Neither was checked, and one review later neither
+    # is claimed.
+    #
+    # Opaque above this module. Only the provider that produced it reads it.
+    assistant: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class Answered:
+    """One tool call the model made, and the text we sent back for it.
+
+    The transcript is a list of these rather than a list of provider messages, so
+    the agent can hold a conversation without ever constructing one. What we sent
+    back is a plain string on purpose: it is a slice of the untrusted sample, and a
+    string is the only shape that cannot smuggle a role, an image or another tool
+    call into the next request.
+    """
+
+    call: Call
+    result: str
 
 
 class LLM(Protocol):
-    def call(self, system: str, user: str, tool: Tool) -> Call: ...
+    def call(self, system: str, user: str, tools: Sequence[Tool],
+             history: Sequence[Answered] = ()) -> Call: ...
 
 
 def validate(arguments: Any, tool: Tool) -> dict[str, Any]:
@@ -160,6 +212,26 @@ def validate(arguments: Any, tool: Tool) -> dict[str, Any]:
         if expected and not isinstance(value, expected):
             raise InvalidArguments(f"field {key!r} should be {declared}")
     return arguments
+
+
+def chosen(tools: Sequence[Tool], name: str, spent: tuple[int, int]) -> Tool:
+    """The tool the model named, or an unusable reply saying it named nothing we sent.
+
+    `tool_choice` forces a call to one of the tools in the request, so a name outside
+    that set is the provider not honouring its own constraint. An `LLMError` rather
+    than an exception, because that is the repairable family: asking again is a
+    reasonable response to a provider that answered off-menu once.
+
+    The point of checking is what happens next. The caller looks the arguments up
+    against the schema of the tool that was called, so a name we accepted without
+    matching would be validated against the wrong schema, or against none.
+    """
+    for tool in tools:
+        if tool.name == name:
+            return tool
+    offered = ", ".join(tool.name for tool in tools)
+    raise LLMError(f"the model called {name!r}, which was not offered. "
+                   f"Offered: {offered}", *spent)
 
 
 def _connection_errors() -> tuple[type[BaseException], ...]:
@@ -309,19 +381,40 @@ class AnthropicLLM:
                    for name in ("api_key", "auth_token", "credentials")):
             raise MissingKey("ANTHROPIC_API_KEY")
 
-    def build_request(self, system: str, user: str, tool: Tool) -> dict[str, Any]:
+    def build_request(self, system: str, user: str, tools: Sequence[Tool],
+                      history: Sequence[Answered] = ()) -> dict[str, Any]:
+        messages: list[dict[str, Any]] = [{"role": "user", "content": user}]
+        for answered in history:
+            messages.append(answered.call.assistant)
+            messages.append({"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": answered.call.tool_use_id,
+                "content": answered.result,
+            }]})
+        # One tool is still forced by name, so the request for a Dockerfile goes over
+        # the wire exactly as it did before any of this existed. Several tools become
+        # "any", which forces a call without saying which: that is the whole point,
+        # since choosing is what the model is here to do.
+        #
+        # `disable_parallel_tool_use` is not a preference. Two tool_use blocks in one
+        # reply means one of them never gets a tool_result, and Anthropic rejects the
+        # next request for exactly that. It would also be a silent hole in the cap:
+        # a reply carrying four reads costs one look.
+        choice: dict[str, Any] = ({"type": "tool", "name": tools[0].name}
+                                  if len(tools) == 1 else {"type": "any"})
+        choice["disable_parallel_tool_use"] = True
         return {
             "model": self.model,
             "max_tokens": MAX_TOKENS,
             "system": system,
-            "messages": [{"role": "user", "content": user}],
+            "messages": messages,
             "tools": [{
                 "name": tool.name,
                 "description": tool.description,
                 "strict": True,
                 "input_schema": tool.schema,
-            }],
-            "tool_choice": {"type": "tool", "name": tool.name},
+            } for tool in tools],
+            "tool_choice": choice,
         }
 
     @staticmethod
@@ -334,8 +427,9 @@ class AnthropicLLM:
             return 0, 0
         return getattr(usage, "input_tokens", 0), getattr(usage, "output_tokens", 0)
 
-    def call(self, system: str, user: str, tool: Tool) -> Call:
-        request = self.build_request(system, user, tool)
+    def call(self, system: str, user: str, tools: Sequence[Tool],
+             history: Sequence[Answered] = ()) -> Call:
+        request = self.build_request(system, user, tools, history)
         response = reachable(lambda: self._client.messages.create(**request))
         spent = self.tokens(response)
         if response.stop_reason == "refusal":
@@ -345,17 +439,28 @@ class AnthropicLLM:
                           input_tokens=spent[0], output_tokens=spent[1])
         if response.stop_reason == "max_tokens":
             raise Truncated(f"{self.model} hit {MAX_TOKENS} tokens", *spent)
-        # Thinking is adaptive by default, so the tool call is rarely content[0].
+        # Scanned rather than indexed, because a reply may carry blocks this code does
+        # not model and their order is the provider's business. An earlier comment here
+        # justified it with thinking being on by default; no `thinking` parameter is sent,
+        # so that was never true of these requests. Scanning is correct either way, which
+        # is why the line survived its own reason.
         block = next((b for b in response.content if b.type == "tool_use"), None)
         if block is None:
             raise LLMError(f"no tool_use block, stop_reason={response.stop_reason}", *spent)
+        body = response.model_dump(mode="json")
         return Call(
-            arguments=charge(validate, block.input, tool, spent),
+            arguments=charge(validate, block.input, chosen(tools, block.name, spent), spent),
+            name=block.name,
+            tool_use_id=block.id,
             model=response.model,
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
             request=request,
-            response=response.model_dump(mode="json"),
+            response=body,
+            # The content blocks as they arrived, thinking and all. Taken from the
+            # dump rather than rebuilt, so a block type this code has never heard of
+            # still survives the round trip.
+            assistant={"role": "assistant", "content": body["content"]},
         )
 
 
@@ -384,7 +489,7 @@ class OpenAICompatLLM:
             raise MissingKey(api_key_env)
         self._client = openai.OpenAI(base_url=base_url, api_key=key)
 
-    def build_request(self, system: str, user: str, tool: Tool) -> dict[str, Any]:
+    def _function(self, tool: Tool) -> dict[str, Any]:
         function: dict[str, Any] = {
             "name": tool.name,
             "description": tool.description,
@@ -392,8 +497,29 @@ class OpenAICompatLLM:
         }
         if self.strict:
             function["strict"] = True
+        return {"type": "function", "function": function}
+
+    def build_request(self, system: str, user: str, tools: Sequence[Tool],
+                      history: Sequence[Answered] = ()) -> dict[str, Any]:
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+        for answered in history:
+            messages.append(answered.call.assistant)
+            messages.append({"role": "tool",
+                             "tool_call_id": answered.call.tool_use_id,
+                             "content": answered.result})
+        # Named while there is one tool, "required" once there are several: the same
+        # two shapes the Anthropic path uses, under this wire format's own names.
+        choice: Any = ({"type": "function", "function": {"name": tools[0].name}}
+                       if len(tools) == 1 else "required")
         return {
             "model": self.model,
+            # One tool call per reply. Same reason as the Anthropic path: a second
+            # call in the same reply would go unanswered and be rejected on the next
+            # request, and it would let one look return four slices.
+            "parallel_tool_calls": False,
             # The same ceiling the Anthropic path sends. Without it the budget's
             # estimate is a guess about a limit that does not exist: `estimate` adds
             # MAX_TOKENS on the assumption a reply cannot exceed it, so one reply here
@@ -401,12 +527,9 @@ class OpenAICompatLLM:
             # gives `Truncated` something to fire on, which is otherwise unreachable
             # on this path.
             "max_completion_tokens": MAX_TOKENS,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "tools": [{"type": "function", "function": function}],
-            "tool_choice": {"type": "function", "function": {"name": tool.name}},
+            "messages": messages,
+            "tools": [self._function(tool) for tool in tools],
+            "tool_choice": choice,
         }
 
     @staticmethod
@@ -417,8 +540,9 @@ class OpenAICompatLLM:
             return 0, 0
         return getattr(usage, "prompt_tokens", 0), getattr(usage, "completion_tokens", 0)
 
-    def call(self, system: str, user: str, tool: Tool) -> Call:
-        request = self.build_request(system, user, tool)
+    def call(self, system: str, user: str, tools: Sequence[Tool],
+             history: Sequence[Answered] = ()) -> Call:
+        request = self.build_request(system, user, tools, history)
         response = reachable(lambda: self._client.chat.completions.create(**request))
         spent = self.tokens(response)
         choice = response.choices[0]
@@ -431,17 +555,28 @@ class OpenAICompatLLM:
         calls = choice.message.tool_calls or []
         if not calls:
             raise LLMError(f"no tool call, finish_reason={choice.finish_reason}", *spent)
+        made = calls[0]
         try:
-            arguments = json.loads(calls[0].function.arguments)
+            arguments = json.loads(made.function.arguments)
         except json.JSONDecodeError as exc:
             raise InvalidArguments(f"arguments were not JSON: {exc}", *spent) from exc
         return Call(
-            arguments=charge(validate, arguments, tool, spent),
+            arguments=charge(validate, arguments,
+                             chosen(tools, made.function.name, spent), spent),
+            name=made.function.name,
+            tool_use_id=made.id,
             model=response.model,
             input_tokens=response.usage.prompt_tokens,
             output_tokens=response.usage.completion_tokens,
             request=request,
             response=response.model_dump(mode="json"),
+            # Null fields dropped. The SDK's dump carries every optional key the
+            # schema has, and sending `"function_call": null` and `"audio": null`
+            # back is at best noise and at worst a 400 from a compatible provider
+            # that is stricter than OpenAI about keys it does not implement.
+            assistant={key: value
+                       for key, value in choice.message.model_dump(mode="json").items()
+                       if value is not None},
         )
 
 

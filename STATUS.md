@@ -9,20 +9,19 @@ decision log. This file is the record of how those got that way, including the p
 were wrong first. Nothing here is tidied after the fact: where a fix was the wrong shape,
 the wrong shape is still described, because that is the part worth reading.
 
-Updated 2026-08-30.
+Updated 2026-09-01.
 
 ## Where this is
 Built and tested: the sandbox that holds the untrusted script, the model layer, the
 deterministic gate every Dockerfile passes before a build, the repair loop, the workspace
 that is the only code here handling a path, the closed event vocabulary with its provenance
-labels, and the token budget.
+labels, the command line, and the two tools the model uses to read the part of a script it
+was not shown.
 
 Not built: the verdict and the trace. The command line reports what a script did and what
-it cost; nothing yet decides what that behaviour means. The model also has no tools: it
-reads the script once and writes a Dockerfile, which makes this a workflow with a feedback
-loop rather than an agent.
+it cost; nothing yet decides what that behaviour means.
 
-288 tests, 275 of which need neither Docker nor an API key. The rest skip
+334 tests, 321 of which need neither Docker nor an API key. The rest skip
 automatically when no daemon is present. Both suites run on every push
 and every pull request.
 
@@ -336,10 +335,17 @@ printed `ok` above exit 3.
 Pushback on how much of this project had grown around token accounting, and it was right.
 The whole module is gone.
 
-It could not fire. Seven calls is the worst a run can make, `max_attempts` caps it there,
-and seven worst-case calls estimate to 150,000 tokens against a 256,000 ceiling. Measured
-before deleting, not assumed. A ceiling that cannot be reached is not a bound, it is a
-comment with a runtime cost.
+It could not fire. Seven calls was the worst a run could make, `max_attempts` capped it
+there, and seven worst-case calls estimate to 150,000 tokens against a 256,000 ceiling.
+Measured before deleting, not assumed. A ceiling that cannot be reached is not a bound, it
+is a comment with a runtime cost.
+
+Past tense throughout, because the looking tools ended that arithmetic one change later:
+the worst case is sixteen calls and 320,000 tokens, past the same ceiling. The deletion
+still stands on `max_attempts`, which now caps looks as well as builds, but "it cannot
+fire" is no longer the reason. This paragraph was left in the present tense when ADR-015
+was corrected, and a review found it: adding the correction somewhere else in the file is
+not the same as retiring the false sentence.
 
 `can_investigate`, the half that held a reserve back for the producing call, was never
 called by anything. It was built for a tool loop that did not exist, on the argument that a
@@ -544,7 +550,11 @@ means the response had no tool call at all.
 
 `build_request` is a pure function on each provider, the same move as the sandbox's
 `build_argv`, so the invariants are tested with no network: `strict` is asked for on
-Anthropic and OpenAI, deliberately not on Groq, and `tool_choice` names the single tool.
+Anthropic and OpenAI, deliberately not on Groq, and `tool_choice` names the tool. It names
+it still, whenever one tool is offered, which is every request that asks for a Dockerfile.
+The looking tools later added the second shape, where several tools are offered and the
+choice becomes "any" rather than a name, and parallel calls are turned off on both
+providers so one reply is one tool call.
 
 Four decisions worth naming:
 
@@ -555,8 +565,11 @@ Four decisions worth naming:
 2. Groq reads `GROQ_API_KEY` and the key is passed explicitly. Handing the openai client a
    `None` key makes it fall back to `OPENAI_API_KEY`, which would send an OpenAI secret to
    Groq's servers and surface as a 401 from the wrong provider.
-3. The tool call is found by scanning `content`, never by index. Thinking is adaptive by
-   default on Sonnet 5, so the first block is usually a thinking block.
+3. The tool call is found by scanning `content`, never by index. Scanning is right
+   whatever a reply contains, which is the whole reason to scan. The justification first
+   written here, that thinking is adaptive by default and so the first block is usually a
+   thinking block, was never verified and is not claimed: no `thinking` parameter is sent
+   on these requests.
 4. `Call.model` is read off the response rather than copied from the request, so the trace
    records what actually answered.
 
@@ -930,7 +943,9 @@ has to honour it.
 
 A fifth provenance was considered and refused here. Docker's own words on `exec_failed` are the
 daemon quoting the model's ENTRYPOINT, so the untrusted author is the model and the daemon
-is not a separate one. `TOOL` exists and nothing emits it; the tool loop will.
+is not a separate one. `TOOL` existed here with nothing emitting it, which the looking
+tools later fixed: `looked` carries its slice as `TOOL` and `INPUT` together, because the
+frame is ours and every character inside it is the sample's.
 
 That held until the command line, which added `PROVIDER` for the provider's own error
 text. The reasoning above is why: the daemon quoting the model is not a separate author,
@@ -1146,3 +1161,306 @@ paths and `--index-url`, so a package can only arrive by name from the default i
 Beyond that, containment is the container, which is the `pip install` argument in general,
 and the real fix is the offline install after pre-resolution recorded in LATER.
 
+
+## The model can look at the script now, 2026-09-01
+
+The gap was arithmetic, and it had been in plain sight since the model layer was
+built. `SCRIPT_LIMIT` is 8,192 characters. Most source files here are longer than that, and so is
+the fixture this was built against: 16,980 characters, 8,788 of them replaced by a marker. On
+any real script the Dockerfile was being written from roughly the first and last quarter
+of a file.
+
+That is not a bound anyone can drop. The script is attacker-controlled text on its way into
+a prompt and it is resent on every repair. So the bound stays and the model gets to ask:
+`search_script` for a literal string, `read_script` for a region by character offset.
+
+**Why this passed the test for being a tool and the manifest did not.** Three questions:
+can the whole thing simply go in the prompt, can anything but the model choose, and does
+the choice change the outcome. Reading the middle of a truncated file fails the first
+(the bound is the answer), passes the second (which region matters differs per script)
+and passes the third. The dependency manifest fails the second outright. `requirements.txt`
+was gathered from the first commit, went into every build context, and was never once
+mentioned to the model: a file we had read, shipped to the daemon, and then asked the model
+to guess the contents of. It is a fifteen-line prompt fix, and wrapping it in a tool would
+have let the model decline to read a file we are certain it needs.
+
+**The cap is a security control, not a budget.** Four looks per attempt, 2,048 characters
+each. A model that asks for eight regions of a truncated script has reassembled the whole
+file one slice at a time, and the bound on how much of the sample reaches a prompt is gone
+without a single rule having been broken. With these two numbers a prompt holds at most
+twice `SCRIPT_LIMIT` of the script and never all of it. It is enforced by taking the tools
+out of the request rather than by telling the model to stop, because a rule written in a
+prompt is a request made of the thing the prompt is defending against.
+
+The arithmetic is stated over characters of the sample and not over the message, and the
+first version of the comment got that wrong: our frame around each slice is a couple of
+hundred characters more, and `bound` overshoots its own limit by the length of the marker
+it leaves. A test written to the sloppy version failed, which is the only reason the
+comment is now true.
+
+**Three decisions with reasons that are not taste.**
+
+Two tools rather than the one the plan called for. A strict schema requires every property
+in `required`, so one tool covering both modes would force the model to supply a character
+range while searching, or need an optional field typed as a union that our own validator
+skips without saying so. The grammar constraint is worth more than the tidier menu.
+
+The search pattern is a literal. It is chosen by a model that has just read
+attacker-controlled text, and `re` on a model-chosen pattern is catastrophic backtracking
+on the host doing the analysis, which is the one machine in this design not in a sandbox.
+There is no safe way to accept a regex here and no reason to want one.
+
+The assistant turn is stored exactly as the provider returned it rather than rebuilt from
+the parsed arguments, because a reconstruction carries only the parts of a reply this code
+models and loses the rest silently, one request before anything notices. The reason first
+written here was that thinking blocks are on by default and must be replayed. A review
+checked it: no `thinking` parameter is sent, so they are not on, and forced tool choice is
+documented as incompatible with them anyway. The decision survives its own justification,
+which is worth recording rather than quietly restating.
+
+**What the model still cannot do.** It chooses what to read. It does not choose whether an
+attempt is spent, whether the gate runs, whether anything is built, or how many attempts
+remain. A look continues the conversation and costs no attempt; the loop is unchanged.
+
+**The templates collapsed onto one context.** The truncation notice and the manifest have
+to appear on a repair as well as on a first ask, and three copies of a paragraph is the
+shape where the third copy goes missing. That shape is exactly what kept the manifest out
+of the prompt in the first place, so the fix and the cause are the same edit.
+
+`TOOL` finally has an emitter. `looked` carries its slice labelled `TOOL` and `INPUT`
+together: the frame is ours, every character inside it is the sample's, and one value
+could not have said that. `tool_capped` says out loud when the cap fires, because a bound
+that never appears in the output is a bound nobody audits.
+
+**The fixture, built before the fix and kept.** `examples/deep_dependency.py` is a 16,980
+character log analyser whose only third-party import sits at character 11,110, inside the
+8,788 characters `bound` discards, with the package named nowhere in the head or the tail.
+Without a look the container builds cleanly and dies at runtime with `ModuleNotFoundError`,
+which is terminal: the loop repairs build failures, and a script that ran and failed is a
+finding rather than something to retry.
+
+35 new tests, and every assertion in them was mutation-tested: the defect each one names
+was applied to the source and the suite confirmed red before the test was believed. Two of
+those mutations were wrong on the first pass, introducing a `NameError` rather than the
+defect they claimed, so they proved a variable existed and nothing more. Redone as the real
+defects, a per-run counter and a look that falls through into spending an attempt, they
+were killed by exactly the tests that name them.
+
+Two stale sentences were retired in the same change, both saying the `.env` allowlist holds
+four variable names. It holds three, and has since the token budget was deleted and took
+the fourth with it. Found by reading the invariant list while adding to it, which is the
+argument for reading a record rather than appending to it.
+
+### What the cold review changed, before this merged
+
+A reader who had not written the code, given the repository and told to falsify the
+claims rather than read them, broke the one that mattered most.
+
+**Invariant 24 was false as written, and the channel was the previous Dockerfile.**
+Everything untrusted is bounded on the way into a prompt, except that `previous` was not,
+and `previous` is not reset between attempts. A model that writes what it read into
+comment lines, which the gate permits, carries those slices into the next attempt and gets
+a fresh look budget on top of them. Reproduced before fixing: 25,326 characters of a
+40,000 character sample in one prompt, against a ceiling this repository claimed was
+16,384, and growing linearly with `max_attempts`. Bounding `previous` at 2,048 brings the
+same attack to 15,417.
+
+The shape of the mistake is worth more than the fix. Every individual rule held. Four
+looks per attempt, every slice bounded at the point of production, the tools withdrawn at
+the cap. The bound was defeated by a path nobody had counted as a path, which is the third
+time in this project that a rule checking the obvious channel missed the one beside it.
+
+**The test named after that invariant could not fail.** It summed the offsets the tools
+had printed about themselves and compared them to a constant, which reduced to
+`16384 <= 16384`. It would have stayed green throughout the attack above, and it did: the
+attack leaves all four looks correctly bounded. It now builds the real prompts and counts
+how much of a sample of unique tokens appears in them.
+
+**One mutant had survived.** Removing the bound in `look` left all 323 tests green.
+`read_region` and `search` each cap the sample they return, so the line looks redundant,
+and it is not: `search` echoes the model's own pattern, which is unbounded. A 300,000
+character pattern reached the prompt. Both this and the laundering fix were mutation
+tested afterwards and are killed by the tests that name them.
+
+**Two numbers written in the same change were already stale.** ADR-018 said ten of sixteen
+source files exceed the limit and that `agent.py` loses 18,866 characters. Both were true
+of the commit before this one: the change itself pushed `events.py` over the limit and grew
+`agent.py` by half again. A measurement written about a tree and not re-taken against the
+tree it ships in.
+
+Corrected once and stale again by the next commit, which is the actual lesson. The second
+review caught the recount too, because fixing the blocker had grown `agent.py` further. A
+number that moves whenever the file it describes is edited does not belong in a record, so
+both now measure `examples/deep_dependency.py`, which exists to be measured and is never
+edited.
+
+**ADR-015's premise expired one change after it was written.** The token budget was deleted
+because seven calls was the worst a run could make and could not approach the ceiling. The
+worst case is now sixteen calls, which clears that 256,000 ceiling on any per-call
+assumption worth making: 320,000 tokens on one and 348,000 on another. Sixteen and not the
+fifteen the formula gives, because a refusal spends no attempt and is therefore a free
+extra call. The first number here was derived and the second was driven, and only the
+driven one was right. The token total is the softer of the two claims, since it depends on
+an assumed input size per call, so the call count is what the argument should rest on.
+The deletion stands, because `max_attempts` is still the bound that holds and it now caps
+looks too, but "it cannot fire" is no longer the argument and the ADR says so.
+
+**A justification was asserted rather than checked.** The reason given for storing the
+provider's assistant turn verbatim was that thinking blocks are on by default and must be
+replayed. No `thinking` parameter is sent, so they are not on, and forced tool choice is
+documented as incompatible with them. Keeping the turn verbatim is still right, for the
+duller reason that a reconstruction silently drops whatever this code does not model. The
+decision survived; its stated reason did not, and replacing it was the point.
+
+**`examples/` shipped outside the leak test.** The guard globs `*.md`, `envforge/*.py` and
+`tests/*.py`, and its own docstring promises that a new record is covered the day it is
+added. That was true per file and false per directory. A fixture is exactly the file
+somebody pastes a real path or a real key into to make it realistic.
+
+Two findings were left out of the branch and recorded with triggers instead: the loop has
+no termination floor of its own and relies on the model layer refusing an unoffered tool
+name, and a look can end a run indirectly by growing a prompt past the context window.
+Neither is reachable with the providers that ship.
+
+### The second blocker: the fourth channel
+
+The same reviewer, given the fix, broke the restated invariant again. Bounding `previous`
+closed one channel and there was another beside it.
+
+`evidence` is set at four places. Three were bounded and the gate-rejection one was not,
+and the gate's rejection reason quotes the whole offending line back so the model can fix
+it. That line is written by the model. Measured: a single `WORKDIR` instruction carrying
+200,000 characters put 202,705 characters into one repair prompt. As a laundering channel
+it beat the restated ceiling too, at 24,160 characters of a 40,000 character sample against
+22,528, and the ceiling is not really the point: the channel was bounded only by the
+model's own output limit.
+
+The comment on one of the three bounded sites already recorded this exact failure, in
+those words, from a provider message. The same bug, on a different path, with its own
+post-mortem written six lines above it.
+
+Fixed in two places, and the source one is the real fix. The gate now caps the whole
+Dockerfile at 8KB and truncates what any reason quotes to 200 characters, which closes it
+where the string is created rather than at each place a reason is later used. That is the
+argument invariant 25 already makes about tool results, applied one module over.
+
+The consumption site is bounded too, and the reason is worth keeping. With the source cap
+in place a mutation removing the `evidence` bound survived the whole suite, because the
+shipped gate can no longer produce a long enough reason to notice. But `Gate` is a
+Protocol: the reason is whatever the installed gate returns, and the agent's guarantee
+about what enters a prompt must not depend on which gate someone wired in. The test that
+kills that mutation now supplies a deliberately wordy gate.
+
+That test was itself broken when first written, and passed nothing: the stub gate rejects
+every attempt, so the run exhausted a reply queue sized for the happy path and the test
+failed unconditionally. It was reported as killing all five mutations, which is the same
+error as a test that cannot fail, wearing the opposite mask. Caught by checking that it
+passed on a clean tree before believing what the sweep said about it.
+
+Four record errors from the same pass, all the same shape. A paragraph in this file still
+claimed in the present tense that seven calls is the worst a run can make, while the ADR
+saying otherwise had been corrected 940 lines away: adding the correction elsewhere is not
+retiring the false sentence. A comment in `agent.py` still said the attempt cap bounds
+model calls at roughly seven. The worst case was written as fifteen, from
+`max_attempts * (MAX_LOOKS + 1)`, and is sixteen, because a refusal spends no attempt and
+is a free call; the token figure beside it had been measured on sixteen, so the derivation
+and the measurement disagreed in the same sentence. And the recount of `agent.py`'s length
+was stale again by the next commit, because fixing the blocker grew the file.
+
+That last one is now fixed by not making the claim about a file that moves. Both records
+measure `examples/deep_dependency.py` instead, which exists to be measured and is never
+edited. A number that goes stale whenever someone edits the thing it describes is a
+promise to be wrong later.
+
+### The third pass, and one more test that could not fail
+
+Signed off. Four attacker shapes against invariant 24, all within the ceiling, and no
+fifth channel: every interpolation into a prompt is now bounded except the script's
+filename, which is held down by the filesystem's 255-byte component limit rather than by
+anything stated here. The manifest cannot accumulate, since those files are read once at
+ingestion and never rewritten by the loop, and the retry path is covered because the same
+bound catches both the unusable-reply message and the tool-name message.
+
+Two of the three follow-ups were done rather than deferred, and the reason is worth
+stating, because the standing rule is that non-blocking findings go to the deferred list
+and never into the branch.
+
+The first was a test written in this change that could not fail. The laundering fake on
+the gate-rejection path smuggled only the current attempt's slices, and `history` resets
+every attempt, so nothing accumulated: on a tree with all three caps removed it reached
+21,726 against a ceiling of 22,528 and passed. Within 3.5% of proving something, and
+proving nothing. Deferring that would mean shipping a test whose docstring claims a
+property it cannot check, which is the precise failure this project has already paid for
+more than once. The fake now banks across attempts, and the pre-fix tree was rebuilt to
+confirm it: seven tests red there, this one among them, and green here.
+
+That is the second time in one change that a new test had to be checked in both
+directions. The rule that came out of it: run a new test on the clean tree and on the
+broken tree, because green proves nothing on its own and red proves nothing on its own,
+and the two failure modes look identical from inside a mutation sweep.
+
+The second was `ARCHITECTURE.md` having no entry for the two gate caps. That file holds
+the invariants, the caps are a security control added at the source, and invariant 25 is
+the exact argument they were added on, so their absence was a record with something to say
+and not saying it. Invariant 28 now carries them, including why the gate's 8KB and the
+prompt's 2KB are deliberately different numbers answering different questions.
+
+The third, a guard for `bound` at limits below two, is deferred with a trigger. `half =
+limit // 2` is zero for a limit of one, and `text[-0:]` is the whole string, so the
+function returns its entire input instead of bounding it. Unreachable today because every
+limit in use is 2,048 or larger, and worth fixing the first time anyone passes a computed
+limit rather than a constant, because `bound` is the one function five separate limits and
+two invariants all rest on.
+
+One number was softened rather than corrected. The worst-case token total was written as a
+measurement and is a modelling choice: it depends on assumed input size per call, and the
+same sixteen calls give 320,000 or 348,000 depending on that assumption. The call count is
+the robust claim and the records now lean on it.
+
+### The first live run, and what it exposed
+
+The exit ticket was met on the first real run: the fixture fails on the previous commit
+with `ModuleNotFoundError`, and succeeds with the tools, same command, same file. The
+model installed `tabulate`, the script ran, exit 0.
+
+It passed on luck, and that is the more useful result.
+
+The model opened with `search_script("import")`, which is exactly the move the prompt asks
+for. The search returned nothing it did not already have. There are eleven matches; the
+tool showed the first five; all five sit between offsets 1318 and 1392, inside the 0-4096
+head the model had already been given. The match that mattered was the eleventh, at 11,110.
+
+So the look was wasted, and the model fell back to reading the middle in slices: three
+`read_script` calls, finding the dependency in the last one before the cap withdrew the
+tools. Had the dependency sat 1,000 characters further on, the run would have been capped
+without ever reaching it and the ticket would have failed.
+
+The cause is general rather than a property of this fixture. Imports cluster at the top of
+a Python file, so "show the first N matches" systematically returns the region the model
+has already read, for the most natural query in the most common language. The tool's own
+description told the model that search is usually the cheaper first move, which the
+evidence had just made false.
+
+Fixed by returning the offset of every match as a bare list of integers, plus windows for
+a few matches chosen spread across the file rather than taken from the front. Offsets are
+what `read_script` takes, so the model can now search once and read exactly where the
+search pointed. On the same query against the same fixture it now gets offset 11124 in the
+list and a window containing `from tabulate import tabulate`, in one look rather than four
+and a guess.
+
+Worth naming why this was fixed rather than deferred, since the standing rule sends
+non-blocking findings to the deferred list. This was not a suggestion from a reviewer, it
+was the acceptance run for the thing being built, and what it showed was the central
+capability failing its primary use case while a string in the code claimed otherwise. The
+deferred list is for ideas that are not this change; a defect in this change is this
+change's problem.
+
+The wider point: three review rounds found four real bugs and none of them found this one.
+Reviewers read the code and attacked the bounds. Only running it against a real model on a
+real file showed that the tool works and is nearly useless, which is a category a test
+suite is not built to notice.
+
+Confirmed on the next live run, which is the only way this kind of fix can be confirmed:
+`search_script("import")`, then one `read_script` at 10800 to 11300, then the Dockerfile.
+Two looks instead of four, three model calls instead of five, and 17,328 tokens against
+32,882. The search now points and the read goes there, which is what the tool was for.

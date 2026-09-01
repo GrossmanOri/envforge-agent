@@ -38,7 +38,10 @@ class Provenance(Enum):
     # controls if they control anything.
     INPUT = "input"
     MODEL = "model"
-    # A tool result. Nothing emits one yet; the tool loop will.
+    # A tool result: text this program produced by running a tool the model asked for.
+    # Always carried with whichever source the tool read from, because a tool result is
+    # a frame around somebody else's words. Today the only tools read the script, so
+    # every one of these is TOOL and INPUT together.
     TOOL = "tool"
     # The provider's own error text, which is neither the model's words nor a tool's.
     # Added rather than folding it into TOOL: overloading a value makes `authors()` lie
@@ -68,9 +71,9 @@ class Kind:
     authors: Mapping[str, frozenset[Provenance]]
 
 
-US, INPUT, MODEL, PROVIDER, CONTAINER = (
-    Provenance.US, Provenance.INPUT, Provenance.MODEL, Provenance.PROVIDER,
-    Provenance.CONTAINER)
+US, INPUT, MODEL, TOOL, PROVIDER, CONTAINER = (
+    Provenance.US, Provenance.INPUT, Provenance.MODEL, Provenance.TOOL,
+    Provenance.PROVIDER, Provenance.CONTAINER)
 
 # One rule the table applies without saying so on every line: a number we format into
 # our own sentence does not make whoever chose it an author. "build exited 137" is ours
@@ -102,6 +105,21 @@ VOCABULARY: dict[str, Kind] = {kind.name: kind for kind in (
           # model's. One value could not say that, which is why these are sets.
           call=(US, INPUT, MODEL),
           run_id=(US,)),
+    # The model asked to look at part of the script, and did.
+    _kind("looked", (US, MODEL),           # our sentence quoting the offsets or the
+                                           # pattern the model chose
+          tool=(MODEL,),                   # which of the two it called
+          call=(US, INPUT, MODEL),         # the wire bodies, as on `wrote`
+          # The slice itself. TOOL because this program produced it by running a tool,
+          # INPUT because every character inside our frame is the sample's own. The
+          # pair is the honest answer and one value could not give it: labelling this
+          # TOOL alone would tell a renderer the text is ours, and it is the most
+          # attacker-controlled string in the run.
+          result=(TOOL, INPUT),
+          run_id=(US,)),
+    # The look cap was reached and the tools were withdrawn. Ours entirely, and worth
+    # an event: a bound that is never visible in the output is a bound nobody audits.
+    _kind("tool_capped", (US,)),
     # The Dockerfile is the model's on every path but one: after two refusals the file
     # we wrote ourselves goes through the same gate and can be rejected there too.
     _kind("gate_rejected", (US, MODEL),    # our reason, quoting the line it refused
