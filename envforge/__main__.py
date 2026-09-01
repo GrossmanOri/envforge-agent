@@ -220,7 +220,8 @@ def report(outcome: Outcome) -> None:
     # "ok" above an exit code of 1. The person and the shell now agree.
     print(HEADLINE_FOR_KIND[outcome.kind], "-", printable(outcome.reason))
     print(f"attempts {outcome.attempts}, "
-          f"{outcome.usage.calls} model call(s), {outcome.usage.tokens} tokens")
+          f"{outcome.usage.calls} model call(s), {outcome.usage.looks} of them "
+          f"looking at the script, {outcome.usage.tokens} tokens")
     if outcome.used_fallback:
         print("the Dockerfile came from us, not from the model")
 

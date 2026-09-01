@@ -36,6 +36,12 @@ PUBLIC_DOCS = sorted(
         [p for p in ROOT.glob("*.md") if p.is_file()]
         + list((ROOT / "envforge").glob("*.py"))
         + list((ROOT / "tests").glob("*.py"))
+        # The sample scripts. They ship in the public repository like everything else,
+        # and a fixture is exactly the kind of file somebody pastes a real path or a
+        # real key into while making it realistic. Added the day `examples/` was, which
+        # is later than the docstring above promises: the glob was discovered per
+        # directory, so a new directory was not covered by it.
+        + list((ROOT / "examples").glob("*.py"))
     )
     # This file states the patterns, so it necessarily contains every one of them. It is
     # the only exemption, and it is named rather than pattern-matched so that adding a

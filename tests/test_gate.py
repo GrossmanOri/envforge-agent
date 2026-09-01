@@ -10,7 +10,7 @@ import json
 import pytest
 
 from envforge.agent import Agent, default_dockerfile
-from envforge.gate import RUN_COMMANDS, check
+from envforge.gate import MAX_DOCKERFILE, QUOTED_LINE, RUN_COMMANDS, check
 
 FILES = frozenset({"s.py"})
 BASE = "python:3.12-slim"
@@ -341,3 +341,36 @@ def test_a_gate_legal_dockerfile_builds_and_runs(tmp_path):
         assert result.exit_code == 0 and "flask" in result.stdout
     finally:
         sandbox.remove_image("envforge-test:gatelegal")
+
+
+# --- a rejection is repair evidence, so its size is a security property ----------------
+
+def test_a_dockerfile_far_larger_than_any_real_one_is_refused_without_quoting_it():
+    """The reason goes back to the model as repair evidence, so it enters the next
+    prompt. A reason that quoted an oversized file in order to complain about its size
+    would be the bug it is reporting."""
+    huge = "FROM python:3.12-slim\n" + "# padding\n" * 2000 + "CMD [\"python\"]\n"
+    reason = check(huge, "python:3.12-slim", frozenset({"s.py"}))
+    assert reason is not None
+    assert str(MAX_DOCKERFILE) in reason
+    assert "padding" not in reason
+
+
+def test_a_rejection_quotes_at_most_a_fixed_slice_of_the_offending_line():
+    """Every rejection names the line so the model can fix it, and that line was written
+    by a model that had just read an untrusted sample. Measured before the cap: a single
+    `WORKDIR` line put 200,000 characters into the next prompt."""
+    payload = "P" * 5000
+    reason = check(f"FROM python:3.12-slim\nWORKDIR {payload}\nCMD [\"python\"]\n",
+                   "python:3.12-slim", frozenset({"s.py"}))
+    assert reason is not None
+    assert len(reason) < QUOTED_LINE + 200
+    assert "more characters" in reason
+    assert payload not in reason
+
+
+def test_an_ordinary_rejection_still_quotes_its_line_whole():
+    """The cap must not cost the model the information it needs to repair."""
+    reason = check("FROM python:3.12-slim\nWORKDIR /app\nCMD [\"python\"]\n",
+                   "python:3.12-slim", frozenset({"s.py"}))
+    assert reason is not None and "'WORKDIR /app'" in reason

