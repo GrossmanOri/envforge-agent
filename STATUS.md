@@ -333,8 +333,8 @@ printed `ok` above exit 3.
 300 tests pass, 287 without a daemon.
 
 ## The token budget, deleted, 2026-09-01
-Ori pushed back on how much of this project had grown around token accounting, and he was
-right. The whole module is gone.
+Pushback on how much of this project had grown around token accounting, and it was right.
+The whole module is gone.
 
 It could not fire. Seven calls is the worst a run can make, `max_attempts` caps it there,
 and seven worst-case calls estimate to 150,000 tokens against a 256,000 ceiling. Measured
