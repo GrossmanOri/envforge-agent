@@ -516,12 +516,54 @@ def test_check_and_a_run_agree_about_every_status():
     do not retry" from a run and "provider unavailable, retry" from `--check`, for one
     event. They call the same function now, and this asserts they agree rather than
     trusting that they do."""
-    from envforge.llm import kind_for_status
-    for status in (400, 401, 402, 403, 404, 408, 409, 413, 422, 429, 451, 500, 529):
-        kind = kind_for_status(status, "")
-        from_run = EXIT_FOR_KIND["rejected" if kind == "rejected" else "unavailable"]
-        from_check = EXIT_BAD_REQUEST if kind == "rejected" else EXIT_UNAVAILABLE
-        assert from_run == from_check, status
+    import anthropic, httpx2 as httpx
+    import envforge.__main__ as module
+    from tests.test_agent import FakeSandbox
+
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+
+    def provider_error(status):
+        response = httpx.Response(status, request=request,
+                                  json={"error": {"type": "x", "message": "m"}})
+        return anthropic.APIStatusError("e", response=response, body=None)
+
+    class Listing:
+        """A client whose model listing raises, which is `--check`'s failure path."""
+        def __init__(self, exc): self._exc = exc
+        @property
+        def models(self):
+            exc = self._exc
+            return type("_M", (), {"list": lambda _s, *a, **k: (_ for _ in ()).throw(exc)})()
+
+    class Raising:
+        model = "fake"
+        def __init__(self, exc): self._client, self._exc = Listing(exc), exc
+        def call(self, *a, **k):
+            from envforge.llm import reachable
+            return reachable(lambda: (_ for _ in ()).throw(self._exc))
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as directory:
+        script = Path(directory) / "s.py"
+        script.write_text("print(1)\n")
+        for status in (400, 401, 402, 403, 404, 408, 409, 413, 422, 429, 451, 500, 529):
+            exc = provider_error(status)
+            llm = Raising(exc)
+            # Both entry points driven for real, not recomputed from one shared value.
+            # The previous version of this test derived each side from the same `kind`,
+            # so it asserted only that two constants matched, and it survived putting
+            # the exact bug back: `check_key` restricted to 400 alone left it green.
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(module, "load_env", lambda *a, **k: [])
+                patch.setattr(module, "make_llm", lambda spec: llm)
+                from_check = module.check_key("anthropic:m")
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(module, "load_env", lambda *a, **k: [])
+                patch.setattr(module, "daemon_error", lambda: None)
+                patch.setattr(module, "make_llm", lambda spec: llm)
+                patch.setattr(module, "DockerSandbox", lambda *a, **k: FakeSandbox())
+                from_run = module.main([str(script)])
+            assert from_check == from_run, f"status {status}: check {from_check}, run {from_run}"
 
 
 def test_an_empty_account_is_billing_and_not_our_bug():
@@ -565,3 +607,30 @@ def test_an_unreadable_script_is_not_a_traceback(tmp_path, capsys):
         assert "Traceback" not in capsys.readouterr().err
     finally:
         os.chmod(script, 0o644)
+
+
+def test_an_unreadable_or_undecodable_dotenv_does_not_crash(tmp_path, capsys):
+    """`load_env` runs before every handler in `main`, on both entry points.
+
+    An unreadable `.env` raised `PermissionError` and a UTF-16 one raised
+    `UnicodeDecodeError`, neither guarded, so a mis-permissioned config file produced a
+    raw traceback and exit 1, which this project defines as the script running and
+    failing. Under `--check` there is no script at all.
+
+    It is reported and survived rather than fatal: the file is optional, the environment
+    may still carry the key, and if it does not the run ends with the message that says
+    so rather than with a stack trace.
+    """
+    import os
+    target = tmp_path / ".env"
+
+    target.write_text("ANTHROPIC_API_KEY=x\n")
+    os.chmod(target, 0o000)
+    try:
+        assert load_env(tmp_path, environ={}) == []
+    finally:
+        os.chmod(target, 0o644)
+
+    target.write_bytes("ANTHROPIC_API_KEY=x\n".encode("utf-16"))
+    assert load_env(tmp_path, environ={}) == []
+    assert "ignoring" in capsys.readouterr().err

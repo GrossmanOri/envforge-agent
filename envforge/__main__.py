@@ -83,8 +83,22 @@ def load_env(root: Path | None = None, environ=None) -> list[str]:
         from dotenv import dotenv_values
     except ImportError:
         return []
+    try:
+        values = dotenv_values(path)
+    except (OSError, ValueError) as exc:
+        # A `.env` that exists and cannot be read: wrong permissions after a copy, or
+        # saved as UTF-16 by an editor. Both raised out of `main` before it had entered
+        # any handler, so a mis-permissioned config file produced a raw traceback and
+        # exit 1, which this project defines as the script running and failing. Under
+        # `--check` there is no script at all.
+        #
+        # Reported and survivable rather than fatal, because this file is optional by
+        # design: the environment may still carry the key, and if it does not, the run
+        # ends with the message that actually says so.
+        print(f"ignoring {printable(str(path))}: {printable(str(exc))}", file=sys.stderr)
+        return []
     applied = []
-    for name, value in dotenv_values(path).items():
+    for name, value in values.items():
         if name not in ENV_ALLOWED or value is None:
             continue
         if environ.get(name):          # already exported: the environment wins

@@ -22,7 +22,7 @@ it cost; nothing yet decides what that behaviour means. The model also has no to
 reads the script once and writes a Dockerfile, which makes this a workflow with a feedback
 loop rather than an agent.
 
-300 tests, 287 of which need neither Docker nor an API key. The rest skip
+301 tests, 288 of which need neither Docker nor an API key. The rest skip
 automatically when no daemon is present. Both suites run on every push
 and every pull request.
 
@@ -302,7 +302,14 @@ run against that mutation before it is believed.
 every 4xx while `--check` stayed on 400 alone, so a 422 was "our bug, do not retry" from a
 run and "provider unavailable, retry" from `--check`, for one event. The record already
 claimed they had been made to agree, which was true only for 400. The mapping is now one
-named function that both call, and a test asserts they agree across thirteen statuses.
+named function that both call.
+
+The test written for that was worthless and a seventh review proved it. It computed both
+sides from the same value, so it asserted that two constants matched, thirteen times, and
+it survived putting the exact bug back. The replacement drives `check_key` and `main` for
+real and compares what each returns, and it was run against that mutation before being
+believed. That last step is the difference between a test and a hope, and skipping it is
+how the previous two rounds shipped assertions that could not fail.
 
 **A blanket rule got a real case wrong.** 402 is Payment Required, which is an exhausted
 account and the same event as a 403 billing error. Sweeping every 4xx into `rejected` told
