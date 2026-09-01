@@ -22,7 +22,7 @@ it cost; nothing yet decides what that behaviour means. The model also has no to
 reads the script once and writes a Dockerfile, which makes this a workflow with a feedback
 loop rather than an agent.
 
-302 tests, 289 of which need neither Docker nor an API key. The rest skip
+288 tests, 275 of which need neither Docker nor an API key. The rest skip
 automatically when no daemon is present. Both suites run on every push
 and every pull request.
 
