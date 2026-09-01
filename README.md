@@ -49,23 +49,16 @@ input, the model, or the container. An engine that invents a kind fails when it 
 event rather than when someone later tries to read it. Nothing renders these yet, so the
 labels are recorded and not consumed.
 
-**The token budget**, `envforge/budget.py`. What the model may be paid for one run,
-counted in tokens rather than in turns, because every turn resends the ones before it. It
-sits alongside the attempt cap rather than replacing it, since an attempt costs a build and
-a container run, which tokens do not measure. Every reply is charged, including the
-refusals and truncations we cannot use, and a truncated reply is the most expensive kind
-there is.
-
 **The command line**, `envforge/__main__.py`. `python -m envforge script.py` takes a script
 and prints what it did, and `python -m envforge --check` verifies the API key without
 spending a call. The exit code separates what a caller must not confuse. `0` is a clean run and `1` is
 the script running and exiting nonzero, which is a finding about the sample. `3` through `7` are this
-tool being unable to do its job: no credentials or the model unreachable, the token budget
-spent, Docker unavailable, no Dockerfile that would build, or the provider refusing the
-request we sent, which is our bug rather than theirs. Those say nothing about the
+tool being unable to do its job: no credentials or the model unreachable, Docker
+unavailable, no Dockerfile that would build, or the provider refusing the request we sent,
+which is our bug rather than theirs. Those say nothing about the
 script and a caller should fix its setup rather than read a verdict into them.
 
-302 tests, 289 of which need neither Docker nor an API key. The rest skip
+288 tests, 275 of which need neither Docker nor an API key. The rest skip
 automatically when no daemon is present. Both suites run on every push
 and every pull request.
 

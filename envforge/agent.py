@@ -2,9 +2,8 @@
 
 Nothing here judges what the script did. It decides one thing only, over and over:
 is this failure something a rewritten Dockerfile could fix. A failure that a rewrite
-cannot fix must not spend an attempt, because an attempt is the scarcer of the two
-things a run can spend: it builds an image and runs a container, which no count of
-tokens measures. `budget.py` bounds the other one.
+cannot fix must not spend an attempt, because an attempt builds an image and runs a
+container, and three of them is the whole bound this loop has.
 
 The loop yields events instead of printing. The graph engine and the trace module
 both attach here, and a caller that wants a CLI can render them. What may be
@@ -19,8 +18,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Literal, Protocol, Sequence
 
-from .budget import Budget, Usage
-from .budget import DEFAULT as DEFAULT_BUDGET
 from .events import Event
 from .llm import (LLM, Call, InvalidArguments, LLMError, ProviderUnavailable,
                   Refused, Tool, Truncated)
@@ -180,11 +177,35 @@ Your most recent usable Dockerfile is above. Here is the latest problem:
 Write the complete corrected Dockerfile."""
 
 
+@dataclass(frozen=True)
+class Usage:
+    """What a run spent, as numbers rather than payloads.
+
+    `calls` counts requests sent to the model, including replies we could not use. Token
+    totals count every reply that reported a usage, a refusal and a truncation included:
+    a truncated reply consumed the whole output ceiling, which is what truncation means.
+
+    Accounting, not a limit. There was a `Budget` beside this that refused calls against a
+    token ceiling, and it was deleted on 2026-09-01 because it could not fire: seven calls
+    at their worst estimate to 150,000 tokens against a 256,000 ceiling, and `max_attempts`
+    already caps the loop at seven. Reporting what a run cost is worth keeping; enforcing a
+    second bound on a door the attempt cap already holds was not.
+    """
+
+    calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+    @property
+    def tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+
 # Every way a run can end. A closed set for the same reason the event vocabulary is one:
 # a caller switches on this, so an unlisted value is a caller reading a case it has never
 # handled.
 Kind = Literal["ran", "script_failed", "no_image", "failed", "build_timeout",
-               "budget", "unavailable", "rejected", "unsupported"]
+               "unavailable", "rejected", "unsupported"]
 
 
 @dataclass(frozen=True)
@@ -270,15 +291,12 @@ class Agent:
     without a gate is a loop that can build one unchecked."""
 
     def __init__(self, llm: LLM, sandbox: Sandbox, gate: Gate,
-                 max_attempts: int = 3, max_refusals: int = 1,
-                 budget: Budget = DEFAULT_BUDGET) -> None:
+                 max_attempts: int = 3, max_refusals: int = 1) -> None:
         self.llm, self.sandbox, self.gate = llm, sandbox, gate
         self.max_attempts, self.max_refusals = max_attempts, max_refusals
-        # Two currencies, two bounds. `max_attempts` bounds container work, since every
-        # attempt builds an image and runs it, and that cost is not measured in tokens.
-        # The budget bounds what the model is paid, which a count of attempts cannot
-        # bound at all once a single attempt can take many turns.
-        self.budget = budget
+        # `max_attempts` is the only bound, and the only one needed: every attempt
+        # builds an image and runs a container, and it caps the model calls at roughly
+        # seven as a side effect. A token ceiling used to sit beside it and never fired.
 
     @staticmethod
     def _prompt(language: str, name: str, text: str,
@@ -289,9 +307,7 @@ class Agent:
         A retry has no previous Dockerfile to carry, so it needs its own template:
         reusing FIRST would compute the evidence and then silently drop it.
 
-        Built separately from the call because the budget has to be asked about a
-        prompt before the prompt is sent, and the only honest estimate of a call's
-        cost is made from the text that call will carry.
+        Built separately from the call so the text is inspectable before it is sent.
         """
         if previous is not None:
             template = REPAIR          # there is a Dockerfile to correct
@@ -347,8 +363,8 @@ class Agent:
 
         def charge(reply: Call | LLMError) -> None:
             """Add what a reply cost to the ledger, whether we could use it or not.
-            A truncated reply burned the whole output ceiling; a budget that charged
-            only for successes could be walked past by a loop that never succeeds."""
+            A truncated reply burned the whole output ceiling, so a ledger that counted
+            only successes would under-report what a run actually cost."""
             nonlocal input_tokens, output_tokens
             input_tokens += reply.input_tokens
             output_tokens += reply.output_tokens
@@ -368,26 +384,6 @@ class Agent:
 
             while dockerfile is None:
                 user = self._prompt(language, script, text, previous, evidence)
-                if not self.budget.can_write(usage(), SYSTEM, user):
-                    # A spent budget ends the run. It used to fall back to the
-                    # Dockerfile we write ourselves, copying the shape of a second
-                    # refusal, and the two do not mean the same thing. A refusal is the
-                    # model judging the script, which is information about the script.
-                    # A spent budget is information about us: the ceiling was too low or
-                    # something looped. Building on it prints a verdict that no judgment
-                    # went into and calls it a success, and a report nobody can trust is
-                    # worse than no report. Ending here is also what allows the ceiling
-                    # to be set generously, since hitting it now means something went
-                    # wrong rather than that an allowance ran out.
-                    spent = usage()
-                    reason = (f"token budget exhausted: {spent.tokens} of "
-                              f"{self.budget.total} spent over {spent.calls} call(s), "
-                              f"and the next one needs room this run does not have")
-                    yield Event("budget_spent", reason)
-                    yield Event("finished", reason, {"outcome": Outcome(
-                        ok=False, kind="budget", reason=reason, attempts=attempt,
-                        usage=spent, refusals=refusals, run_id=run_id)})
-                    return
                 yield Event("asking", f"attempt {attempt}: asking for a Dockerfile")
                 calls += 1
                 try:
@@ -429,10 +425,9 @@ class Agent:
                     # Repairable, but by rewriting the reply rather than the image.
                     charge(exc)
                     yield Event("unusable_reply", str(exc))
-                    # Bounded like every other evidence path. This one was missed:
+                    # Bounded like every other evidence path. This one was missed, and
                     # a provider message carrying model-chosen text put 200,000
-                    # characters into the next prompt, which the budget's estimate
-                    # was nowhere near large enough to refuse.
+                    # characters into the next prompt.
                     evidence = bound(str(exc), EVIDENCE_LIMIT)
                     break
                 else:
