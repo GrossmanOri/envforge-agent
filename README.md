@@ -65,7 +65,7 @@ spent, Docker unavailable, no Dockerfile that would build, or the provider refus
 request we sent, which is our bug rather than theirs. Those say nothing about the
 script and a caller should fix its setup rather than read a verdict into them.
 
-301 tests, 288 of which need neither Docker nor an API key. The rest skip
+302 tests, 289 of which need neither Docker nor an API key. The rest skip
 automatically when no daemon is present. Both suites run on every push
 and every pull request.
 

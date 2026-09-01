@@ -564,6 +564,28 @@ def test_the_whole_loop_against_a_real_daemon(tmp_path):
     assert outcome.run.exit_code == 3 and "from inside" in outcome.run.stdout
 
 
+def test_a_build_timeout_buys_one_free_rebuild_and_no_model_call(script):
+    """The retry a timeout is worth, and the one it is not.
+
+    A cold base image can take longer to pull than the ceiling, and buildkit keeps the
+    layers it managed to pull, so the same Dockerfile often succeeds on a second try.
+    That is worth wall clock and nothing else. Asking the model again is not: it cannot
+    see a clock, so it rewrites the identical file, which is what happened when this
+    branch first ran for real.
+    """
+    llm = FakeLLM(_call(), _call(), _call())
+    timed = BuildResult(ok=False, image="", exit_code=None, log="", truncated=False,
+                        timed_out=True, seconds=300.0)
+    sandbox = FakeSandbox(builds=[timed, _build()])
+    events, kinds, outcome = drive(Agent(llm, sandbox, ALLOW), script)
+    assert kinds == ["asking", "wrote", "building", "build_failed",
+                     "building", "running", "finished"]
+    assert outcome.ok and outcome.kind == "ran"
+    assert len(llm.prompts) == 1              # rebuilt, never re-asked
+    assert len(sandbox.built) == 2            # and the second build is the same file
+    assert sandbox.built[0] == sandbox.built[1]
+
+
 def test_a_build_timeout_does_not_buy_a_repair(script):
     """Found by running the tool, not by reading it.
 
@@ -575,11 +597,14 @@ def test_a_build_timeout_does_not_buy_a_repair(script):
     not spend an attempt.
     """
     llm = FakeLLM(_call(), _call(), _call())
-    sandbox = FakeSandbox(builds=[BuildResult(
-        ok=False, image="", exit_code=None, log="", truncated=False,
-        timed_out=True, seconds=300.0)])
+    timed = BuildResult(ok=False, image="", exit_code=None, log="", truncated=False,
+                        timed_out=True, seconds=300.0)
+    # Twice: the free rebuild is offered once, and a Dockerfile that always times out
+    # must not buy a fresh one on every attempt.
+    sandbox = FakeSandbox(builds=[timed, timed])
     events, kinds, outcome = drive(Agent(llm, sandbox, ALLOW), script)
-    assert kinds == ["asking", "wrote", "building", "build_failed", "finished"]
+    assert kinds == ["asking", "wrote", "building", "build_failed",
+                     "building", "build_failed", "finished"]
     assert outcome.kind == "build_timeout" and not outcome.ok
     assert "timed out" in outcome.reason
     assert len(llm.prompts) == 1                 # one call, not three

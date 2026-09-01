@@ -292,7 +292,11 @@ and 402 keep theirs; everything else in the 4xx range falls here, because enumer
 statuses always misses the next one.
 `build_timeout` deliberately shares `6` with the other ways a run ends without a working
 image, because a caller's action is the same in all of them, which is to look at the build
-rather than to retry.
+rather than to retry. It is only reached after a second timeout: the first buys one rebuild
+of the identical Dockerfile, which costs wall clock and no tokens, because buildkit keeps
+the layers a cancelled pull managed to fetch and the retry starts warm. Asking the model
+again instead would be asking the wrong question at full price, since it cannot see a
+clock.
 
 The code is chosen from a typed `Outcome.kind` and never from the words in `reason`. A
 first version matched substrings, and `reason` splices in the gate's quoted line, which
