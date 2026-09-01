@@ -90,9 +90,6 @@ VOCABULARY: dict[str, Kind] = {kind.name: kind for kind in (
     _kind("refused", (US, MODEL),          # str(exc) quotes what the provider said
           reason=(MODEL,)),
     _kind("fell_back", (US,)),
-    # A count of tokens against a total, both of them ours. Terminal: a spent budget
-    # ends the run rather than falling back, so this is always followed by `finished`.
-    _kind("budget_spent", (US,)),
     # Our sentence wrapping what the provider's SDK said about why it refused us. Not
     # about the script at all: a dead key, an empty account, a rate limit.
     _kind("provider_unavailable", (US, PROVIDER),

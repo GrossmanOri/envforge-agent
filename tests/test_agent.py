@@ -13,7 +13,6 @@ from envforge.agent import (
     EVIDENCE_LIMIT, LANGUAGES, SCRIPT_LIMIT, Agent, Event, Outcome, Usage, bound,
     default_dockerfile, language_for,
 )
-from envforge.budget import Budget
 from envforge.llm import Call, InvalidArguments, ProviderUnavailable, Refused, Truncated
 from envforge.sandbox import BuildResult, DockerSandbox, Limits, RunResult
 from envforge.workspace import Files, gather
@@ -257,32 +256,6 @@ def test_two_refusals_fall_back_to_our_own_dockerfile(script):
     assert llm.queue == []                  # it was never asked a third time
 
 
-# --- the token budget ----------------------------------------------------------------
-
-def test_a_spent_budget_ends_the_run_rather_than_degrading_it(script):
-    """A spent budget is not a second refusal, and used to be treated as one.
-
-    A refusal is the model judging the script, which is information about the script
-    and a fair reason to fall back to a Dockerfile we wrote. A spent budget is
-    information about us: the ceiling was too low, or something looped. Building on it
-    prints a verdict that no judgment went into and labels it a success, and a report
-    nobody can trust is worse than no report.
-
-    Ending here is also what lets the ceiling be generous. Once hitting it means
-    something went wrong rather than that an allowance ran out, there is no reason to
-    keep it tight.
-    """
-    llm = FakeLLM(_call())
-    sandbox = FakeSandbox()
-    agent = Agent(llm, sandbox, ALLOW, budget=Budget(total=10, reserve=5))
-    events, kinds, outcome = drive(agent, script)
-    assert kinds == ["budget_spent", "finished"]
-    assert not outcome.ok and not outcome.used_fallback
-    assert "budget exhausted" in outcome.reason
-    assert sandbox.built == []                       # nothing was built on a spent budget
-    assert llm.prompts == []                         # and it was never asked at all
-
-
 def test_a_provider_we_cannot_reach_ends_the_run_and_never_falls_back(script):
     """A dead key is not a finding about the script.
 
@@ -324,17 +297,6 @@ def test_a_refusal_is_charged_too(script):
     llm = FakeLLM(Refused("no", reason="a", input_tokens=500, output_tokens=20), _call())
     events, kinds, outcome = drive(Agent(llm, FakeSandbox(), ALLOW), script)
     assert outcome.ok and outcome.usage.tokens == 500 + 20 + 2
-
-
-def test_one_run_does_not_spend_the_next_ones_budget(script):
-    """The budget is a policy and holds no counters, so an `Agent` built once and run
-    twice starts each run at zero. A mutable budget on the agent would let the first
-    run quietly bound the second."""
-    agent = Agent(FakeLLM(_call(), _call()), FakeSandbox(), ALLOW,
-                  budget=Budget(total=100_000, reserve=20_000))
-    first = drive(agent, script)[2]
-    second = drive(agent, script)[2]
-    assert first.usage == second.usage and second.ok
 
 
 def test_the_fallback_is_gated_like_everything_else(script):

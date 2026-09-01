@@ -22,8 +22,6 @@ from pathlib import Path
 from typing import Sequence
 
 from .agent import Agent, LANGUAGES, Outcome, language_for
-from .budget import DEFAULT as DEFAULT_BUDGET
-from .budget import Budget
 from .events import Event, Provenance
 from .gate import check
 from .llm import MissingKey, ProviderUnavailable, kind_for_status, make_llm
@@ -40,7 +38,6 @@ EXIT_OK = 0
 EXIT_RUN_FAILED = 1
 EXIT_USAGE = 2
 EXIT_UNAVAILABLE = 3
-EXIT_BUDGET = 4
 EXIT_NO_DOCKER = 5
 EXIT_NO_IMAGE = 6
 # Our own request was refused. Not the provider being down, so retrying is wrong.
@@ -52,7 +49,7 @@ EXIT_BAD_REQUEST = 7
 # is the one that matters, because setting it points the client at another server and
 # sends the key there, but no blocklist would have caught every equivalent.
 ENV_ALLOWED = frozenset({
-    "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY", "ENVFORGE_TOKEN_BUDGET",
+    "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY",
 })
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -70,7 +67,7 @@ def load_env(root: Path | None = None, environ=None) -> list[str]:
 
     Names are filtered as well as the path, because the file being ours is a weaker
     guarantee than it looks: it is edited by hand, copied between machines, and pasted
-    from instructions. Only credentials and our own budget setting get through.
+    from instructions. Only credentials get through.
 
     The process environment always wins, so an exported key beats the file and CI needs
     no file at all. Returns the names it set, so a caller can say so rather than having
@@ -266,7 +263,6 @@ HEADLINE_FOR_KIND = {
     "no_image": "FAILED",
     "build_timeout": "TIMED OUT",
     "failed": "FAILED",
-    "budget": "STOPPED",
     "unavailable": "STOPPED",
     "rejected": "OUR BUG",
     "unsupported": "REFUSED",
@@ -282,7 +278,6 @@ EXIT_FOR_KIND = {
     "build_timeout": EXIT_NO_IMAGE,
     "failed": EXIT_NO_IMAGE,
     "unsupported": EXIT_USAGE,
-    "budget": EXIT_BUDGET,
     "unavailable": EXIT_UNAVAILABLE,
     "rejected": EXIT_BAD_REQUEST,
 }
@@ -313,29 +308,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"default {DEFAULT_SPEC}")
     parser.add_argument("--language", choices=sorted(LANGUAGES),
                         help="override the language inferred from the extension")
-    parser.add_argument("--token-budget", type=int, metavar="N",
-                        help="total tokens one run may spend on the model. A safety "
-                             "limit rather than an allowance: the default is generous, "
-                             "so hitting it means something went wrong. Overrides "
-                             "ENVFORGE_TOKEN_BUDGET.")
     parser.add_argument("--arg", action="append", default=[], metavar="ARG",
                         help="an argument for the script, repeatable")
     return parser
-
-
-def budget_from(cli_value: int | None, environ) -> Budget:
-    """The ordinary precedence: an explicit flag, then the environment, then the
-    default. Only the total is exposed. The reserve is arithmetic about one worst-case
-    producing call and not a number anyone should have to reason about."""
-    raw = cli_value if cli_value is not None else environ.get("ENVFORGE_TOKEN_BUDGET")
-    if raw in (None, ""):
-        return DEFAULT_BUDGET
-    total = int(raw)
-    if total < DEFAULT_BUDGET.reserve:
-        raise ValueError(
-            f"a budget of {total} is below the {DEFAULT_BUDGET.reserve} reserved for the "
-            f"one call that has to produce a Dockerfile, so no run could finish")
-    return Budget(total=total, reserve=DEFAULT_BUDGET.reserve)
 
 
 def main(argv: Sequence[str] | None = None, environ=None) -> int:
@@ -361,12 +336,6 @@ def main(argv: Sequence[str] | None = None, environ=None) -> int:
         print(f"cannot tell what language {printable(args.script.name)} is. "
               f"Use --language.",
               file=sys.stderr)
-        return EXIT_USAGE
-
-    try:
-        budget = budget_from(args.token_budget, environ)
-    except ValueError as exc:
-        print(f"bad token budget: {exc}", file=sys.stderr)
         return EXIT_USAGE
 
     try:
@@ -402,7 +371,7 @@ def main(argv: Sequence[str] | None = None, environ=None) -> int:
         return EXIT_NO_DOCKER
 
     sandbox = DockerSandbox()
-    agent = Agent(llm, sandbox, check, budget=budget)
+    agent = Agent(llm, sandbox, check)
     outcome = None
     try:
         for event in agent.run(workspace, language, tuple(args.arg)):

@@ -66,9 +66,9 @@ same gate before any build.
 19. Every event an engine yields is one of a closed set, and every string it carries has
     its authors declared. An engine cannot invent a kind, and no record reaches a reader
     without saying whether we wrote it.
-20. A run that cannot reach the model, or that exhausts its token budget, ends with
-    `ok` false and never falls back to a Dockerfile we wrote. Neither is a finding about
-    the script, and a verdict no judgment went into must not be reported as a success.
+20. A run that cannot reach the model ends with `ok` false and never falls back to a
+    Dockerfile we wrote. It is not a finding about the script, and a verdict no judgment
+    went into must not be reported as a success.
 21. Configuration is never read from a directory the sample controls. The `.env` is read
     from the package's own directory only, and only four variable names are accepted from
     it, so a file shipped beside a sample can neither supply credentials nor redirect
@@ -199,38 +199,31 @@ Nothing reads the labels yet; the trace module will. They are written now becaus
 the code emitting an event knows who wrote the strings in it, so this is the one property
 that cannot be added afterwards.
 
-### ADR-015: the model spend is bounded in tokens, with a reserve
-Decided 2026-08-27. `envforge/budget.py`. A turn cap measures nothing, because every turn
-resends everything before it and the tenth costs several times the first. The bound is a
-token total instead, and `max_attempts` stays alongside it: an attempt builds an image and
-runs a container, which is a cost tokens do not measure, so the two currencies keep two
-bounds.
+### ADR-015: the token budget, and why it was deleted
+Decided 2026-08-27, reversed 2026-09-01. `envforge/budget.py` bounded model spend in tokens
+with a reserve held back for the call that has to produce a Dockerfile. The whole module is
+gone and this entry is kept as the record of a mistake rather than of a design.
 
-Part of the total is reserved and cannot be spent on investigation. The tool loop
-will read files before it writes anything, and a loop that spends its last token on one more
-file read has bought knowledge it can no longer use. `can_investigate` asks the question
-with the reserve held back and `can_write` asks it without; nothing calls the first until
-the tool loop lands, and it exists now because a loop written against a turn counter is a rewrite
-rather than an argument.
+It could not fire. Seven calls is the worst a run can make, `max_attempts` caps it there,
+and seven worst-case calls estimate to 150,000 tokens against a 256,000 ceiling. Measured
+before deleting it, not assumed. A second lock on a door the first lock already held.
 
-A spent budget ended the run as of 2026-08-30, and this paragraph used to say the
-opposite: that it fell back to the Dockerfile we write ourselves, the same shape as a
-second refusal. Invariant 20 and ADR-017 hold the current rule and the argument for it.
+`can_investigate`, the half that held the reserve back, was never called by anything. It
+was built for a tool loop that did not exist, on the argument that a loop written against a
+turn counter would be a rewrite later. That argument is how speculative code gets written:
+it is always cheaper to add the thing now, and the cost only shows up as the surface it
+drags behind it. This one cost an exit code, an `Outcome` kind, an event kind, a terminal
+path in the loop, a CLI flag, an environment variable and a share of seven review rounds,
+for 16 lines of logic wrapped in 65 lines of prose defending them.
 
-The estimate gates and the provider's numbers record. `estimate` errs high in both halves,
-a characters-per-token rate below the real one and a reply assumed to run to the output
-ceiling, so the loop stops one call early rather than one call late. An overestimate is
-never written into the ledger and refunded later, because that pessimism would compound
-until the budget was a turn cap under another name. The ceiling half holds on all three
-providers: Anthropic is sent `max_tokens` and the two OpenAI-compatible ones are sent
-`max_completion_tokens`, which both document as the replacement for the deprecated name.
-Until 2026-08-30 `OpenAICompatLLM` sent no ceiling at all, so on that path one reply could
-overshoot the whole budget before the next call was refused, and `Truncated` could never
-fire. A bound that holds on one provider out of three is not a bound.
+What replaces it is what was already there. `max_attempts` bounds container work and bounds
+model calls as a side effect. `Usage` stays, in `agent.py`, because reporting what a run
+cost is a feature and counting is not the same as enforcing. Account-level spend limits
+belong in the provider's console, which is where every other project puts them.
 
-`Budget` is frozen and holds no counters. An `Agent` is built once and may be run more
-than once, and a budget carrying its own spent total would let the first run bound the
-second.
+The lesson worth keeping is the order. The right time to build a bound is when something
+has run away, or when a measurement shows it could. Not when a future feature might want
+one.
 
 ### ADR-016: keys come from a .env, and a test guards the example
 Decided 2026-08-30, reversing the 2026-08-22 decision that the key is read from the
@@ -260,15 +253,14 @@ Decided 2026-08-30. `envforge/__main__.py`. `python -m envforge script.py` runs 
 end to end and `--check` verifies the key without spending a call. It is the first caller
 this project has had: everything under it was driven by tests until now.
 
-Two failures were fixed because a command line cannot ship with them, and both are the same
-mistake in different places. A run has to be able to say honestly that it failed.
+A failure was fixed because a command line cannot ship with it. A run has to be able to say
+honestly that it failed.
 
-A spent budget used to fall back to the Dockerfile we write ourselves, copying the shape of
-a second refusal. The two do not mean the same thing. A refusal is the model judging the
-script, which is information about the script. A spent budget is information about us, and
-building on it prints a verdict no judgment went into. It now ends the run. That is also
-what allows the ceiling to be generous, since hitting it then means something went wrong
-rather than that an allowance ran out.
+The other half of this entry described a spent token budget ending the run rather than
+falling back. The budget was deleted on 2026-09-01, see ADR-015, so that half is gone. The
+argument it rested on is still the right one and now applies only to an unreachable
+provider: a refusal is the model judging the script and a fair reason to fall back, while
+our own failure to work is not, and building on it prints a verdict no judgment went into.
 
 A provider failure was not caught at all. `AuthenticationError`, `PermissionDeniedError`
 and `RateLimitError` are none of the three `LLMError` types the loop handles, so each one
@@ -280,8 +272,8 @@ model access are the same status and only the provider's error type separates th
 
 The exit code carries the distinction to the shell. `1` is the script running and exiting
 nonzero, which is a result. `3` through `7` are this tool being unable to work: no provider
-or no credentials, no budget, no Docker, no Dockerfile that builds, and the provider
-refusing the request we sent. A caller that collapsed them would treat a dead key as a
+or no credentials, no Docker, no Dockerfile that builds, and the provider refusing the
+request we sent. A caller that collapsed them would treat a dead key as a
 verdict about the code it was given.
 
 `7` is ours rather than theirs, and it is the same event ADR-008 settled one layer down: a
@@ -304,10 +296,8 @@ carries the script's filename: a sample named "x could not be reached.py" produc
 code meaning "retry, the provider was down". `Kind` has no default, because the version
 that had one reported a failed run as a success on the single path that forgot to set it.
 
-Configuration is the environment first, then the project's own `.env`, with
-`--token-budget` and `ENVFORGE_TOKEN_BUDGET` for the total only. The reserve stays internal:
-it is arithmetic about one worst-case producing call, not a number anyone should have to
-reason about.
+Configuration is the environment first, then the project's own `.env`, which carries
+credentials and nothing else.
 
 The `.env` is read from the directory holding the package and never from the working
 directory, and only four variable names are accepted from it. Both rules exist because this

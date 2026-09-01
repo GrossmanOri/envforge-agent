@@ -12,14 +12,12 @@ from pathlib import Path
 import pytest
 
 from envforge.__main__ import (
-    EXIT_BUDGET, EXIT_NO_DOCKER, EXIT_OK, EXIT_RUN_FAILED, EXIT_UNAVAILABLE,
+    EXIT_NO_DOCKER, EXIT_OK, EXIT_RUN_FAILED, EXIT_UNAVAILABLE,
     EXIT_USAGE,
     EXIT_NO_IMAGE, EXIT_BAD_REQUEST, EXIT_FOR_KIND, HEADLINE_FOR_KIND,
-    budget_from, exit_code_for, load_env, main, printable, render, report,
+    exit_code_for, load_env, main, printable, render, report,
 )
 from envforge.agent import Outcome, Usage
-from envforge.budget import DEFAULT as DEFAULT_BUDGET
-from envforge.budget import Budget
 from envforge.events import Event
 from envforge.sandbox import RunResult
 
@@ -28,7 +26,7 @@ from envforge.sandbox import RunResult
 
 def test_a_script_that_ran_and_failed_is_not_the_same_as_this_tool_failing():
     """The distinction the exit code exists for. A script exiting nonzero is a finding:
-    the tool worked and the news is bad. A budget or a dead provider is this tool being
+    the tool worked and the news is bad. A dead provider is this tool being
     unable to do its job, and a caller should fix its setup rather than read anything
     into the result."""
     assert exit_code_for(Outcome(ok=True, kind="ran", reason="")) == EXIT_OK
@@ -36,12 +34,10 @@ def test_a_script_that_ran_and_failed_is_not_the_same_as_this_tool_failing():
     # path started distinguishing it, so every failing script used to report 0.
     assert exit_code_for(Outcome(ok=True, kind="script_failed", reason="")) == EXIT_RUN_FAILED
     assert exit_code_for(Outcome(ok=False, kind="no_image", reason="")) == EXIT_NO_IMAGE
-    assert exit_code_for(Outcome(ok=False, kind="budget", reason="")) == EXIT_BUDGET
     assert exit_code_for(Outcome(ok=False, kind="unavailable", reason="")) == EXIT_UNAVAILABLE
     # All of them are distinct, which is the property a caller depends on.
     assert len({EXIT_OK, EXIT_RUN_FAILED, EXIT_USAGE, EXIT_UNAVAILABLE,
-                EXIT_BUDGET, EXIT_NO_DOCKER, EXIT_NO_IMAGE,
-                EXIT_BAD_REQUEST}) == 8
+                EXIT_NO_DOCKER, EXIT_NO_IMAGE, EXIT_BAD_REQUEST}) == 7
 
 
 def test_every_kind_has_an_exit_code():
@@ -74,7 +70,6 @@ def test_the_kind_comes_from_the_agent_and_not_from_a_literal_in_this_file():
     the shell learns while every test still passed. This drives the real loop to each
     terminal state and asserts the code the shell would actually get."""
     from envforge.agent import Agent
-    from envforge.budget import Budget
     from envforge.llm import ProviderUnavailable
     from tests.test_agent import ALLOW, FakeLLM, FakeSandbox, _call
 
@@ -88,13 +83,10 @@ def test_the_kind_comes_from_the_agent_and_not_from_a_literal_in_this_file():
         def last(agent):
             return list(agent.run(workspace, "python"))[-1].data["outcome"]
 
-        spent = last(Agent(FakeLLM(_call()), FakeSandbox(), ALLOW,
-                           budget=Budget(total=10, reserve=5)))
         gone = last(Agent(FakeLLM(ProviderUnavailable("401", kind="auth")),
                           FakeSandbox(), ALLOW))
         ran = last(Agent(FakeLLM(_call()), FakeSandbox(), ALLOW))
 
-    assert exit_code_for(spent) == EXIT_BUDGET and spent.kind == "budget"
     assert exit_code_for(gone) == EXIT_UNAVAILABLE and gone.kind == "unavailable"
     assert exit_code_for(ran) == EXIT_OK and ran.kind == "ran"
 
@@ -117,29 +109,6 @@ def test_a_bad_provider_spec_is_refused_before_anything_is_built(tmp_path, capsy
     script.write_text("print(1)\n")
     assert main([str(script), "--model", "nonsense"]) == EXIT_USAGE
     assert "provider:model" in capsys.readouterr().err
-
-
-# --- the budget, and what a person is allowed to set ----------------------------------
-
-def test_the_budget_takes_the_flag_then_the_environment_then_the_default():
-    assert budget_from(None, {}) is DEFAULT_BUDGET
-    assert budget_from(None, {"ENVFORGE_TOKEN_BUDGET": "90000"}).total == 90_000
-    # An explicit flag beats the environment, which is the ordinary precedence.
-    assert budget_from(70_000, {"ENVFORGE_TOKEN_BUDGET": "90000"}).total == 70_000
-    assert budget_from(None, {"ENVFORGE_TOKEN_BUDGET": ""}) is DEFAULT_BUDGET
-
-
-def test_only_the_total_is_exposed_and_the_reserve_is_derived():
-    """The reserve is arithmetic about one worst-case producing call, not a number
-    anyone should have to reason about, so it is never a flag."""
-    assert budget_from(90_000, {}).reserve == DEFAULT_BUDGET.reserve
-
-
-def test_a_budget_too_small_to_finish_is_refused_rather_than_accepted():
-    """Accepting it would produce a run that spends money and then always reports the
-    budget exhausted, which looks like a bug in the tool rather than a bad setting."""
-    with pytest.raises(ValueError, match="below the"):
-        budget_from(DEFAULT_BUDGET.reserve - 1, {})
 
 
 # --- who wrote the line -----------------------------------------------------------------
@@ -583,13 +552,13 @@ def test_every_headline_and_exit_value_is_asserted_not_only_the_keys():
     same commit says it deliberately shares 6."""
     assert HEADLINE_FOR_KIND == {
         "ran": "ok", "script_failed": "the script FAILED", "no_image": "FAILED",
-        "failed": "FAILED", "build_timeout": "TIMED OUT", "budget": "STOPPED",
+        "failed": "FAILED", "build_timeout": "TIMED OUT",
         "unavailable": "STOPPED", "rejected": "OUR BUG", "unsupported": "REFUSED",
     }
     assert EXIT_FOR_KIND == {
         "ran": EXIT_OK, "script_failed": EXIT_RUN_FAILED, "no_image": EXIT_NO_IMAGE,
         "failed": EXIT_NO_IMAGE, "build_timeout": EXIT_NO_IMAGE,
-        "unsupported": EXIT_USAGE, "budget": EXIT_BUDGET,
+        "unsupported": EXIT_USAGE,
         "unavailable": EXIT_UNAVAILABLE, "rejected": EXIT_BAD_REQUEST,
     }
 

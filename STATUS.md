@@ -332,6 +332,38 @@ printed `ok` above exit 3.
 
 300 tests pass, 287 without a daemon.
 
+## The token budget, deleted, 2026-09-01
+Ori pushed back on how much of this project had grown around token accounting, and he was
+right. The whole module is gone.
+
+It could not fire. Seven calls is the worst a run can make, `max_attempts` caps it there,
+and seven worst-case calls estimate to 150,000 tokens against a 256,000 ceiling. Measured
+before deleting, not assumed. A ceiling that cannot be reached is not a bound, it is a
+comment with a runtime cost.
+
+`can_investigate`, the half that held a reserve back for the producing call, was never
+called by anything. It was built for a tool loop that did not exist, on the argument that a
+loop written against a turn counter would be a rewrite later. That argument is exactly how
+speculative code gets in: adding it now is always cheap, and the price arrives later as
+surface. This one cost an exit code, an `Outcome` kind, an event kind, a terminal path in
+the loop, a CLI flag, an environment variable and a share of seven review rounds, to hold
+16 lines of logic inside 65 lines of prose defending them.
+
+265 lines came out across seven files and nothing that ever ran was lost.
+
+What checking the industry showed. The norm for a small agentic CLI is an iteration cap,
+which this already had: LangChain defaults to fifteen, LangGraph to a recursion limit of
+twenty-five. The sharper advice is a no-progress guard that halts when the same tool and
+error repeat, since step caps fire after the money is spent. Cost control belongs at the
+account, and Anthropic's console carries organisation and per-workspace monthly limits, set
+comfortably above normal spend so they never trip. One setting in a web console against 107
+lines in a repository.
+
+`Usage` survives, moved into `agent.py`. Counting what a run cost is a feature and the
+report prints it. Counting is not enforcing, and conflating the two is what produced the
+module.
+
+287 tests pass.
 ## The free rebuild a timeout is worth, 2026-08-31
 The seventh review argued for this and it went to the backlog rather than into a branch
 that had been blocked five times. Taken up now that the command line has merged.
