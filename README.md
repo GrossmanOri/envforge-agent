@@ -38,8 +38,10 @@ does not do is stated plainly: `pip install <name>` runs that package's own code
 time, and no instruction allowlist can prevent that, because installing packages is the
 product.
 
-**The agent**, `envforge/graph.py`. A LangGraph `StateGraph` and the only engine there
-is. Nodes ask the model, answer its questions about the script, gate the Dockerfile, build
+**The agent**, `envforge/graph.py`. A LangGraph `StateGraph`, and the engine everything
+new is built on. The `while` loop it replaces is still in `envforge/agent.py` and still
+what `python -m envforge` drives, because the command line has not been ported yet; that
+is the next piece of work and it is said here rather than implied. Nodes ask the model, answer its questions about the script, gate the Dockerfile, build
 it and run it. Each node reads the state, does one thing, and returns the fields it
 changed, so what a node did to a run is exactly the dict it returned.
 
@@ -106,7 +108,7 @@ What the model does not get is any influence over the loop. It chooses what to r
 does not choose whether an attempt is spent, whether the gate runs, or whether anything is
 built.
 
-387 tests, 371 of which need neither Docker nor an API key. The rest skip
+404 tests, 388 of which need neither Docker nor an API key. The rest skip
 automatically when no daemon is present. Both suites run on every push
 and every pull request.
 

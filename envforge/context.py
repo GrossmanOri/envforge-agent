@@ -37,8 +37,9 @@ class Context:
     sandbox: Any = None
     emit: Callable[[Event], None] = field(default=_discard)
     # Whether a container of this name is still on the host. The replay guard: `run`
-    # removes its container unconditionally, so one that survived was left by a process
-    # that died, which is how a resumed run learns the sample already ran. In context
+    # kills its container and leaves it, and removal happens only once the result is
+    # durable, so one that survived was left by a process that died, which is how a
+    # resumed run learns the sample already ran. In context
     # rather than imported directly by the node, so a test can answer it without Docker.
     exists: Callable[[str], bool] = field(default=lambda name: False)
     # Remove a container once its result is durable. Called from the node *after* the

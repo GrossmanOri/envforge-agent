@@ -90,6 +90,16 @@ def _ran(exit_code=0, stdout="", stderr="", start_error="", timed_out=False):
                      timed_out=timed_out, seconds=0.1, start_error=start_error)
 
 
+def _offline():
+    """The host lookups, answered without a daemon.
+
+    A graph test should not need docker, and these three are the only calls in the
+    engine that reach for it.
+    """
+    return {"exists": lambda name: False, "remove": lambda name: None,
+            "sweeper": lambda keep="", older_than=3600.0: []}
+
+
 def _workspace(text=None):
     """A gathered workspace, without touching disk twice."""
     from envforge.workspace import Files
@@ -404,8 +414,8 @@ def test_a_replayed_run_refuses_to_execute_the_sample_twice():
     A checkpoint is written after a node returns, so a crash between the container
     exiting and the checkpoint committing makes LangGraph replay the run node. The state
     cannot help, because the state is exactly what was not saved. The container is the
-    evidence: `run` removes it unconditionally, so one still bearing this attempt's name
-    was left by a process that died.
+    evidence: `run` kills it and leaves it, and removal waits until the result is
+    durable, so one still bearing this attempt's name was left by a process that died.
     """
     events = []
     sandbox = FakeSandbox()
@@ -648,7 +658,7 @@ def test_a_run_removes_the_images_it_built_whatever_happened():
 
     workspace = _workspace()
     sandbox = Recording(builds=[_build(ok=False, exit_code=1, log="boom"), _build()])
-    agent = Agent(FakeModel(submits(), submits()), sandbox, ALLOW)
+    agent = Agent(FakeModel(submits(), submits()), sandbox, ALLOW, **_offline())
     list(agent.run(workspace, "python"))
     assert sandbox.removed == sandbox.built_tags
     assert len(sandbox.removed) == 2                # one per attempt, both gone
@@ -669,7 +679,7 @@ def test_an_exception_mid_run_still_removes_the_images():
             self.removed.append(tag)
 
     sandbox = Exploding()
-    agent = Agent(FakeModel(submits()), sandbox, ALLOW)
+    agent = Agent(FakeModel(submits()), sandbox, ALLOW, **_offline())
     with pytest.raises(OSError):
         list(agent.run(_workspace(), "python"))
     assert sandbox.removed == sandbox.built_tags != []
@@ -690,7 +700,8 @@ def test_a_run_removes_only_its_own_images():
 
     sandbox = Recording()
     sandbox.built_tags.append("envforge-someoneelse:attempt1")
-    list(Agent(FakeModel(submits()), sandbox, ALLOW).run(_workspace(), "python"))
+    list(Agent(FakeModel(submits()), sandbox, ALLOW,
+               **_offline()).run(_workspace(), "python"))
     assert "envforge-someoneelse:attempt1" not in sandbox.removed
     assert len(sandbox.removed) == 1
 
@@ -715,9 +726,205 @@ def test_every_image_and_container_carries_the_run_label():
             return super().run(image, args, name=name)
 
     sandbox = Watching()
-    list(Agent(FakeModel(submits()), sandbox, ALLOW).run(_workspace(), "python"))
+    list(Agent(FakeModel(submits()), sandbox, ALLOW,
+               **_offline()).run(_workspace(), "python"))
     assert [kind for kind, _ in sandbox.labels] == ["image", "container"]
     runs = {labels[RUN_LABEL] for _, labels in sandbox.labels}
     assert len(runs) == 1 and len(runs.pop()) == 32          # one run id, a uuid4 hex
     for _, labels in sandbox.labels:
         assert int(labels[STARTED_LABEL]) > 0
+
+
+# --- the engine actually produces events ----------------------------------------------
+
+def test_the_engine_yields_the_events_it_produces():
+    """The whole point of the object, and it did none of it.
+
+    `Agent.run` collected events into a list nothing read and streamed with
+    `stream_mode="custom"`, which yields only what a node writes through LangGraph's
+    writer. No node did, so the only engine in the project produced nothing at all: no
+    verdict, no `finished`, nothing. Four tests drove that generator and every one of
+    them asserted on the sandbox instead of on what came out.
+    """
+    from envforge.graph import Agent
+
+    events = list(Agent(FakeModel(submits()), FakeSandbox(), ALLOW,
+                        **_offline()).run(_workspace(), "python"))
+    assert [e.kind for e in events] == ["asking", "wrote", "building", "running",
+                                        "finished"]
+    outcome = events[-1].data["outcome"]
+    assert outcome.ok and outcome.kind == "ran"
+
+
+def test_the_engine_yields_a_look_and_a_repair_too():
+    from envforge.graph import Agent
+
+    sandbox = FakeSandbox(builds=[_build(ok=False, exit_code=1, log="boom"), _build()])
+    events = list(Agent(FakeModel(looks_at(), submits(), submits()), sandbox, ALLOW,
+                        **_offline()).run(_workspace(), "python"))
+    kinds = [e.kind for e in events]
+    assert kinds.count("looked") == 1 and kinds.count("building") == 2
+    assert kinds[-1] == "finished" and events[-1].data["outcome"].attempts == 2
+
+
+def test_the_engine_says_what_it_swept():
+    from envforge.graph import Agent
+
+    offline = {**_offline(),
+               "sweeper": lambda keep="", older_than=3600.0: ["image abc from run def"]}
+    events = list(Agent(FakeModel(submits()), FakeSandbox(), ALLOW,
+                        **offline).run(_workspace(), "python"))
+    assert events[0].kind == "swept" and "abc" in events[0].message
+
+
+# --- the message reset, measured rather than described ---------------------------------
+
+def test_repair_messages_do_not_accumulate_across_attempts():
+    """Each attempt carries one repair message, not one per attempt so far.
+
+    `new_attempt` kept "the leading run of system and human messages", and the repair
+    message it appends is itself a HumanMessage, so on the next attempt it had joined
+    that run and was never removed again. The bound invariant 24 states became linear in
+    `max_attempts` instead of constant: at twelve attempts a review measured 24,876
+    characters of the sample in one prompt against a ceiling of 22,528.
+    """
+    from envforge.graph import Agent
+
+    model = FakeModel(*[submits(f"FROM python:3.12-slim\nRUN nope{i}\n")
+                        for i in range(6)])
+    sandbox = FakeSandbox(builds=[_build(ok=False, exit_code=1, log="boom")] * 6)
+    list(Agent(model, sandbox, ALLOW, max_attempts=6,
+               **_offline()).run(_workspace(), "python"))
+
+    for sent in model.seen_messages:
+        repairs = [m for m in sent
+                   if isinstance(m, HumanMessage) and "did not work" in m.content]
+        assert len(repairs) <= 1, f"{len(repairs)} repair messages in one prompt"
+    # And the opening pair is never removed, or the model loses the script itself.
+    for sent in model.seen_messages:
+        assert isinstance(sent[0], SystemMessage) and isinstance(sent[1], HumanMessage)
+
+
+def test_the_ceiling_holds_when_every_attempt_reads_somewhere_new():
+    """The laundering attack with distinct slices per attempt.
+
+    The version of this that shipped recycled the same slices every attempt, so the
+    unique-token count could not grow and it passed against a design where it should
+    not have.
+    """
+    from envforge.agent import DOCKERFILE_LIMIT, EVIDENCE_LIMIT, SCRIPT_LIMIT
+    from envforge.graph import Agent
+    from envforge.tools import SLICE_LIMIT
+
+    tokens = [f"tok{i:06d}" for i in range(6000)]
+    script = "\n".join(tokens)
+
+    class Fresh(FakeModel):
+        """Reads a region nobody has read yet, then hides it in comments."""
+
+        def __init__(self):
+            super().__init__()
+            self.carried, self.reads = [], 0
+
+        def invoke(self, messages):
+            self.seen_messages.append(list(messages))
+            looked = sum(1 for m in messages if isinstance(m, ToolMessage))
+            if self.offered[-1] != ["submit_dockerfile"] and looked < MAX_LOOKS:
+                start = self.reads * SLICE_LIMIT
+                self.reads += 1
+                return looks_at(name="read_script", start=start,
+                                end=start + SLICE_LIMIT)
+            self.carried += [m.content.replace("\n", " ") for m in messages
+                             if isinstance(m, ToolMessage)]
+            comments = "\n".join(f"# {c}" for c in self.carried)
+            return submits(f"FROM python:3.12-slim\n{comments}\n"
+                           f'COPY s.py /app/s.py\nCMD ["python", "/app/s.py"]\n')
+
+    model = Fresh()
+    sandbox = FakeSandbox(builds=[_build(ok=False, exit_code=1, log="boom")] * 12)
+    list(Agent(model, sandbox, ALLOW, max_attempts=12,
+               **_offline()).run(_workspace(script), "python"))
+
+    ceiling = SCRIPT_LIMIT + MAX_LOOKS * SLICE_LIMIT + DOCKERFILE_LIMIT + EVIDENCE_LIMIT
+    worst = 0
+    for sent in model.seen_messages:
+        whole = "".join(str(m.content) for m in sent)
+        worst = max(worst, sum(len(t) for t in tokens if t in whole))
+    assert worst <= ceiling, f"{worst} characters of the sample in one prompt"
+
+
+# --- the cap is the graph's rule, not the provider's -----------------------------------
+
+def test_a_model_that_ignores_the_withdrawn_tool_is_not_served():
+    """Withdrawing a tool from the request should make it uncallable, and that is a rule
+    the provider enforces rather than us. A fake that names an inspection tool anyway was
+    served it, took 3,332 looks past the cap and reassembled the whole script."""
+    class Stubborn(FakeModel):
+        def invoke(self, messages):
+            self.seen_messages.append(list(messages))
+            return looks_at(name="read_script", start=0, end=100)
+
+    events = []
+    final = run(Stubborn(), events=events, max_attempts=1)
+    assert final["seen"] == MAX_LOOKS               # not one more, whatever it asked for
+    assert [e.kind for e in events].count("looked") == MAX_LOOKS
+    assert outcome_of(events).kind == "no_image"    # it ran out of attempts, not looks
+
+
+def test_the_tool_node_holds_only_the_read_only_tools():
+    """The wiring invariant 23 rests on. Adding the submission to this node would put the
+    daemon one model call away, and nothing pinned it."""
+    from envforge.graph import build_graph
+
+    compiled = build_graph("print(1)")
+    node = compiled.nodes["inspect"]
+    names = {t.name for t in node.bound.tools_by_name.values()}
+    assert names == {"read_script", "search_script"}
+    assert "submit_dockerfile" not in names
+
+
+# --- provider failures ------------------------------------------------------------------
+
+class Dead(Exception):
+    """An SDK exception, in the shape LangChain passes through."""
+
+    def __init__(self, message, status_code, type_=""):
+        super().__init__(message)
+        self.status_code, self.type = status_code, type_
+
+
+@pytest.mark.parametrize("status, reported, kind", [
+    (401, "", "auth"),
+    (402, "", "billing"),
+    (403, "billing_error", "billing"),
+    (429, "", "rate_limit"),
+    (422, "", "rejected"),
+], ids=["dead key", "no credit", "403 billing", "rate limit", "our bad request"])
+def test_a_provider_failure_ends_the_run_and_says_which(status, reported, kind):
+    """It escaped the graph entirely: a dead key came out as a raw SDK exception with no
+    `finished` event, so a caller got no verdict and no sign one was missing.
+
+    Never the fallback. A refusal is the model judging the sample; this is our
+    infrastructure failing, and a verdict no judgment went into must not look like one.
+    """
+    class Failing(FakeModel):
+        def invoke(self, messages):
+            raise Dead("no", status, reported)
+
+    events = []
+    run(Failing(), events=events)
+    result = outcome_of(events)
+    assert not result.ok and not result.used_fallback
+    assert result.kind == ("rejected" if kind == "rejected" else "unavailable")
+    assert kind in [e.data.get("kind") for e in events if e.kind == "provider_unavailable"]
+
+
+def test_a_bug_of_ours_is_not_dressed_up_as_a_provider_failure():
+    """Anything without a status is not the provider failing, and turning it into a tidy
+    verdict would hide our own crash behind a report about the sample."""
+    class Broken(FakeModel):
+        def invoke(self, messages):
+            raise ValueError("a bug in our own code")
+
+    with pytest.raises(ValueError, match="a bug in our own code"):
+        run(Broken())

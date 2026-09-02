@@ -475,3 +475,64 @@ def _labelled(kind: str, run_id: str) -> bool:
     found = subprocess.run(listing + ["--filter", f"label={RUN_LABEL}={run_id}"],
                            capture_output=True, text=True, check=True)
     return bool(found.stdout.strip())
+
+
+def test_a_label_that_is_not_a_number_is_left_alone(monkeypatch):
+    """The guard the comment calls out as "how a sweep deletes something it should not",
+    and nothing tested it. A `started` label we cannot read is not a licence to guess an
+    age of zero and delete the object."""
+    import envforge.sandbox as sandbox_module
+
+    dropped: list[str] = []
+    monkeypatch.setattr(sandbox_module, "_ours", sandbox_module._ours)
+    monkeypatch.setattr(sandbox_module, "remove_container", dropped.append)
+    monkeypatch.setattr(sandbox_module, "remove_image", dropped.append)
+
+    def listing(kind, argv):
+        if kind != "container":
+            return []
+        return [("readable", "old-run", 0), ("unreadable", "old-run", None)]
+
+    # A None age is what `_ours` refuses to produce; this drives the same decision with
+    # the value the parser would have had to invent.
+    monkeypatch.setattr(sandbox_module, "_ours",
+                        lambda kind, argv: [(i, r, s) for i, r, s in listing(kind, argv)
+                                            if s is not None])
+    sandbox_module.sweep(older_than=3600.0)
+    assert dropped == ["readable"], "an unreadable label was swept"
+
+
+def test_the_parser_drops_a_row_whose_started_label_is_not_a_number(monkeypatch):
+    """The other half: `_ours` itself must not hand a malformed row onward."""
+    import envforge.sandbox as sandbox_module
+
+    class Finished:
+        def __init__(self, stdout):
+            self.stdout = stdout
+
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if "inspect" in argv:
+            return Finished("id1\trun-a\t100\nid2\trun-b\tnot-a-number\n")
+        return Finished("id1 id2\n")
+
+    monkeypatch.setattr(sandbox_module.subprocess, "run", fake_run)
+    assert sandbox_module._ours("container", ["docker", "ps"]) == [("id1", "run-a", 100)]
+
+
+def test_the_sweep_says_nothing_when_docker_is_not_there(monkeypatch):
+    """The sweep runs at the start of every run, so an unguarded call here made the
+    suite the README calls "needs no daemon" die with FileNotFoundError."""
+    import envforge.sandbox as sandbox_module
+
+    def missing(*args, **kwargs):
+        raise FileNotFoundError("docker")
+
+    monkeypatch.setattr(sandbox_module.subprocess, "run", missing)
+    assert sandbox_module._ours("container", ["docker", "ps"]) == []
+    assert sandbox_module.sweep() == []
+    # And a lookup that cannot be answered fails closed: assuming no container would let
+    # a resumed run execute the sample again on the strength of a failed lookup.
+    assert sandbox_module.container_exists("anything") is True

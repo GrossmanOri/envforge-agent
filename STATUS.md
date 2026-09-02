@@ -9,7 +9,7 @@ decision log. This file is the record of how those got that way, including the p
 were wrong first. Nothing here is tidied after the fact: where a fix was the wrong shape,
 the wrong shape is still described, because that is the part worth reading.
 
-Updated 2026-09-01.
+Updated 2026-09-02.
 
 ## Where this is
 Built and tested: the sandbox that holds the untrusted script, the model layer, the
@@ -24,7 +24,7 @@ model layer's provider handling, which still builds requests by hand.
 Not built: the verdict and the trace. The command line reports what a script did and what
 it cost; nothing yet decides what that behaviour means.
 
-387 tests, 371 of which need neither Docker nor an API key. The rest skip
+404 tests, 388 of which need neither Docker nor an API key. The rest skip
 automatically when no daemon is present. Both suites run on every push
 and every pull request.
 
@@ -1552,3 +1552,59 @@ A test now reads the ADR headings and fails on a duplicate number or one out of 
 written after ADR-018 was used twice a fortnight apart. And the test that checks the event
 vocabulary against what the code emits now reads both engine modules, because it read
 `agent` alone, which was the engine when it was written and is not any more.
+
+### What the cold review found, and the worst of it
+
+Blocked on two, and the first is the most embarrassing defect in this project so far.
+
+**The engine produced no events at all.** `Agent.run` collected them into a list nothing
+read, then streamed with `stream_mode="custom"`, which yields only what a node writes
+through LangGraph's stream writer. No node did. So the only engine in the project ran a
+whole script, built an image, ran a container and yielded nothing: no verdict, no
+`finished`, no sign anything had happened.
+
+It was invisible because all four tests of that object called `list(agent.run(...))` to
+drive the generator and then asserted on the sandbox. Not one looked at what came out.
+That is a new shape of the old mistake: not a test that cannot fail, but a test that
+never asks the question the object exists to answer.
+
+**Repair messages accumulated, one per attempt.** `new_attempt` kept "the leading run of
+system and human messages", and the repair message it appends is itself a `HumanMessage`,
+so on the next attempt it had joined that leading run and was never removed again. The
+bound invariant 24 states became linear in `max_attempts` rather than constant: at twelve
+attempts the review measured 24,876 characters of the sample in one prompt against a
+ceiling of 22,528.
+
+The test that should have caught it recycled the same slices every attempt, so the count
+of distinct sample characters could not grow no matter how many messages piled up. It now
+reads somewhere new each time.
+
+**The look cap was enforced by what was offered, not by the graph.** `model_node`
+withdraws the inspection tools once the budget is spent, but the routing sent any name in
+`INSPECTION` to the `ToolNode` without checking. A fake that ignored the withdrawal took
+3,332 looks past the cap and reassembled the whole script over 3,336 model calls. The
+module comment claimed the opposite in the same file. Withdrawing a tool is a rule the
+provider enforces; the graph does not take its word for it any more.
+
+**Provider failures escaped the graph.** A dead key came out as a raw SDK exception with
+no `finished` event. The old loop had distinguished a rejected request from an unreachable
+provider since the command line was written, and the port simply dropped it.
+`provider_unavailable` was the one kind in the vocabulary the graph never emitted.
+
+**Four unit tests had quietly started requiring Docker,** because the startup sweep calls
+the binary and was the only call in `sandbox.py` with no `OSError` guard. The suite the
+README calls "needs no daemon" died with `FileNotFoundError`, and running it performed
+real removals on the developer's machine. The three host lookups are injectable now, and
+the whole unit suite runs with `docker` off `PATH`.
+
+**Invariants 28 and 30 contradicted each other,** which no amount of reading either would
+have shown. 28 says a sample runs at most once per attempt, and rests on the container
+surviving as evidence. 30 has the sweep delete another run's containers after an hour. So
+a run resumed later than that finds no evidence, runs the sample again and reports an
+ordinary verdict. Demonstrated against real Docker. The horizon is now written into 28
+rather than left for someone to find.
+
+Two mutations had survived: putting the submission tool into the `ToolNode`, which is the
+exact wiring invariant 23 rests on, and treating a malformed `started` label as age zero,
+which is the guard whose own comment calls it "how a sweep deletes something it should
+not". Both have tests now.

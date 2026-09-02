@@ -540,6 +540,18 @@ def default_dockerfile(language: str, name: str) -> str:
     )
 
 
+class EngineFailure(Exception):
+    """An engine stopped without producing a verdict.
+
+    Here rather than in the command line, and that is not filing. Under
+    `python -m envforge`, Python runs `__main__.py` as the module named `__main__`, so a
+    `from .__main__ import EngineFailure` elsewhere loads that file a second time under
+    another name and builds a second class object: the `except` holds one and the `raise`
+    holds the other, and the ending this exception exists to name escapes as an unhandled
+    traceback and exit 1, which this project defines as the script having run and failed.
+    """
+
+
 class Gate(Protocol):
     """The gate implements this. It returns a reason to refuse, or None to allow.
 

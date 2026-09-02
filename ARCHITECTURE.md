@@ -69,7 +69,8 @@ same gate before any build.
     charged only for successes could be walked past by a loop that never succeeds.
 19. Every event an engine yields is one of a closed set, and every string it carries has
     its authors declared. An engine cannot invent a kind, and no record reaches a reader
-    without saying whether we wrote it.
+    without saying whether we wrote it. A test reads both engine modules and fails if the
+    union of what they emit is not exactly the table.
 20. A run that cannot reach the model ends with `ok` false and never falls back to a
     Dockerfile we wrote. It is not a finding about the script, and a verdict no judgment
     went into must not be reported as a success.
@@ -162,7 +163,13 @@ same gate before any build.
     proof that the attempt already executed, and a resumed run that finds one refuses to
     execute again and reports the attempt as interrupted rather than producing a verdict.
     This holds with a durable checkpointer; `InMemorySaver` loses the state with the
-    process, so there is no resume to protect.
+    process, so there is no resume to protect. It also holds for as long as the evidence
+    does, and invariant 30 is what ends that: the sweep removes another run's containers
+    after an hour, so a run resumed later than that finds nothing, executes the sample a
+    second time and reports an ordinary verdict. Measured, not deduced. The two
+    invariants genuinely trade against each other, the horizon is stated here rather than
+    left for someone to discover, and closing it means the sweep learning to ask whether
+    a thread has an unfinished checkpoint.
 29. Nothing that cannot be serialised goes in graph state. The model, the sandbox, the
     gate and the event sink are runtime context. State is what a checkpointer writes
     down, so a credential in state is a credential written to wherever checkpoints go.

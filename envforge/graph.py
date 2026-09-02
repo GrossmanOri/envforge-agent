@@ -26,16 +26,19 @@ from typing import Any, Literal
 
 from langchain_core.messages import (AIMessage, AnyMessage, HumanMessage, RemoveMessage,
                                      SystemMessage, ToolMessage)
+from langgraph.config import get_stream_writer
+from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 from langgraph.runtime import Runtime
 
 from .agent import (CONTEXT, DOCKERFILE_LIMIT, EVIDENCE_LIMIT, FIRST, LANGUAGES,
-                    SCRIPT_LIMIT, SYSTEM, Outcome, Usage, default_dockerfile,
-                    describe, manifests)
+                    SCRIPT_LIMIT, SYSTEM, EngineFailure, Outcome, Usage,
+                    default_dockerfile, describe, manifests)
 from .context import Context
 from .sandbox import container_exists, remove_container, sweep
 from .events import Event
+from .llm import ProviderUnavailable, kind_for_status
 from .sandbox import BuildResult, RunResult, labels_for
 from .tools import (INSPECTION, SUBMIT, bound, inspection_tools, submit_dockerfile)
 
@@ -78,6 +81,9 @@ class State(MessagesState):
     base_image: str
     evidence: str | None         # why the last candidate did not work
     rejection: str | None        # what the gate said, if it refused
+    # The run ended for a reason that is not about the sample at all, so nothing further
+    # should be asked, built or run. Only the provider failing sets this.
+    stopped: bool
 
     max_attempts: int
     max_refusals: int
@@ -124,6 +130,19 @@ def refusal_reason(reply: Any) -> str | None:
 
 
 def _emit(runtime: Runtime[Context], event: Event) -> None:
+    """Put one event where a caller can see it, by both routes.
+
+    The stream is how `Agent.run` yields, and it was the whole hole: the nodes wrote to
+    the context sink, `Agent.run` streamed with `stream_mode="custom"`, and custom yields
+    only what a node writes through LangGraph's writer. Nothing did, so the only engine
+    in the project produced no events at all, and four tests drove that generator without
+    asserting on a single thing it yielded.
+
+    The context sink is kept as well, because a caller that drives the graph itself
+    rather than through `Agent` has no stream to read, and every test here does exactly
+    that. Two sinks and one call site, so neither can be forgotten separately.
+    """
+    get_stream_writer()(event)
     runtime.context.emit(event)
 
 
@@ -144,7 +163,31 @@ def model_node(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
         parallel_tool_calls=False,
     )
     _emit(runtime, Event("asking", f"attempt {state['attempt']}: asking the model"))
-    reply = bound_model.invoke(state["messages"])
+    try:
+        reply = bound_model.invoke(state["messages"])
+    except Exception as exc:                              # noqa: BLE001, narrowed below
+        # Not repairable, and not a finding about the script. Asking again spends money
+        # to fail identically, and falling back would print a verdict on a run the model
+        # never saw. A rejected request is not an unreachable provider: the model was
+        # reached and it answered, and one of those is worth retrying while the other is
+        # a bug in us.
+        #
+        # This escaped the graph entirely until a review ran it: a dead key came out as
+        # a raw SDK exception with no `finished` event, so a caller got no verdict and no
+        # sign that one was missing.
+        failure = as_unavailable(exc)
+        if failure is None:
+            raise
+        if failure.kind == "rejected":
+            reason = (f"the provider rejected our request, which is our bug rather than "
+                      f"theirs: {failure}")
+        else:
+            reason = f"the model could not be reached ({failure.kind}): {failure}"
+        _emit(runtime, Event("provider_unavailable", reason, {"kind": failure.kind}))
+        _emit(runtime, finished_event(state, reason, ok=False,
+                                      kind="rejected" if failure.kind == "rejected"
+                                      else "unavailable"))
+        return {"stopped": True, "calls": state["calls"] + 1}
     # Charged from the reply rather than estimated. `usage_metadata` is LangChain's
     # normalised shape, so this is the same arithmetic on every provider.
     used = getattr(reply, "usage_metadata", None) or {}
@@ -160,7 +203,7 @@ def model_node(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
     # not a failure of ours. It never spends a repair attempt: it has its own counter,
     # because asking a model that has just declined to try again is not a repair.
     refusals = state["refusals"] + [said]
-    runtime.context.emit(Event("refused", f"the model declined: {said}",
+    _emit(runtime, Event("refused", f"the model declined: {said}",
                                {"reason": said}))
     if len(refusals) <= state["max_refusals"]:
         return {"messages": [reply], "refusals": refusals, **charged}
@@ -168,13 +211,13 @@ def model_node(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
     # Declined twice, so we write the Dockerfile ourselves and stop asking. Its
     # existence is what makes a refusal survivable without another call, and it goes
     # through the same gate as anything the model wrote: one path to the daemon.
-    runtime.context.emit(Event("fell_back", "refused twice, using our own Dockerfile"))
+    _emit(runtime, Event("fell_back", "refused twice, using our own Dockerfile"))
     return {"messages": [reply], "refusals": refusals, "used_fallback": True,
             "candidate": default_dockerfile(state["language"], state["script"]),
             "base_image": LANGUAGES[state["language"]].base_image, **charged}
 
 
-def route_model(state: State) -> Literal["inspect", "gate", "model", "unusable"]:
+def route_model(state: State) -> str:
     """Where a reply goes, decided by which tool the model called.
 
     `tools_condition` cannot do this: it answers "tools" or "end", and there are two
@@ -182,6 +225,10 @@ def route_model(state: State) -> Literal["inspect", "gate", "model", "unusable"]
     what keeps the submission away from `ToolNode`, so no tool the model calls can reach
     the gate.
     """
+    if state["stopped"]:
+        # The provider failed. Not repairable, not a finding about the script, and not a
+        # reason to fall back: a verdict no judgment went into must not look like one.
+        return END
     if state["used_fallback"] and state["candidate"]:
         # The model refused twice and we wrote the Dockerfile. It is checked like any
         # other: one path to the daemon, whoever wrote the file.
@@ -200,7 +247,13 @@ def route_model(state: State) -> Literal["inspect", "gate", "model", "unusable"]
     if calls[0]["name"] == SUBMIT:
         return "gate"
     if calls[0]["name"] in INSPECTION:
-        return "inspect"
+        # The budget is checked here as well as when the tools are bound. Withdrawing a
+        # tool from the request is what should make it uncallable, and that is a rule
+        # enforced by the provider rather than by us: a model that names an inspection
+        # tool anyway was served it, and a fake that ignores the withdrawal reassembled
+        # the whole script and made 3,336 model calls. The graph does not take the
+        # provider's word for it.
+        return "inspect" if state["seen"] < MAX_LOOKS else "unusable"
     return "unusable"
 
 
@@ -209,7 +262,7 @@ def unusable_node(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
     image, so it spends an attempt and the model is told what shape was expected."""
     reason = ("your reply called no tool. Answer by calling one of the tools you were "
               "given, not with prose")
-    runtime.context.emit(Event("unusable_reply", reason))
+    _emit(runtime, Event("unusable_reply", reason))
     return {"retry_to": "model", "evidence": reason}
 
 
@@ -269,7 +322,7 @@ def gate_node(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
             # Three things can go wrong with a Dockerfile we wrote ourselves, and in
             # all three the honest move is to stop and say which, never to ask a model
             # that has already declined twice.
-            _emit(runtime, _outcome(
+            _emit(runtime, finished_event(
                 state, f"our fallback Dockerfile was rejected: {rejection}",
                 ok=False, kind="failed", dockerfile=dockerfile, used_fallback=True))
             return {"messages": replies, "candidate": dockerfile,
@@ -299,7 +352,7 @@ def route_gate(state: State) -> Literal["build", "retry", "__end__"]:
     return "retry" if state["rejection"] is not None else "build"
 
 
-def _outcome(state: State, reason: str, /, message: str | None = None,
+def finished_event(state: State, reason: str, /, message: str | None = None,
              **fields: Any) -> Event:
     """The one event every ending produces, with the shared fields filled in.
 
@@ -327,7 +380,7 @@ def build_node(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
     is what makes this the easy half of the replay question.
     """
     tag = f"envforge-{state['run_id']}:attempt{state['attempt']}"
-    runtime.context.emit(Event("building", f"building {tag}"))
+    _emit(runtime, Event("building", f"building {tag}"))
     build = runtime.context.sandbox.build(state["candidate"], state["files"], tag,
                                           labels_for(state["run_id"]))
     return {"build": asdict(build)}
@@ -362,7 +415,7 @@ def after_build(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
         # for was a cold base image pulling past the ceiling, and buildkit keeps what it
         # pulled, so the retry starts warm. Once, not until it works.
         if not state["rebuilt_after_timeout"]:
-            runtime.context.emit(Event("build_failed",
+            _emit(runtime, Event("build_failed",
                                        f"the build timed out after {build.seconds:.0f}s. "
                                        f"Trying the same Dockerfile once more, which "
                                        f"costs no tokens: a partly-pulled image is kept "
@@ -371,14 +424,14 @@ def after_build(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
         reason = (f"the build timed out after {build.seconds:.0f}s, twice. The Dockerfile "
                   f"asks for more work than the timeout allows, or the image cannot be "
                   f"pulled from here")
-        runtime.context.emit(Event("build_failed", reason))
-        runtime.context.emit(_outcome(state, reason, ok=False, kind="build_timeout",
+        _emit(runtime, Event("build_failed", reason))
+        _emit(runtime, finished_event(state, reason, ok=False, kind="build_timeout",
                                       dockerfile=state["candidate"],
                                       used_fallback=state["used_fallback"]))
         return {"retry_to": END}
-    runtime.context.emit(Event("build_failed", f"build exited {build.exit_code}"))
+    _emit(runtime, Event("build_failed", f"build exited {build.exit_code}"))
     if state["used_fallback"]:
-        runtime.context.emit(_outcome(
+        _emit(runtime, finished_event(
             state, "our fallback Dockerfile did not build", ok=False, kind="failed",
             dockerfile=state["candidate"], used_fallback=True))
         return {"retry_to": END}
@@ -405,8 +458,8 @@ def run_node(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
     exiting and the checkpoint committing means LangGraph replays this node. Nothing in
     the state can help, because the state is exactly what was not saved. The evidence
     has to be outside: the container is named from the run and the attempt, and `run`
-    removes it unconditionally, so a container still bearing this name was left behind
-    by a process that died. Finding one means the sample already ran, and the honest
+    kills it and leaves it, and removal happens only once the result is durable, so a
+    container still bearing this name was left behind by a process that died. Finding one means the sample already ran, and the honest
     answer is to stop and say so rather than to run it again or to invent a verdict.
     """
     name = container_name(state)
@@ -414,13 +467,13 @@ def run_node(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
         reason = ("this attempt already started a container and the run was interrupted "
                   "before its result was recorded. Refusing to run the sample a second "
                   "time")
-        runtime.context.emit(Event("exec_failed", reason))
-        runtime.context.emit(_outcome(state, reason, ok=False, kind="failed",
+        _emit(runtime, Event("exec_failed", reason))
+        _emit(runtime, finished_event(state, reason, ok=False, kind="failed",
                                       dockerfile=state["candidate"]))
         return {"result": None}
 
     tag = f"envforge-{state['run_id']}:attempt{state['attempt']}"
-    runtime.context.emit(Event("running", f"running {tag}"))
+    _emit(runtime, Event("running", f"running {tag}"))
     build = BuildResult(**state["build"])
     result = runtime.context.sandbox.run(build.image, state["args"], name=name,
                                          labels=labels_for(state["run_id"]))
@@ -444,10 +497,10 @@ def after_run(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
         # The daemon says the process never started, so the Dockerfile is wrong. This is
         # deliberately not a test on 126 or 127: a script that can produce anything has
         # already started.
-        runtime.context.emit(Event("exec_failed",
+        _emit(runtime, Event("exec_failed",
                                    f"the container never started: {result.start_error}"))
         if state["used_fallback"]:
-            runtime.context.emit(_outcome(
+            _emit(runtime, finished_event(
                 state, "our fallback image could not run its command", ok=False,
                 kind="failed", dockerfile=state["candidate"], used_fallback=True))
             return {"retry_to": END}
@@ -456,7 +509,7 @@ def after_run(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
                              f"{bound(result.start_error, EVIDENCE_LIMIT)}")}
     # Whether the script succeeded is observable and the caller needs it: a nonzero exit
     # is a finding, not a malfunction of this tool.
-    runtime.context.emit(_outcome(
+    _emit(runtime, finished_event(
         state, f"the script ran and exited {result.exit_code}", ok=True,
         kind="ran" if result.exit_code == 0 else "script_failed",
         dockerfile=state["candidate"], used_fallback=state["used_fallback"]))
@@ -472,7 +525,7 @@ def route_run(state: State) -> Literal["retry", "__end__"]:
 def retry_node(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
     """Spend an attempt, or give up because there are none left."""
     if state["attempt"] >= state["max_attempts"]:
-        runtime.context.emit(_outcome(
+        _emit(runtime, finished_event(
             state, f"no Dockerfile worked in {state['attempt']} attempts",
             message=f"gave up after {state['attempt']} attempts",
             ok=False, kind="no_image", dockerfile=state["candidate"],
@@ -497,13 +550,15 @@ def new_attempt(state: State) -> dict[str, Any]:
     instructions and the description of the script. Everything the model said and
     everything a tool returned goes.
     """
-    keep = 0
-    for index, message in enumerate(state["messages"]):
-        if isinstance(message, (SystemMessage, HumanMessage)):
-            keep = index
-        else:
-            break
-    removals = [RemoveMessage(id=m.id) for m in state["messages"][keep + 1:] if m.id]
+    # Exactly the first two: the system message and the opening one carrying the
+    # script. Not "the leading run of system and human messages", which is what this
+    # said and which was wrong in a way that grew: the repair message appended below is
+    # itself a HumanMessage, so on the next attempt it had joined that leading run and
+    # was never removed. Repair messages then accumulated one per attempt, and the bound
+    # invariant 24 states became linear in `max_attempts` instead of constant. Measured
+    # at twelve attempts: 24,876 characters of the sample in one prompt against a
+    # ceiling of 22,528.
+    removals = [RemoveMessage(id=m.id) for m in state["messages"][2:] if m.id]
 
     # The reset takes the reason with it, so the reason comes back as a message. This is
     # the repair prompt: without it a rejected Dockerfile is retried by a model that no
@@ -552,7 +607,7 @@ def build_graph(script_text: str, checkpointer=None):
     graph.add_node("unusable", unusable_node)
     graph.add_conditional_edges("model", route_model,
                                 {"inspect": "inspect", "gate": "gate",
-                                 "model": "model", "unusable": "unusable"})
+                                 "model": "model", "unusable": "unusable", END: END})
     graph.add_edge("unusable", "retry")
     graph.add_edge("inspect", "counted")
     graph.add_edge("counted", "model")
@@ -583,10 +638,50 @@ def start_state(run_id: str, language: str, script: str, full: str,
         args=list(args or []),
         attempt=1, calls=0, looks=0, seen=0,
         candidate=None, base_image="", evidence=None, rejection=None,
+        stopped=False,
         max_attempts=max_attempts, max_refusals=max_refusals, refusals=[],
         used_fallback=False, input_tokens=0, output_tokens=0,
         rebuilt_after_timeout=False, retry_to="model", build=None, result=None,
     )
+
+
+def as_unavailable(exc: Exception) -> ProviderUnavailable | None:
+    """The provider failing, classified, or None if this is not that.
+
+    The classification is `llm.py`'s and is reused rather than rewritten. It took several
+    rounds to get right: 402 and a 403 whose type says billing are an empty account, 401
+    is a dead key, 429 is a rate limit, and any other 4xx is our own malformed request,
+    which is a bug in us rather than the provider being down. LangChain passes the SDK's
+    exception through, so the same status is on it and the same rule applies.
+
+    Returns None for anything that is not a provider failure, so the caller re-raises
+    rather than turning a bug of ours into a tidy verdict.
+    """
+    if isinstance(exc, ProviderUnavailable):
+        return exc
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        return None
+    kind = kind_for_status(status, getattr(exc, "type", "") or "")
+    return ProviderUnavailable(str(exc), kind=kind)
+
+
+def step_ceiling(max_attempts: int, max_refusals: int) -> int:
+    """How many node visits a run can make, plus room.
+
+    LangGraph stops a graph at `recursion_limit` and raises. Its default of 25 is close
+    enough to what this machine legitimately uses that a longer run would hit it, and the
+    failure matters more than the number: every ending here is a `finished` event
+    carrying an `Outcome`, and a graph stopped by its own limit emits none, so the run
+    would end with no verdict rather than a bad one.
+
+    Derived from the caps that actually bound a run rather than guessed. Per attempt: one
+    model call per look, the look's two nodes, the call that finally submits, and the
+    gate, build and run nodes with their `after` pair. Refusals are free calls counted
+    once for the run. If this ever fires it is a bug in the derivation, because
+    `max_attempts` is the bound that is supposed to stop a run.
+    """
+    return max_attempts * (4 * MAX_LOOKS + 10) + max_refusals + 10
 
 
 def first_prompt(language: str, script: str, full: str,
@@ -630,22 +725,39 @@ class Agent:
     """
 
     def __init__(self, llm: Any, sandbox: Any, gate: Gate, max_attempts: int = 3,
-                 max_refusals: int = 1) -> None:
+                 max_refusals: int = 1, exists=container_exists,
+                 remove=remove_container, sweeper=sweep) -> None:
         self.llm, self.sandbox, self.gate = llm, sandbox, gate
         self.max_attempts, self.max_refusals = max_attempts, max_refusals
+        # The three host lookups, injectable for the same reason the sandbox is. They
+        # reach for the docker binary, and a test of the graph's decisions should not
+        # need one: leaving them hard-wired made four unit tests require a daemon and
+        # perform real removals on the developer's machine.
+        self.exists, self.remove, self.sweeper = exists, remove, sweeper
 
     def run(self, workspace: Workspace, language: str, args: Sequence[str] = (),
-            emit=lambda event: None, checkpointer=None,
+            checkpointer=None,
             config: dict[str, Any] | None = None) -> Iterator[Event]:
-        """Stream the events the nodes produce, as they produce them."""
+        """Stream the events the nodes produce, as they produce them.
+
+        `stream_mode="custom"` is what a node writes while it works, so an event arrives
+        here the moment it is made rather than when its node returns.
+        """
         run_id = uuid.uuid4().hex
         # Collect what earlier runs left behind, before making anything of our own. Not
         # a background chore: a crashed run leaves a tagged image and an exited
         # container, nothing else ever removes them, and the only alternative is that
         # they accumulate until somebody notices the disk. Guarded by ownership and age,
         # so a run in another terminal right now is never touched.
-        for gone in sweep(keep=run_id):
-            emit(Event("swept", f"removed {gone}, left by a run that did not finish"))
+        #
+        # Best effort about the daemon, deliberately. A sweep is housekeeping, and no
+        # part of it is worth refusing to start a run over.
+        try:
+            for gone in self.sweeper(keep=run_id):
+                yield Event("swept",
+                            f"removed {gone}, left by a run that did not finish")
+        except OSError:
+            pass
         script = workspace.script
         files = {name: workspace.read(name) for name in workspace.names()}
         full = files[script]
@@ -654,13 +766,24 @@ class Agent:
                             args=list(args), max_attempts=self.max_attempts,
                             max_refusals=self.max_refusals)
         graph = build_graph(full, checkpointer=checkpointer)
-        produced: list[Event] = []
+        # No second sink here. The nodes write to the stream, and the stream is what this
+        # generator yields; an extra list collected on the side is what hid the fact that
+        # nothing was reaching a caller at all.
         context = Context(model=self.llm, gate=self.gate, sandbox=self.sandbox,
-                          emit=produced.append, exists=container_exists,
-                          remove_container=remove_container)
+                          exists=self.exists, remove_container=self.remove)
+        limit = step_ceiling(self.max_attempts, self.max_refusals)
         try:
-            yield from graph.stream(state, config or {}, context=context,
-                                    stream_mode="custom")
+            yield from graph.stream(state, {**(config or {}),
+                                            "recursion_limit": limit},
+                                    context=context, stream_mode="custom")
+        except GraphRecursionError as exc:
+            # Derived to be unreachable, so reaching it is a bug in the derivation rather
+            # than a run that deserved to stop. Translated here because a run with no
+            # verdict must never reach a shell as an unhandled traceback, which this
+            # project's exit codes define as the script having run and failed.
+            raise EngineFailure(
+                f"the graph exceeded {limit} steps, which its own bound says is "
+                f"impossible, so the run produced no verdict: {exc}") from exc
         finally:
             # Unconditional, and scoped to this run. `built_tags` may hold tags from
             # other runs if a sandbox is shared, so the prefix is the ownership check:

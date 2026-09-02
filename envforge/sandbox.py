@@ -248,9 +248,15 @@ def container_exists(name: str) -> bool:
     belongs to a run in progress or was left by a process that died. Either way the
     sample already ran under that name.
     """
-    finished = subprocess.run(["docker", "ps", "-a", "--filter", f"name=^{name}$",
-                               "--format", "{{.Names}}"],
-                              capture_output=True, text=True, timeout=20)
+    try:
+        finished = subprocess.run(["docker", "ps", "-a", "--filter", f"name=^{name}$",
+                                   "--format", "{{.Names}}"],
+                                  capture_output=True, text=True, timeout=20)
+    except (subprocess.TimeoutExpired, OSError):
+        # No answer is not the same as "no container". Reporting False here would let a
+        # resumed run execute the sample again on the strength of a failed lookup, so
+        # this fails closed: assume the evidence exists.
+        return True
     return name in finished.stdout.split()
 
 
@@ -261,17 +267,27 @@ def _ours(kind: str, list_argv: list[str]) -> list[tuple[str, str, int]]:
     print a container's labels but `docker images --format` cannot, so a single listing
     that worked for both does not exist; `inspect` answers for both in the same shape.
     """
-    listed = subprocess.run(list_argv, capture_output=True, text=True, timeout=30,
-                            check=False)
+    # Guarded like every other docker call in this file, and this one was not. The sweep
+    # runs at the start of every run, so an unguarded `subprocess.run` here made four
+    # unit tests need the docker binary: the suite the README calls "needs no daemon"
+    # died with FileNotFoundError on a machine without docker on PATH.
+    try:
+        listed = subprocess.run(list_argv, capture_output=True, text=True, timeout=30,
+                                check=False)
+    except (subprocess.TimeoutExpired, OSError):
+        return []
     ids = listed.stdout.split()
     if not ids:
         return []
-    shown = subprocess.run(
-        ["docker", kind, "inspect", *ids, "--format",
-         '{{.Id}}\t{{index .Config.Labels "' + RUN_LABEL + '"}}\t'
-         '{{index .Config.Labels "' + STARTED_LABEL + '"}}'],
-        capture_output=True, text=True, timeout=60, check=False)
-    found = []
+    try:
+        shown = subprocess.run(
+            ["docker", kind, "inspect", *ids, "--format",
+             '{{.Id}}\t{{index .Config.Labels "' + RUN_LABEL + '"}}\t'
+             '{{index .Config.Labels "' + STARTED_LABEL + '"}}'],
+            capture_output=True, text=True, timeout=60, check=False)
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    found: list[tuple[str, str, int]] = []
     for line in shown.stdout.splitlines():
         parts = line.split("\t")
         if len(parts) != 3 or not parts[1]:
