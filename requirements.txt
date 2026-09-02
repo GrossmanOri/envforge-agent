@@ -1,3 +1,8 @@
 anthropic>=1.0,<2
 openai>=3.0,<4
 python-dotenv>=1.0,<2
+# The engine. Not optional: there is one agent and it is a graph.
+langgraph>=1.0,<2
+# The chat model behind `bind_tools`. Anthropic is the default provider; OpenAI and Groq
+# come through `langchain-openai`, which is added with them rather than ahead of them.
+langchain-anthropic>=1.0,<2
