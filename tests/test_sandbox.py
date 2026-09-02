@@ -361,8 +361,8 @@ def _sweep(monkeypatch, objects, keep="", older_than=3600.0):
 def test_the_sweep_skips_the_run_that_asked_for_it(monkeypatch):
     """A run must not delete the image it is about to run."""
     _, dropped = _sweep(monkeypatch,
-                        [("container", "mine", "run-a", 0),
-                         ("container", "theirs", "run-b", 0)], keep="run-a")
+                        [("image", "mine", "run-a", 0),
+                         ("image", "theirs", "run-b", 0)], keep="run-a")
     assert dropped == ["theirs"]
 
 
@@ -371,8 +371,8 @@ def test_the_sweep_leaves_anything_young_alone(monkeypatch):
     like ours. There is no way to ask whether that process is alive, so age stands in."""
     now = int(time.time())
     _, dropped = _sweep(monkeypatch,
-                        [("container", "fresh", "run-b", now),
-                         ("container", "stale", "run-c", now - 7200)])
+                        [("image", "fresh", "run-b", now),
+                         ("image", "stale", "run-c", now - 7200)])
     assert dropped == ["stale"]
 
 
@@ -382,10 +382,13 @@ def test_the_sweep_reports_what_it_removed(monkeypatch):
     assert removed == ["image deadbeefcafe from run run-xyyy"]
 
 
-def test_the_sweep_removes_images_as_well_as_containers(monkeypatch):
+def test_the_sweep_never_removes_a_container(monkeypatch):
+    """A crashed attempt's container is the only proof its sample already ran, so
+    collecting it would let a run resumed later execute that sample again and report an
+    ordinary verdict. Images fill the disk; containers cost kilobytes and are evidence."""
     _, dropped = _sweep(monkeypatch, [("container", "c1", "old", 0),
                                       ("image", "i1", "old", 0)])
-    assert sorted(dropped) == ["c1", "i1"]
+    assert dropped == ["i1"]
 
 
 @pytest.mark.docker
@@ -440,7 +443,10 @@ def test_the_sweep_collects_a_crashed_run_and_spares_a_live_one(sandbox):
     try:
         removed = sweep(keep="", older_than=3600.0)
         assert any(crashed[:8] in line for line in removed), removed
-        assert not _labelled("container", crashed) and not _labelled("image", crashed)
+        assert not _labelled("image", crashed), "the crashed run's image survived"
+        # Its container is left on purpose: it is the proof that the sample already ran,
+        # and a resumed run that cannot find it executes the sample a second time.
+        assert _labelled("container", crashed), "the evidence was swept"
         # The concurrent run is untouched, which is the point of the age guard.
         assert _labelled("container", live) and _labelled("image", live)
     finally:
@@ -489,7 +495,7 @@ def test_a_label_that_is_not_a_number_is_left_alone(monkeypatch):
     monkeypatch.setattr(sandbox_module, "remove_image", dropped.append)
 
     def listing(kind, argv):
-        if kind != "container":
+        if kind != "image":
             return []
         return [("readable", "old-run", 0), ("unreadable", "old-run", None)]
 

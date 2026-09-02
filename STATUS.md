@@ -24,7 +24,7 @@ model layer's provider handling, which still builds requests by hand.
 Not built: the verdict and the trace. The command line reports what a script did and what
 it cost; nothing yet decides what that behaviour means.
 
-404 tests, 388 of which need neither Docker nor an API key. The rest skip
+406 tests, 390 of which need neither Docker nor an API key. The rest skip
 automatically when no daemon is present. Both suites run on every push
 and every pull request.
 
@@ -1608,3 +1608,44 @@ Two mutations had survived: putting the submission tool into the `ToolNode`, whi
 exact wiring invariant 23 rests on, and treating a malformed `started` label as age zero,
 which is the guard whose own comment calls it "how a sweep deletes something it should
 not". Both have tests now.
+
+### The second pass, and a record bug worse than the code ones
+
+All three blockers confirmed gone by measurement: the engine yields, the prompt ceiling is
+flat out to fifty attempts (11,093 characters at the worst, against a sample where the
+attacker had been shown 409,600 distinct characters across the run), and a model that
+ignores the withdrawn tool now takes four looks instead of 3,332.
+
+Then it blocked again, on the records alone, and the finding is the sharpest kind.
+
+**`ARCHITECTURE.md` carried two copies of invariants 23 to 28.** The new block was
+appended without retiring the old one, so there were two different invariant 24s and two
+different invariant 28s, and six places in the code and tests cite an invariant by number.
+Every one of those citations named two rules at once. Merged: the newer wording wins for
+23 to 27, the older 28 keeps its number because it is about the gate and has no
+counterpart in the new block, and the at-most-once rule moved to 32 so no number ever
+means two things. A test now fails on a duplicate, a gap, or an out-of-order entry, which
+is the sibling of the one that guards ADR numbers and would not have caught this.
+
+**And the event-kind count went stale for the third time.** It said thirteen when the code
+had twelve, still thirteen when the tool loop made it fourteen, and this change added
+`swept` without touching it. It is fifteen, and it is now read out of the record by a test
+and compared with `len(VOCABULARY)`.
+
+**ADR-019 contradicted the README in the same repository.** It said "there is no second
+engine, no plain loop beside it", which is the sentence this project has a rule against:
+the loop is still in `agent.py` and still what `python -m envforge` drives. The ADR now
+states the decision and says plainly that the tree does not match it yet, and why.
+
+**One code change came out of the same pass.** The reviewer pointed out that invariants 28
+and 30 do not merely trade, they can be reconciled: containers are the evidence and cost
+kilobytes, images are what fill a disk and were never evidence. The sweep now collects
+images only and never touches a container. That turns a documented one-hour hole into no
+hole, at the price of exited containers accumulating on a machine that crashes often,
+which `docker container prune` clears.
+
+The lesson worth keeping from this pass is that the code review found three real defects
+and the record review found four, and the record ones are the sort nobody notices until
+somebody acts on a number. Both invariant-numbering and count claims now have tests, which
+is the third and fourth number in this project to be given a mechanism instead of another
+promise to be careful.

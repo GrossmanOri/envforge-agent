@@ -304,6 +304,10 @@ def _ours(kind: str, list_argv: list[str]) -> list[tuple[str, str, int]]:
 def sweep(keep: str = "", older_than: float = 3600.0) -> list[str]:
     """Remove containers and images left behind by runs that did not finish.
 
+    Images, not containers. See the comment below: a container is the proof that an
+    attempt already executed an untrusted sample, and removing it is what would let a
+    resumed run execute that sample again.
+
     Two guards, and both are about other people's work rather than tidiness.
 
     Ownership: anything labelled with `keep` belongs to the run asking for the sweep and
@@ -318,9 +322,13 @@ def sweep(keep: str = "", older_than: float = 3600.0) -> list[str]:
     """
     cutoff = time.time() - older_than
     removed = []
+    # Images only. Containers are deliberately left, and that is the resolution of a
+    # contradiction rather than an oversight: a crashed attempt's container is the
+    # durable evidence that its sample already ran, so sweeping it lets a run resumed an
+    # hour later execute the sample a second time and report an ordinary verdict. A
+    # confident wrong verdict is the worst thing this tool can produce, and an exited
+    # container costs kilobytes. Images are what fill a disk and were never evidence.
     for kind, listing, drop in (
-        ("container", ["docker", "ps", "--all", "--quiet", "--filter",
-                       f"label={RUN_LABEL}"], remove_container),
         ("image", ["docker", "image", "ls", "--quiet", "--filter",
                    f"label={RUN_LABEL}"], remove_image),
     ):

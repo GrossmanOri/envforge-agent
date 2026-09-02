@@ -82,40 +82,25 @@ same gate before any build.
 22. What the shell learns comes from a typed `Outcome.kind`, never from matching words in
     a sentence. `reason` splices in filenames and provider text, so a sample could
     otherwise choose the exit code.
-23. The model chooses what it reads and never what the loop does. A tool call cannot
-    spend an attempt, reach the gate, start a build, or change the attempt count.
-24. One prompt holds at most `SCRIPT_LIMIT + MAX_LOOKS * SLICE_LIMIT` characters of the
-    script directly, plus at most `DOCKERFILE_LIMIT + EVIDENCE_LIMIT` of text written by
-    the model or produced by a build, either of which may quote the sample back. The cap
-    on tool calls is what makes the first term true, so it is a security control and not
-    a budget: without it a model that asks for region after region has reassembled the
-    sample one slice at a time without breaking a single other rule.
-
-    The second term is not padding, and this invariant was false without it for the
-    length of one review. Every untrusted string entering a prompt is bounded except,
-    originally, the previous Dockerfile: the model wrote it, `previous` is not reset
-    between attempts, and it is replayed whole into every repair. A model that writes
-    what it read into comment lines, which the gate permits, therefore carried its
-    slices into the next attempt on top of that attempt's own fresh look budget.
-    Measured before the fix: 25,326 characters of a 40,000 character sample in a single
-    prompt against a ceiling then claimed to be 16,384, growing linearly with
-    `max_attempts`. The lesson is the one this project keeps relearning: a bound stated
-    over the direct path is not a bound, because the interesting channel is the one
-    nobody counted as a channel.
-
-    The manifests are bounded separately, at `MANIFEST_LIMIT` each, and are a different
-    file rather than the script. They are untrusted by the same argument and are not
-    covered by the arithmetic above, which is about reassembling the sample.
+23. The model chooses what it reads and never what the loop does. The tools it may call
+    are read-only inspections of the script. Submitting a Dockerfile is a tool the graph
+    routes on rather than executes, so the gate, the build and the run are deterministic
+    nodes that no tool call can reach.
+24. One prompt holds at most the bounded script, plus `MAX_LOOKS` slices of it, plus the
+    previous Dockerfile and the evidence, each bounded. The conversation is cleared at
+    the start of every attempt, which is a security property and not housekeeping: the
+    message list accumulates, so without the reset three attempts of four looks would put
+    twelve slices of the sample in one context.
 25. Every tool result is bounded and labelled where it is produced, not where it is
-    consumed. There is one function that creates a slice of the sample, which is the only
-    place the rule cannot be forgotten by a later caller.
+    consumed. There is one function that cuts a piece out of the sample, which is the
+    only place the rule cannot be forgotten by a later caller.
 26. A search pattern is a literal, never a regular expression. The pattern is chosen by a
     model that has just read attacker-controlled text, and `re` on a model-chosen pattern
-    is catastrophic backtracking on the host, which is the one machine here that is not
-    in a sandbox.
-27. Every reply is exactly one tool call. Parallel tool use is disabled on both providers,
-    because a second call in one reply never receives a result and would also make one
-    look return several slices.
+    is catastrophic backtracking on the host, which is the one machine here not in a
+    sandbox.
+27. Every reply is exactly one tool call. Parallel tool use is disabled, because a second
+    call in one reply never receives a result and would let one reply return several
+    slices past the look cap.
 28. A gate rejection is repair evidence, so its size is a security property and not a
     formatting one. The gate refuses a Dockerfile over `MAX_DOCKERFILE`, and a rejection
     quotes at most `QUOTED_LINE` characters of the offending line. Both are the same rule
@@ -137,55 +122,44 @@ same gate before any build.
     behaviour for a file that large: `bound` keeps the head and the tail, so `FROM` and
     the command survive, and the marker says what was removed.
 
-23. The model chooses what it reads and never what the loop does. The tools it may call
-    are read-only inspections of the script. Submitting a Dockerfile is a tool the graph
-    routes on rather than executes, so the gate, the build and the run are deterministic
-    nodes that no tool call can reach.
-24. One prompt holds at most the bounded script, plus `MAX_LOOKS` slices of it, plus the
-    previous Dockerfile and the evidence, each bounded. The conversation is cleared at
-    the start of every attempt, which is a security property and not housekeeping: the
-    message list accumulates, so without the reset three attempts of four looks would put
-    twelve slices of the sample in one context.
-25. Every tool result is bounded and labelled where it is produced, not where it is
-    consumed. There is one function that cuts a piece out of the sample, which is the
-    only place the rule cannot be forgotten by a later caller.
-26. A search pattern is a literal, never a regular expression. The pattern is chosen by a
-    model that has just read attacker-controlled text, and `re` on a model-chosen pattern
-    is catastrophic backtracking on the host, which is the one machine here not in a
-    sandbox.
-27. Every reply is exactly one tool call. Parallel tool use is disabled, because a second
-    call in one reply never receives a result and would let one reply return several
-    slices past the look cap.
-28. An untrusted sample is executed at most once per attempt, and the guarantee is
-    durable rather than best effort. The container is named from the run and the attempt,
-    it is killed but not removed when the run node finishes, and it is removed only after
-    the result has been checkpointed. A container bearing an attempt's name is therefore
-    proof that the attempt already executed, and a resumed run that finds one refuses to
-    execute again and reports the attempt as interrupted rather than producing a verdict.
-    This holds with a durable checkpointer; `InMemorySaver` loses the state with the
-    process, so there is no resume to protect. It also holds for as long as the evidence
-    does, and invariant 30 is what ends that: the sweep removes another run's containers
-    after an hour, so a run resumed later than that finds nothing, executes the sample a
-    second time and reports an ordinary verdict. Measured, not deduced. The two
-    invariants genuinely trade against each other, the horizon is stated here rather than
-    left for someone to discover, and closing it means the sweep learning to ask whether
-    a thread has an unfinished checkpoint.
 29. Nothing that cannot be serialised goes in graph state. The model, the sandbox, the
     gate and the event sink are runtime context. State is what a checkpointer writes
     down, so a credential in state is a credential written to wherever checkpoints go.
 30. Every image and container this project creates carries an `envforge.run` label naming
     the run that made it, and a second label saying when that run started. The run that
     made them removes them when it finishes, in a `finally`. A sweep at startup removes
-    labelled objects from other runs older than an hour, and both guards matter: the
+    labelled **images** from other runs older than an hour, and both guards matter: the
     ownership check stops a run deleting the image it is about to execute, and the age
-    check stops it deleting the work of a second envforge running right now, which
-    labels its objects identically and cannot be asked whether it is alive.
+    check stops it deleting the work of a second envforge running right now, which labels
+    its objects identically and cannot be asked whether it is alive.
+
+    Containers are never swept, and that is invariant 32 winning an argument with this
+    one. A crashed attempt's container is the only proof that its sample already ran, so
+    collecting it would let a run resumed later execute that sample again and report an
+    ordinary verdict. An exited container costs kilobytes; images are what fill a disk
+    and were never evidence. The cost is that a machine running many crashed runs
+    accumulates exited containers, which `docker container prune` clears.
 31. The BuildKit cache is never pruned automatically. Layer reuse is what makes a repair
     attempt cheap, and a loop that deleted its own base layers would pay full price on
     every attempt. It is unbounded by design, and `docker builder prune` is the user's to
     run. `remove_image` removes a tag, and with it the image and any layers nothing else
     references; it does not touch that cache, and reading it as "cleanup" is what would
     let someone conclude a finished run leaves nothing behind on the machine.
+32. An untrusted sample is executed at most once per attempt, and the guarantee is
+    durable rather than best effort. The container is named from the run and the attempt,
+    it is killed but not removed when the run node finishes, and it is removed only after
+    the result has been checkpointed. A container bearing an attempt's name is therefore
+    proof that the attempt already executed, and a resumed run that finds one refuses to
+    execute again and reports the attempt as interrupted rather than producing a verdict.
+    This holds with a durable checkpointer; `InMemorySaver` loses the state with the
+    process, so there is no resume to protect.
+
+    It held for only an hour until a review measured it. The sweep collected another
+    run's containers, so a run resumed later found no evidence, executed the sample again
+    and reported an ordinary verdict, which is the worst output this tool has: not an
+    error, a confident wrong answer. The sweep no longer touches containers at all. That
+    is this invariant winning against 30 on purpose, and the reasoning is written in both
+    so neither can be read alone and believed.
 
 Invariants 4 and 5 are asserted against the argv that `sandbox.py` actually builds, so
 dropping a flag from the code fails a test rather than passing review.
@@ -290,7 +264,7 @@ They need error types that retain provider wire data, so the trace module owns
 that design rather than adding half a trace to the repair loop.
 
 ### ADR-014: the engine seam is a labelled vocabulary, not a topology
-Decided 2026-08-27. `envforge/events.py` holds the thirteen kinds an engine may yield, and
+Decided 2026-08-27. `envforge/events.py` holds the fifteen kinds an engine may yield, and
 `Event` refuses anything else at construction. The plain loop and the LangGraph port both
 honour it, which a node-shaped interface could not be: a plain loop has no nodes.
 
@@ -503,9 +477,16 @@ is what kept the manifest out of the prompt for months.
 ### ADR-019: the agent is a LangGraph graph, and there is only one of it
 Decided 2026-09-02, replacing an earlier attempt that is kept unmerged as reference.
 
-`envforge/graph.py` is the engine. `StateGraph` over an extended `MessagesState`, a chat
-model with `bind_tools`, `@tool` functions inside a `ToolNode`, and conditional edges.
-There is no second engine, no plain loop beside it and no flag to choose between them.
+`envforge/graph.py` is the engine, and everything new is built on it. `StateGraph` over
+an extended `MessagesState`, a chat model with `bind_tools`, `@tool` functions inside a
+`ToolNode`, and conditional edges.
+
+The decision is that there will be one engine, and the tree does not match it yet: the
+`while` loop is still in `envforge/agent.py` and is still what `python -m envforge`
+drives, because the command line has not been ported. Writing "there is no second engine"
+while one sits in the next file is the kind of sentence this project has a rule against,
+so it says this instead. The loop goes when the command line moves, and nothing new is
+added to it in the meantime.
 
 That is the reversal worth recording. The first port kept the existing `while` loop and
 added a graph beside it, with a contract test proving the two agreed. It passed every
