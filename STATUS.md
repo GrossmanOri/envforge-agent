@@ -13,15 +13,18 @@ Updated 2026-09-01.
 
 ## Where this is
 Built and tested: the sandbox that holds the untrusted script, the model layer, the
-deterministic gate every Dockerfile passes before a build, the repair loop, the workspace
-that is the only code here handling a path, the closed event vocabulary with its provenance
-labels, the command line, and the two tools the model uses to read the part of a script it
-was not shown.
+deterministic gate every Dockerfile passes before a build, the LangGraph agent that is now
+the only engine, the workspace that is the only code here handling a path, the closed event
+vocabulary with its provenance labels, the command line, and the two tools the model uses
+to read the part of a script it was not shown.
+
+Not yet ported to the graph: the command line, which still drives the old loop, and the
+model layer's provider handling, which still builds requests by hand.
 
 Not built: the verdict and the trace. The command line reports what a script did and what
 it cost; nothing yet decides what that behaviour means.
 
-334 tests, 321 of which need neither Docker nor an API key. The rest skip
+387 tests, 371 of which need neither Docker nor an API key. The rest skip
 automatically when no daemon is present. Both suites run on every push
 and every pull request.
 
@@ -1464,3 +1467,88 @@ Confirmed on the next live run, which is the only way this kind of fix can be co
 `search_script("import")`, then one `read_script` at 10800 to 11300, then the Dockerfile.
 Two looks instead of four, three model calls instead of five, and 17,328 tokens against
 32,882. The search now points and the read goes there, which is what the tool was for.
+
+## The agent became a graph, 2026-09-02
+
+`envforge/graph.py` is the engine. A LangGraph `StateGraph` over an extended
+`MessagesState`, a chat model with `bind_tools`, `@tool` functions in a `ToolNode`, and
+conditional edges. There is no second engine and no flag to choose one.
+
+### The version before this one, and why it was thrown away
+The first attempt kept the existing `while` loop and added a graph beside it, with a
+contract test proving the two agreed. Every test passed. It was the wrong thing, and the
+argument against it is short: two engines are upkeep, and the second can never be allowed
+to behave differently from the first without failing the contract, so it can never become
+the thing LangGraph is for. Checkpointing, resuming and inspecting a run between nodes all
+require the graph to be the thing actually running.
+
+The second attempt was worse in a way that is easier to miss. It carried one mutable
+object through the graph and mutated it inside the nodes. That looks identical from
+outside, passes the same tests, and is a loop wearing a graph costume: nothing is
+checkpointable, nothing is resumable, and what a node did to a run cannot be read from
+what it returned.
+
+Both are kept unmerged on a branch as reference. What was taken from them is the security
+reasoning and the test scenarios, not the structure.
+
+### What the model may do, and what it may not
+Its tools read the script: a region by offset, or a literal search that returns every
+match offset. Submitting a Dockerfile is a tool the graph **routes on** rather than
+executes, so `ToolNode` holds only read-only tools and the gate, the build and the run are
+nodes no tool call can reach. The submission tool's body raises, and a test asserts it.
+
+The look cap is enforced by binding a different tool list once the budget is spent, never
+by a sentence in the prompt. A rule written in a prompt is a request made of the thing the
+prompt is defending against.
+
+### The message reset, which is a security property
+`add_messages` accumulates. The conversation is cleared at the start of every attempt,
+because the bound on how much of the sample can reach one prompt assumes each attempt
+starts fresh: without the reset, three attempts of four looks would put twelve slices of
+the script in one context. The reason the last attempt failed comes back as a new message,
+because the reset takes it away, and a test caught that before it shipped: a model retrying
+without being told what was wrong is a model guessing.
+
+### Running the sample twice, and the window that made it possible
+The replay question was asked by a reviewer and not by me, and the first answer was wrong.
+
+A checkpoint commits after a node returns. `sandbox.run` removed its container in a
+`finally`, so a crash between that removal and the checkpoint left a resumed run with no
+state and no container, and it executed the untrusted sample again. Building twice wastes
+time; running twice is the one side effect in this program that must happen at most once.
+
+Fixed by not deleting the evidence. `run` now kills its container and leaves it, and
+removal happens in the next node, by which time the result is durable. So a container
+bearing an attempt's name proves the attempt already executed, and a resumed run that
+finds one refuses and reports the attempt as interrupted rather than inventing a verdict.
+
+A Docker test asserted the old property, that no container outlived a run. It was true and
+it was the bug.
+
+### What a run leaves on the machine, which nobody had asked
+Asked as a list of questions about images, tags, layers and cache, and the honest headline
+was not the policy. It was that the graph implementation had **no image cleanup at all**,
+because that code lived in the command line and the command line had not been ported, so
+every graph run so far had left its image on the machine.
+
+Cleanup now belongs to the object that owns the run, in a `finally`. Objects carry a label
+naming their run and a label saying when it started, so a sweep can say "this is ours"
+without matching a container a user named `envforge-something` themselves. The start time
+is a label rather than the object's own timestamp so the sweep never parses a date: docker
+prints those in a human format that varies with locale and version.
+
+Two guards on the sweep, both about other people's work. Ownership, so a run cannot delete
+the image it is about to execute. Age, because a second envforge may be running right now
+and labels its objects identically, and there is no way to ask whether that process is
+alive.
+
+The limitation is written into the invariants rather than left for someone to discover:
+the BuildKit cache grows without bound and nothing here prunes it. That is deliberate,
+since pruning is what would make every repair attempt pay full price, and it means a
+finished run does not leave the machine as it found it.
+
+### Two record habits that finally got mechanisms
+A test now reads the ADR headings and fails on a duplicate number or one out of order,
+written after ADR-018 was used twice a fortnight apart. And the test that checks the event
+vocabulary against what the code emits now reads both engine modules, because it read
+`agent` alone, which was the engine when it was written and is not any more.

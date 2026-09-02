@@ -124,6 +124,9 @@ VOCABULARY: dict[str, Kind] = {kind.name: kind for kind in (
     # we wrote ourselves goes through the same gate and can be rejected there too.
     _kind("gate_rejected", (US, MODEL),    # our reason, quoting the line it refused
           dockerfile=(US, MODEL)),
+    # What an earlier run left on the machine, removed before this one starts. Ours
+    # entirely: an object id and a run id we wrote.
+    _kind("swept", (US,)),
     _kind("building", (US,)),
     _kind("build_failed", (US,)),          # an exit code, never the log
     _kind("running", (US,)),

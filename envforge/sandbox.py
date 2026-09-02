@@ -12,6 +12,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Mapping, Protocol, Sequence
 
 # Filenames the build itself interprets, so a context file carrying one of these is not
@@ -73,14 +74,41 @@ class Sandbox(Protocol):
 
     built_tags: list[str]
 
-    def build(self, dockerfile: str, files: Mapping[str, str], tag: str) -> BuildResult: ...
+    def build(self, dockerfile: str, files: Mapping[str, str], tag: str,
+              labels: Mapping[str, str] = MappingProxyType({})) -> BuildResult: ...
 
-    def run(self, image: str, args: Sequence[str] = ()) -> RunResult: ...
+    def run(self, image: str, args: Sequence[str] = (), name: str | None = None,
+            labels: Mapping[str, str] = MappingProxyType({})) -> RunResult: ...
 
     def remove_image(self, tag: str) -> None: ...
 
 
-def build_argv(tag: str, context: Path) -> list[str]:
+# The labels every image and container we create carries.
+#
+# A label rather than a name prefix, because a sweep has to be able to say "this is ours"
+# about somebody else's machine. A prefix match on `envforge-` would also match a
+# container a user named that themselves, and deleting it would be our bug in their
+# workspace.
+#
+# The start time is a label rather than read from the object's own creation timestamp so
+# the sweep never parses a date. `docker` prints creation times in a human format that
+# varies with locale and version, and an age rule built on parsing that is a rule that
+# breaks on somebody else's machine.
+RUN_LABEL = "envforge.run"
+STARTED_LABEL = "envforge.started"
+
+
+def labels_for(run_id: str) -> dict[str, str]:
+    return {RUN_LABEL: run_id, STARTED_LABEL: str(int(time.time()))}
+
+
+def _label_argv(labels: Mapping[str, str]) -> list[str]:
+    return [part for key, value in labels.items()
+            for part in ("--label", f"{key}={value}")]
+
+
+def build_argv(tag: str, context: Path,
+               labels: Mapping[str, str] = MappingProxyType({})) -> list[str]:
     """Build has network on purpose: apt and pip need it (invariant 4).
 
     The context is a temp dir holding exactly the Dockerfile and the script, so the
@@ -89,6 +117,7 @@ def build_argv(tag: str, context: Path) -> list[str]:
     return [
         "docker", "build",
         "--tag", tag,
+        *_label_argv(labels),
         "--file", str(context / "Dockerfile"),
         str(context),
     ]
@@ -100,11 +129,13 @@ def run_argv(
     cidfile: Path,
     limits: Limits,
     args: Sequence[str] = (),
+    labels: Mapping[str, str] = MappingProxyType({}),
 ) -> list[str]:
     """Every hardening flag from ARCHITECTURE.md invariant 5, in the argv itself."""
     argv = [
         "docker", "run",
         "--name", name,
+        *_label_argv(labels),
         "--cidfile", str(cidfile),
         "--network", "none",
         "--memory", limits.memory,
@@ -173,17 +204,130 @@ def _start_error(name: str) -> str:
     return done.stdout.strip() if done.returncode == 0 else ""
 
 
-def _force_remove(name: str) -> None:
+def _docker(*argv: str) -> None:
+    """Best effort. A wedged daemon is not a reason to lose the run's result."""
     try:
-        subprocess.run(
-            ["docker", "rm", "--force", name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=30,
-            check=False,
-        )
+        subprocess.run(["docker", *argv], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=30, check=False)
     except (subprocess.TimeoutExpired, OSError):
-        pass  # A wedged daemon is not a reason to lose the run's result.
+        pass
+
+
+def force_stop(name: str) -> None:
+    """Stop the container, and deliberately do not remove it.
+
+    Stopping is the safety property: killing the docker client does not kill the
+    container, which is measured behaviour rather than theory, so nothing may be left
+    executing. Removing is a different thing, and doing it here is what made an untrusted
+    sample runnable twice.
+
+    The container is the only durable evidence that an attempt already executed. A
+    checkpoint is written after a node returns, so a crash between removing the container
+    and committing that checkpoint leaves a resumed run with no state and no container,
+    and it runs the sample again. Keeping the exited container until the result is
+    durable closes that window: `remove_container` is called by a later node, once the
+    result has been written down.
+
+    `kill` rather than `stop`, because `stop` sends SIGTERM and waits, and a sample that
+    ignores SIGTERM would hold this up for the grace period. Nothing here needs the
+    container to shut down tidily.
+    """
+    _docker("kill", name)
+
+
+def remove_container(name: str) -> None:
+    """Remove a container once nothing needs it as evidence any more."""
+    _docker("rm", "--force", name)
+
+
+def container_exists(name: str) -> bool:
+    """Whether a container with this name is still on the host, in any state.
+
+    The reconciliation primitive. `run` stops its container and leaves it, and removal
+    happens only once the run's result is durable, so a container still here either
+    belongs to a run in progress or was left by a process that died. Either way the
+    sample already ran under that name.
+    """
+    finished = subprocess.run(["docker", "ps", "-a", "--filter", f"name=^{name}$",
+                               "--format", "{{.Names}}"],
+                              capture_output=True, text=True, timeout=20)
+    return name in finished.stdout.split()
+
+
+def _ours(kind: str, list_argv: list[str]) -> list[tuple[str, str, int]]:
+    """Every object of this kind we made, as (id, run_id, started).
+
+    Two calls rather than one, and no date parsing anywhere. `docker ps --format` can
+    print a container's labels but `docker images --format` cannot, so a single listing
+    that worked for both does not exist; `inspect` answers for both in the same shape.
+    """
+    listed = subprocess.run(list_argv, capture_output=True, text=True, timeout=30,
+                            check=False)
+    ids = listed.stdout.split()
+    if not ids:
+        return []
+    shown = subprocess.run(
+        ["docker", kind, "inspect", *ids, "--format",
+         '{{.Id}}\t{{index .Config.Labels "' + RUN_LABEL + '"}}\t'
+         '{{index .Config.Labels "' + STARTED_LABEL + '"}}'],
+        capture_output=True, text=True, timeout=60, check=False)
+    found = []
+    for line in shown.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3 or not parts[1]:
+            continue
+        try:
+            found.append((parts[0], parts[1], int(parts[2])))
+        except ValueError:
+            # A label we wrote that is not a number is not ours to reason about, and
+            # guessing an age for it is how a sweep deletes something it should not.
+            continue
+    return found
+
+
+def sweep(keep: str = "", older_than: float = 3600.0) -> list[str]:
+    """Remove containers and images left behind by runs that did not finish.
+
+    Two guards, and both are about other people's work rather than tidiness.
+
+    Ownership: anything labelled with `keep` belongs to the run asking for the sweep and
+    is skipped, because a run must not delete the image it is about to run.
+
+    Age: anything younger than `older_than` is skipped, because a second envforge may be
+    running right now and its objects are labelled exactly like ours. There is no way to
+    ask "is that process alive", so age stands in for it, and an hour is far longer than
+    a run and far shorter than a machine fills up.
+
+    Returns what it removed, so a caller can say so rather than sweeping silently.
+    """
+    cutoff = time.time() - older_than
+    removed = []
+    for kind, listing, drop in (
+        ("container", ["docker", "ps", "--all", "--quiet", "--filter",
+                       f"label={RUN_LABEL}"], remove_container),
+        ("image", ["docker", "image", "ls", "--quiet", "--filter",
+                   f"label={RUN_LABEL}"], remove_image),
+    ):
+        for object_id, run_id, started in _ours(kind, listing):
+            if run_id == keep or started > cutoff:
+                continue
+            drop(object_id)
+            removed.append(f"{kind} {object_id[:12]} from run {run_id[:8]}")
+    return removed
+
+
+def remove_image(tag: str) -> None:
+    """Remove a tag, and with it the image and any layers nothing else references.
+
+    It does not touch the build cache, which is a separate store that only
+    `docker builder prune` clears. Reading this as "cleanup" is what would let someone
+    conclude a finished run leaves nothing behind on the machine.
+
+    Best effort and bounded. This was the only docker call in the file with no timeout,
+    and it runs once per built tag inside a `finally`, so a wedged daemon hung the
+    program forever after the run had already produced its answer.
+    """
+    _docker("image", "rm", "--force", tag)
 
 
 def daemon_error() -> str | None:
@@ -222,7 +366,8 @@ class DockerSandbox:
         # pay full price every attempt.
         self.built_tags: list[str] = []
 
-    def build(self, dockerfile: str, files: Mapping[str, str], tag: str) -> BuildResult:
+    def build(self, dockerfile: str, files: Mapping[str, str], tag: str,
+              labels: Mapping[str, str] = MappingProxyType({})) -> BuildResult:
         """Every file lands in the context root under its own name, which is the name a
         COPY must use.
 
@@ -257,7 +402,7 @@ class DockerSandbox:
                                        "interprets. It would replace the gated Dockerfile")
                 (context / name).write_text(content, encoding="utf-8")
             code, out, err, timed_out = _capture(
-                build_argv(tag, context), self.limits.build_timeout
+                build_argv(tag, context, labels), self.limits.build_timeout
             )
         log, truncated = _bound(out + err)
         return BuildResult(
@@ -270,8 +415,14 @@ class DockerSandbox:
             seconds=time.monotonic() - started,
         )
 
-    def run(self, image: str, args: Sequence[str] = ()) -> RunResult:
-        name = f"envforge-{uuid.uuid4().hex[:12]}"
+    def run(self, image: str, args: Sequence[str] = (), name: str | None = None,
+            labels: Mapping[str, str] = MappingProxyType({})) -> RunResult:
+        # A caller may supply the name so it can find this container again after a
+        # crash. This method stops the container and deliberately leaves it in place,
+        # so the container is durable evidence that the sample already ran, and
+        # `remove_container` is called later by whoever knows the result is safe.
+        # Random by default, because a caller that does not care must not invent one.
+        name = name or f"envforge-{uuid.uuid4().hex[:12]}"
         started = time.monotonic()
         with tempfile.TemporaryDirectory(prefix="envforge-cid-") as tmp:
             # docker refuses to overwrite a cidfile, so the path must not exist yet.
@@ -279,16 +430,17 @@ class DockerSandbox:
             start_error = ""
             try:
                 code, out, err, timed_out = _capture(
-                    run_argv(image, name, cidfile, self.limits, args),
+                    run_argv(image, name, cidfile, self.limits, args, labels),
                     self.limits.run_timeout,
                 )
             finally:
-                # Order matters and removal must still be unconditional: read the
-                # witness first, then remove whatever happened while reading it.
+                # Order matters and stopping must still be unconditional: read the
+                # witness first, then stop whatever was running while we read it. The
+                # container is left in place on purpose; see `force_stop`.
                 try:
                     start_error = _start_error(name)
                 finally:
-                    _force_remove(name)
+                    force_stop(name)
             created = cidfile.exists()
 
         stdout, cut_out = _bound(out)
@@ -309,17 +461,5 @@ class DockerSandbox:
         )
 
     def remove_image(self, tag: str) -> None:
-        """Best effort, and bounded. This was the only docker call in the file with no
-        timeout, and it runs once per built tag inside a `finally`, so a wedged daemon
-        hung the program forever after the run had already produced its answer."""
-        try:
-            subprocess.run(
-                ["docker", "image", "rm", "--force", tag],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-                timeout=30,
-            )
-        except (subprocess.TimeoutExpired, OSError):
-            # Cleanup failing must never lose a result the run already earned.
-            pass
+        """See the module-level `remove_image`: a tag, not the build cache."""
+        remove_image(tag)

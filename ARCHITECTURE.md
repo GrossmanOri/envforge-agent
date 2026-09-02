@@ -39,7 +39,11 @@ same gate before any build.
 4. Build has network. Run has none.
 5. The run has a memory cap, a pids cap, a cpu cap, read-only root with a tmpfs,
    cap-drop ALL, no-new-privileges, and a non-root user.
-6. Every container is named and force-removed in a `finally`.
+6. Every container is named before it spawns and killed in a `finally`, so killing the
+   docker client can never leave one running. Removal is deliberately later: the
+   container is the only durable proof that an untrusted sample already ran, so it is
+   removed once the run's result has been checkpointed, and a sweep collects whatever a
+   crashed run left behind.
 7. No Docker socket is mounted anywhere, and the agent is never containerised.
 8. Test arguments are passed only after the image name, so an ENTRYPOINT image receives
    them as argv and never as docker flags.
@@ -131,6 +135,50 @@ same gate before any build.
     gate and comes back for repair with a marker in the middle, which is the correct
     behaviour for a file that large: `bound` keeps the head and the tail, so `FROM` and
     the command survive, and the marker says what was removed.
+
+23. The model chooses what it reads and never what the loop does. The tools it may call
+    are read-only inspections of the script. Submitting a Dockerfile is a tool the graph
+    routes on rather than executes, so the gate, the build and the run are deterministic
+    nodes that no tool call can reach.
+24. One prompt holds at most the bounded script, plus `MAX_LOOKS` slices of it, plus the
+    previous Dockerfile and the evidence, each bounded. The conversation is cleared at
+    the start of every attempt, which is a security property and not housekeeping: the
+    message list accumulates, so without the reset three attempts of four looks would put
+    twelve slices of the sample in one context.
+25. Every tool result is bounded and labelled where it is produced, not where it is
+    consumed. There is one function that cuts a piece out of the sample, which is the
+    only place the rule cannot be forgotten by a later caller.
+26. A search pattern is a literal, never a regular expression. The pattern is chosen by a
+    model that has just read attacker-controlled text, and `re` on a model-chosen pattern
+    is catastrophic backtracking on the host, which is the one machine here not in a
+    sandbox.
+27. Every reply is exactly one tool call. Parallel tool use is disabled, because a second
+    call in one reply never receives a result and would let one reply return several
+    slices past the look cap.
+28. An untrusted sample is executed at most once per attempt, and the guarantee is
+    durable rather than best effort. The container is named from the run and the attempt,
+    it is killed but not removed when the run node finishes, and it is removed only after
+    the result has been checkpointed. A container bearing an attempt's name is therefore
+    proof that the attempt already executed, and a resumed run that finds one refuses to
+    execute again and reports the attempt as interrupted rather than producing a verdict.
+    This holds with a durable checkpointer; `InMemorySaver` loses the state with the
+    process, so there is no resume to protect.
+29. Nothing that cannot be serialised goes in graph state. The model, the sandbox, the
+    gate and the event sink are runtime context. State is what a checkpointer writes
+    down, so a credential in state is a credential written to wherever checkpoints go.
+30. Every image and container this project creates carries an `envforge.run` label naming
+    the run that made it, and a second label saying when that run started. The run that
+    made them removes them when it finishes, in a `finally`. A sweep at startup removes
+    labelled objects from other runs older than an hour, and both guards matter: the
+    ownership check stops a run deleting the image it is about to execute, and the age
+    check stops it deleting the work of a second envforge running right now, which
+    labels its objects identically and cannot be asked whether it is alive.
+31. The BuildKit cache is never pruned automatically. Layer reuse is what makes a repair
+    attempt cheap, and a loop that deleted its own base layers would pay full price on
+    every attempt. It is unbounded by design, and `docker builder prune` is the user's to
+    run. `remove_image` removes a tag, and with it the image and any layers nothing else
+    references; it does not touch that cache, and reading it as "cleanup" is what would
+    let someone conclude a finished run leaves nothing behind on the machine.
 
 Invariants 4 and 5 are asserted against the argv that `sandbox.py` actually builds, so
 dropping a flag from the code fails a test rather than passing review.
@@ -444,6 +492,61 @@ The three prompt templates were collapsed onto one shared context in the same ch
 truncation notice and the manifest have to appear on a repair as well as on a first ask,
 and three copies of a paragraph is the shape where the third copy goes missing. That shape
 is what kept the manifest out of the prompt for months.
+
+### ADR-019: the agent is a LangGraph graph, and there is only one of it
+Decided 2026-09-02, replacing an earlier attempt that is kept unmerged as reference.
+
+`envforge/graph.py` is the engine. `StateGraph` over an extended `MessagesState`, a chat
+model with `bind_tools`, `@tool` functions inside a `ToolNode`, and conditional edges.
+There is no second engine, no plain loop beside it and no flag to choose between them.
+
+That is the reversal worth recording. The first port kept the existing `while` loop and
+added a graph beside it, with a contract test proving the two agreed. It passed every
+test and bought nothing: two engines mean upkeep, and the second can never be allowed to
+behave differently from the first without failing the contract, so it can never become
+the thing LangGraph is for. What LangGraph is for is checkpointing, resuming and
+inspecting a run between nodes, and none of that arrives while a loop is still the thing
+actually running.
+
+The state is plain data and travels between nodes. Nodes return only the fields they
+changed and the framework merges them. The first attempt carried one mutable object
+through the graph and mutated it inside the nodes, which looks identical from outside and
+is a loop wearing a graph costume: nothing is checkpointable, nothing is resumable, and a
+node's effect on a run cannot be read from what it returns.
+
+The division of labour is the security story. The model's tools read the script and
+nothing else. Submitting a Dockerfile is a tool the graph routes on rather than executes,
+so the gate, the build and the run are nodes the model cannot call. `ToolNode` therefore
+holds only read-only tools, which is a cleaner statement of the boundary than a comment
+would be.
+
+Rejected: `tools_condition`. It answers "tools" or "end", and there are two kinds of tool
+call here that must go to different places, so the routing reads the tool name itself.
+
+Rejected: keeping the loop as a fallback engine. See above; it is the whole point.
+
+### ADR-020: what a run leaves on the machine
+Decided 2026-09-02, after being asked a question nobody had asked.
+
+Cleanup belongs to the object that owns the run, in a `finally`, and not to the command
+line. It lived in the command line because that was the only caller, and the consequence
+was invisible until the engine changed: every run driven by anything else leaked an image
+per attempt, which was every run of the graph implementation until this was written.
+
+Objects are labelled rather than name-matched. A sweep has to say "this is ours" on
+somebody else's machine, and a prefix match on `envforge-` would also match a container a
+user named that themselves. Deleting it would be our bug in their workspace.
+
+The start time is a label rather than the object's own creation timestamp, so the sweep
+never parses a date. Docker prints creation times in a human format that varies with
+locale and version, and an age rule built on parsing that is a rule that breaks somewhere
+else.
+
+The limitation is stated rather than fixed: the BuildKit cache grows without bound and
+nothing here prunes it. That is deliberate, because pruning it is what would make every
+repair attempt pay full price, and it means a finished run does not leave the machine as
+it found it. Invariant 31 says so, because the honest failure of a cleanup policy is
+someone reading "cleanup" and believing more than it does.
 
 ## What crosses each boundary
 

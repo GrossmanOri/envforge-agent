@@ -133,3 +133,18 @@ def test_the_check_would_actually_catch_something():
     # only judgment it makes and the one worth pinning down.
     assert CREDENTIAL.search("sk-ant-api03-" + "x" * 40), "a real-length key must be caught"
     assert not CREDENTIAL.search("sk-ant-REPLACE_ME"), "a placeholder must not be caught"
+
+
+def test_no_two_decisions_share_a_number():
+    """ADR numbers are how one entry refers to another, so a duplicate makes both
+    references ambiguous and neither wrong enough to notice.
+
+    Written after ADR-018 was used twice: once for the looking tools and once, a
+    fortnight later, for the engine. Counting the headings by hand is exactly the check
+    a person skips.
+    """
+    text = (ROOT / "ARCHITECTURE.md").read_text()
+    numbers = re.findall(r"^### (ADR-\d+):", text, flags=re.M)
+    duplicates = sorted({n for n in numbers if numbers.count(n) > 1})
+    assert not duplicates, f"used more than once: {', '.join(duplicates)}"
+    assert numbers == sorted(numbers), "the decision log is out of order"

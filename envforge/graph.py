@@ -1,0 +1,670 @@
+"""The agent as a LangGraph graph. First slice: ask, look, submit, gate.
+
+    START -> model -+-> inspect -> model        the model reading the script
+                    |
+                    +-> gate -+-> model         rejected, so try again
+                    |         |
+                    |         +-> END           passed (build and run land next)
+                    +-> END                     nothing more to do
+
+`model` is the only node that talks to the model. `inspect` is a `ToolNode` holding the
+two read-only tools. `gate` is deterministic and the model cannot call it: submitting a
+Dockerfile is a tool the graph routes on rather than executes, so the checking is done by
+a node rather than by a tool the model chose to run.
+
+State is plain data and travels between nodes. Nodes return only the fields they change
+and LangGraph merges them, so a node's whole effect on a run is the dict it returns. The
+model, the sandbox, the gate and the event sink are not state: they are runtime context,
+because state gets checkpointed and none of those can or should be written down.
+"""
+
+from __future__ import annotations
+
+import uuid
+from dataclasses import asdict
+from typing import Any, Literal
+
+from langchain_core.messages import (AIMessage, AnyMessage, HumanMessage, RemoveMessage,
+                                     SystemMessage, ToolMessage)
+from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.prebuilt import ToolNode
+from langgraph.runtime import Runtime
+
+from .agent import (CONTEXT, DOCKERFILE_LIMIT, EVIDENCE_LIMIT, FIRST, LANGUAGES,
+                    SCRIPT_LIMIT, SYSTEM, Outcome, Usage, default_dockerfile,
+                    describe, manifests)
+from .context import Context
+from .sandbox import container_exists, remove_container, sweep
+from .events import Event
+from .sandbox import BuildResult, RunResult, labels_for
+from .tools import (INSPECTION, SUBMIT, bound, inspection_tools, submit_dockerfile)
+
+# How many times the model may look at the script in one attempt.
+#
+# A cap in code, never a sentence in the prompt: a rule written in a prompt is a request
+# made of the thing the prompt is defending against. It is enforced by binding a
+# different tool list once the budget is gone, so a withdrawn tool cannot be called
+# however the conversation goes.
+#
+# It is a security control before it is a cost control. Each look returns a bounded slice
+# of an untrusted script, and a model that asks for region after region has reassembled
+# the file one piece at a time without breaking any other rule.
+MAX_LOOKS = 4
+
+
+class State(MessagesState):
+    """One run's facts. Everything here is bounded and serialisable.
+
+    Extends `MessagesState`, so `messages` carries the conversation with the model under
+    the `add_messages` reducer. Everything else is scalars, strings and small lists.
+
+    `messages` accumulating is exactly what makes the reset below necessary, and that is
+    a security property rather than housekeeping: the bound on how much of the sample can
+    reach one prompt assumes each attempt starts a fresh conversation. Without the reset,
+    three attempts of four looks put twelve slices of the script in one context.
+    """
+
+    run_id: str
+    language: str
+    script: str                  # the filename
+    full: str                    # the whole script text; the tools read from this
+    files: dict[str, str]        # everything the workspace gathered, for the build
+    args: list[str]              # arguments for the script, after the image name
+    attempt: int
+    calls: int                   # requests sent to the model, usable or not
+    looks: int                   # of those, ones that read the script
+    seen: int                    # looks used this attempt, against MAX_LOOKS
+    candidate: str | None        # the Dockerfile the model last submitted
+    base_image: str
+    evidence: str | None         # why the last candidate did not work
+    rejection: str | None        # what the gate said, if it refused
+
+    max_attempts: int
+    max_refusals: int
+    refusals: list[str]          # what the model said when it declined, in order
+    used_fallback: bool          # the Dockerfile is ours, so it gets no repairs
+    input_tokens: int
+    output_tokens: int
+    # Run-scoped, not attempt-scoped: the free rebuild after a timeout is offered once
+    # per run, so a Dockerfile that always times out cannot buy a fresh retry every
+    # attempt.
+    rebuilt_after_timeout: bool
+    retry_to: str                # where `retry` sends the run: "model" or "build"
+    # Results as plain dicts rather than the frozen dataclasses they came from.
+    # `BuildResult` round-trips through the checkpointer today and LangGraph warns that
+    # deserialising unregistered types will be blocked, so the state holds shapes the
+    # serialiser knows and the dataclass is rebuilt when the outcome is made.
+    build: dict[str, Any] | None
+    result: dict[str, Any] | None
+
+
+def refusal_reason(reply: Any) -> str | None:
+    """What the model said when it declined, or None if it did not.
+
+    Two providers, two shapes, and neither is an exception: a refusal is a successful
+    HTTP 200. Anthropic reports it as `stop_reason` "refusal" in the response metadata.
+    OpenAI puts the text in a `refusal` field on the message, which LangChain carries in
+    `additional_kwargs`.
+
+    Kept apart from error handling on purpose, and this is the distinction the design
+    rests on. A refusal is the model judging the sample, which is information about the
+    sample. A dead key or an empty account is our infrastructure failing, which is
+    information about us. Confusing them would mean writing our own Dockerfile, running
+    it, and printing an ordinary verdict for a run the model never saw, which for a tool
+    whose only product is a judgment about untrusted code is the worst failure available.
+    """
+    metadata = getattr(reply, "response_metadata", None) or {}
+    if metadata.get("stop_reason") == "refusal":
+        details = metadata.get("stop_details") or {}
+        return str(details.get("explanation") or details or "no reason given")
+    extra = getattr(reply, "additional_kwargs", None) or {}
+    if extra.get("refusal"):
+        return str(extra["refusal"])
+    return None
+
+
+def _emit(runtime: Runtime[Context], event: Event) -> None:
+    runtime.context.emit(event)
+
+
+def model_node(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
+    """Ask the model once, with the tools this attempt is still allowed.
+
+    The tool list is the cap. Once `seen` reaches `MAX_LOOKS` the inspection tools are
+    not in the request at all, so the only call the model can make is the submission.
+    """
+    tools = list(inspection_tools(state["full"]))
+    if state["seen"] >= MAX_LOOKS:
+        tools = []
+    bound_model = runtime.context.model.bind_tools(
+        tools + [submit_dockerfile],
+        # One tool call per reply. Two would leave one without a result, which the next
+        # request rejects, and it would let a single reply return several slices and walk
+        # past the look cap.
+        parallel_tool_calls=False,
+    )
+    _emit(runtime, Event("asking", f"attempt {state['attempt']}: asking the model"))
+    reply = bound_model.invoke(state["messages"])
+    # Charged from the reply rather than estimated. `usage_metadata` is LangChain's
+    # normalised shape, so this is the same arithmetic on every provider.
+    used = getattr(reply, "usage_metadata", None) or {}
+    charged = {"calls": state["calls"] + 1,
+               "input_tokens": state["input_tokens"] + used.get("input_tokens", 0),
+               "output_tokens": state["output_tokens"] + used.get("output_tokens", 0)}
+
+    said = refusal_reason(reply)
+    if said is None:
+        return {"messages": [reply], **charged}
+
+    # A refusal is the model judging the sample, which is a finding about the sample and
+    # not a failure of ours. It never spends a repair attempt: it has its own counter,
+    # because asking a model that has just declined to try again is not a repair.
+    refusals = state["refusals"] + [said]
+    runtime.context.emit(Event("refused", f"the model declined: {said}",
+                               {"reason": said}))
+    if len(refusals) <= state["max_refusals"]:
+        return {"messages": [reply], "refusals": refusals, **charged}
+
+    # Declined twice, so we write the Dockerfile ourselves and stop asking. Its
+    # existence is what makes a refusal survivable without another call, and it goes
+    # through the same gate as anything the model wrote: one path to the daemon.
+    runtime.context.emit(Event("fell_back", "refused twice, using our own Dockerfile"))
+    return {"messages": [reply], "refusals": refusals, "used_fallback": True,
+            "candidate": default_dockerfile(state["language"], state["script"]),
+            "base_image": LANGUAGES[state["language"]].base_image, **charged}
+
+
+def route_model(state: State) -> Literal["inspect", "gate", "model", "unusable"]:
+    """Where a reply goes, decided by which tool the model called.
+
+    `tools_condition` cannot do this: it answers "tools" or "end", and there are two
+    kinds of tool call here that must go to different places. Reading the name is also
+    what keeps the submission away from `ToolNode`, so no tool the model calls can reach
+    the gate.
+    """
+    if state["used_fallback"] and state["candidate"]:
+        # The model refused twice and we wrote the Dockerfile. It is checked like any
+        # other: one path to the daemon, whoever wrote the file.
+        return "gate"
+    last = state["messages"][-1]
+    if refusal_reason(last) is not None:
+        # Declined, and the refusal counter is not spent yet, or the branch above would
+        # have caught it. Asking again is not a repair, so this does not touch `retry`.
+        return "model"
+    calls = getattr(last, "tool_calls", None) or []
+    if not calls:
+        # A reply that neither called a tool nor declined. Unusable rather than final:
+        # ending here would report no verdict at all, so it spends an attempt and the
+        # model is told what was wrong with the shape of its answer.
+        return "unusable"
+    if calls[0]["name"] == SUBMIT:
+        return "gate"
+    if calls[0]["name"] in INSPECTION:
+        return "inspect"
+    return "unusable"
+
+
+def unusable_node(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
+    """A reply we cannot use. Repairable, but by rewriting the reply rather than the
+    image, so it spends an attempt and the model is told what shape was expected."""
+    reason = ("your reply called no tool. Answer by calling one of the tools you were "
+              "given, not with prose")
+    runtime.context.emit(Event("unusable_reply", reason))
+    return {"retry_to": "model", "evidence": reason}
+
+
+def counted_inspect(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
+    """Count the look and say what was read.
+
+    Counting is a node rather than something inside a tool, because the cap is the
+    graph's rule and not the tool's. A tool that counted its own uses would be the thing
+    being limited keeping the tally.
+    """
+    last = state["messages"][-1]
+    call = (getattr(last, "tool_calls", None) or [{}])[0]
+    seen = state["seen"] + 1
+    _emit(runtime, Event("looked",
+                         f"attempt {state['attempt']}: the model called "
+                         f"{call.get('name')} with {call.get('args')}",
+                         {"tool": call.get("name"), "call": None, "result": "",
+                          "run_id": state["run_id"]}))
+    if seen == MAX_LOOKS:
+        _emit(runtime, Event("tool_capped",
+                             f"that was look {MAX_LOOKS} of {MAX_LOOKS} for this "
+                             f"attempt. The looking tools are withdrawn and the model "
+                             f"must submit now"))
+    return {"seen": seen, "looks": state["looks"] + 1}
+
+
+def gate_node(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
+    """Check the submitted Dockerfile. Deterministic, and unreachable from a tool call.
+
+    Reads the arguments off the submission the model made, answers that tool call with a
+    `ToolMessage` so the conversation stays well formed, and records the verdict. What
+    happens next is `route_gate`'s decision, not the model's.
+    """
+    last = state["messages"][-1]
+    call = (getattr(last, "tool_calls", None) or [{}])[0]
+    if state["used_fallback"]:
+        # Ours, so there is no tool call to read it from and none to answer. It is
+        # checked exactly like anything the model submitted.
+        dockerfile, base_image = state["candidate"] or "", state["base_image"]
+        answers: list[Any] = []
+    else:
+        args = call.get("args", {})
+        dockerfile, base_image = args.get("dockerfile", ""), args.get("base_image", "")
+        answers = [call]
+
+    rejection = runtime.context.gate(dockerfile, base_image, frozenset(state["files"]))
+    answer = ("the Dockerfile passed the gate" if rejection is None
+              else f"the Dockerfile was rejected before it was built: {rejection}")
+    # Every tool call is answered or the next request is refused for a dangling call.
+    # The gate's own words go back to the model as the repair evidence.
+    replies = [ToolMessage(content=answer, tool_call_id=c.get("id", ""))
+               for c in answers]
+
+    if rejection is not None:
+        _emit(runtime, Event("gate_rejected", rejection, {"dockerfile": dockerfile}))
+        if state["used_fallback"]:
+            # Three things can go wrong with a Dockerfile we wrote ourselves, and in
+            # all three the honest move is to stop and say which, never to ask a model
+            # that has already declined twice.
+            _emit(runtime, _outcome(
+                state, f"our fallback Dockerfile was rejected: {rejection}",
+                ok=False, kind="failed", dockerfile=dockerfile, used_fallback=True))
+            return {"messages": replies, "candidate": dockerfile,
+                    "base_image": base_image, "rejection": rejection,
+                    "evidence": None, "retry_to": END}
+        return {"messages": replies, "candidate": dockerfile,
+                "base_image": base_image, "rejection": rejection, "evidence": answer}
+    if not state["used_fallback"]:
+        # `wrote` means the model wrote it. Our own fallback already announced itself
+        # with `fell_back`, and saying the model wrote it would be a false sentence in
+        # the one output that has to say who wrote what.
+        _emit(runtime, Event("wrote", f"got {len(dockerfile)} characters",
+                             {"base_image": base_image, "call": None,
+                              "run_id": state["run_id"]}))
+    return {"messages": replies, "candidate": dockerfile, "base_image": base_image,
+            "rejection": None, "evidence": None}
+
+
+def route_gate(state: State) -> Literal["build", "retry", "__end__"]:
+    """A passing Dockerfile is built. A rejected one spends an attempt and goes back.
+
+    Through `retry` rather than straight to the model, because a rejection is a failed
+    attempt and the attempt cap has to see it. Routing it directly to the model would
+    make a Dockerfile the gate always refuses loop until the graph's own recursion limit
+    stopped it, which produces no verdict at all.
+    """
+    return "retry" if state["rejection"] is not None else "build"
+
+
+def _outcome(state: State, reason: str, /, message: str | None = None,
+             **fields: Any) -> Event:
+    """The one event every ending produces, with the shared fields filled in.
+
+    `message` differs from `reason` on the give-up path, which says "gave up after 3
+    attempts" to a person and records "no Dockerfile worked in 3 attempts" as the
+    outcome. Positional-only up to here, because `Outcome` has a field called `run`.
+    """
+    return Event("finished", message if message is not None else reason,
+                 {"outcome": Outcome(
+                     reason=reason, attempts=state["attempt"], run_id=state["run_id"],
+                     usage=Usage(state["calls"], state["input_tokens"],
+                                 state["output_tokens"], state["looks"]),
+                     refusals=list(state["refusals"]),
+                     build=BuildResult(**state["build"]) if state["build"] else None,
+                     run=RunResult(**state["result"]) if state["result"] else None,
+                     **fields)})
+
+
+def build_node(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
+    """Build the image the gate just passed.
+
+    Safe to replay. The tag is derived from the run and the attempt rather than from a
+    clock or a counter, so a rebuild after a crash produces the same tag, and buildkit
+    serves the layers it already has. Rebuilding costs time and changes nothing, which
+    is what makes this the easy half of the replay question.
+    """
+    tag = f"envforge-{state['run_id']}:attempt{state['attempt']}"
+    runtime.context.emit(Event("building", f"building {tag}"))
+    build = runtime.context.sandbox.build(state["candidate"], state["files"], tag,
+                                          labels_for(state["run_id"]))
+    return {"build": asdict(build)}
+
+
+def route_build(state: State) -> Literal["run", "retry", "__end__"]:
+    """Where a build goes, decided by what `after_build` already worked out.
+
+    Routing on `retry_to` rather than re-reading the build, because the first version
+    re-derived the timeout decision here and got it backwards: `after_build` sets
+    `rebuilt_after_timeout` before this runs, so a route testing that flag saw the value
+    from after the decision and ended the run instead of taking the free rebuild. One
+    node decides, the route reads what it decided.
+    """
+    if state["build"] and BuildResult(**state["build"]).ok:
+        return "run"
+    return END if state["retry_to"] == END else "retry"
+
+
+def after_build(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
+    """Say what the build did, and decide what the next attempt is for.
+
+    Separate from `build_node` so the node that performs the side effect does nothing
+    else, which is what keeps the replay question about one line.
+    """
+    build = BuildResult(**state["build"])
+    if build.ok:
+        return {}
+    if build.timed_out:
+        # A timeout is not a Dockerfile defect, so it must not spend a model call. The
+        # same file is worth building once more for free: the incident this was written
+        # for was a cold base image pulling past the ceiling, and buildkit keeps what it
+        # pulled, so the retry starts warm. Once, not until it works.
+        if not state["rebuilt_after_timeout"]:
+            runtime.context.emit(Event("build_failed",
+                                       f"the build timed out after {build.seconds:.0f}s. "
+                                       f"Trying the same Dockerfile once more, which "
+                                       f"costs no tokens: a partly-pulled image is kept "
+                                       f"and the retry starts warm"))
+            return {"rebuilt_after_timeout": True, "retry_to": "build"}
+        reason = (f"the build timed out after {build.seconds:.0f}s, twice. The Dockerfile "
+                  f"asks for more work than the timeout allows, or the image cannot be "
+                  f"pulled from here")
+        runtime.context.emit(Event("build_failed", reason))
+        runtime.context.emit(_outcome(state, reason, ok=False, kind="build_timeout",
+                                      dockerfile=state["candidate"],
+                                      used_fallback=state["used_fallback"]))
+        return {"retry_to": END}
+    runtime.context.emit(Event("build_failed", f"build exited {build.exit_code}"))
+    if state["used_fallback"]:
+        runtime.context.emit(_outcome(
+            state, "our fallback Dockerfile did not build", ok=False, kind="failed",
+            dockerfile=state["candidate"], used_fallback=True))
+        return {"retry_to": END}
+    return {"retry_to": "model", "evidence": bound(build.log, EVIDENCE_LIMIT)}
+
+
+def container_name(state: State) -> str:
+    """One name per attempt, derived rather than generated.
+
+    Derived, because it is the durable evidence a resumed run reads. A random name would
+    make the guard below unable to recognise its own container.
+    """
+    return f"envforge-{state['run_id']}-attempt{state['attempt']}"
+
+
+def run_node(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
+    """Run the container, unless this attempt already ran one.
+
+    The hard half of the replay question. Building twice wastes time; running twice
+    executes an untrusted sample a second time, which is the one side effect in this
+    program that must happen at most once.
+
+    A checkpoint is written after a node returns, so a crash between the container
+    exiting and the checkpoint committing means LangGraph replays this node. Nothing in
+    the state can help, because the state is exactly what was not saved. The evidence
+    has to be outside: the container is named from the run and the attempt, and `run`
+    removes it unconditionally, so a container still bearing this name was left behind
+    by a process that died. Finding one means the sample already ran, and the honest
+    answer is to stop and say so rather than to run it again or to invent a verdict.
+    """
+    name = container_name(state)
+    if runtime.context.exists(name):
+        reason = ("this attempt already started a container and the run was interrupted "
+                  "before its result was recorded. Refusing to run the sample a second "
+                  "time")
+        runtime.context.emit(Event("exec_failed", reason))
+        runtime.context.emit(_outcome(state, reason, ok=False, kind="failed",
+                                      dockerfile=state["candidate"]))
+        return {"result": None}
+
+    tag = f"envforge-{state['run_id']}:attempt{state['attempt']}"
+    runtime.context.emit(Event("running", f"running {tag}"))
+    build = BuildResult(**state["build"])
+    result = runtime.context.sandbox.run(build.image, state["args"], name=name,
+                                         labels=labels_for(state["run_id"]))
+    return {"result": asdict(result)}
+
+
+def after_run(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
+    """Say what the container did, and only now remove it.
+
+    This node runs after `run` returned, which means `run`'s writes are committed: the
+    result is durable, so the container has stopped being the only record that the sample
+    executed and can go. Removing it inside `run` is what opened the window where a crash
+    left neither a checkpoint nor a container, and a resumed run executed the sample a
+    second time.
+    """
+    runtime.context.remove_container(container_name(state))
+    if state["result"] is None:            # the interrupted-replay path already ended
+        return {}
+    result = RunResult(**state["result"])
+    if result.start_error:
+        # The daemon says the process never started, so the Dockerfile is wrong. This is
+        # deliberately not a test on 126 or 127: a script that can produce anything has
+        # already started.
+        runtime.context.emit(Event("exec_failed",
+                                   f"the container never started: {result.start_error}"))
+        if state["used_fallback"]:
+            runtime.context.emit(_outcome(
+                state, "our fallback image could not run its command", ok=False,
+                kind="failed", dockerfile=state["candidate"], used_fallback=True))
+            return {"retry_to": END}
+        return {"retry_to": "model",
+                "evidence": ("the container never started its command. docker said:\n"
+                             f"{bound(result.start_error, EVIDENCE_LIMIT)}")}
+    # Whether the script succeeded is observable and the caller needs it: a nonzero exit
+    # is a finding, not a malfunction of this tool.
+    runtime.context.emit(_outcome(
+        state, f"the script ran and exited {result.exit_code}", ok=True,
+        kind="ran" if result.exit_code == 0 else "script_failed",
+        dockerfile=state["candidate"], used_fallback=state["used_fallback"]))
+    return {}
+
+
+def route_run(state: State) -> Literal["retry", "__end__"]:
+    if state["result"] is None:
+        return END
+    return "retry" if RunResult(**state["result"]).start_error else END
+
+
+def retry_node(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
+    """Spend an attempt, or give up because there are none left."""
+    if state["attempt"] >= state["max_attempts"]:
+        runtime.context.emit(_outcome(
+            state, f"no Dockerfile worked in {state['attempt']} attempts",
+            message=f"gave up after {state['attempt']} attempts",
+            ok=False, kind="no_image", dockerfile=state["candidate"],
+            used_fallback=state["used_fallback"]))
+        return {"retry_to": END}
+    return {**new_attempt(state), "previous_candidate": None}
+
+
+def route_retry(state: State) -> Literal["model", "build", "__end__"]:
+    return state["retry_to"] if state["retry_to"] in ("model", "build") else END
+
+
+def new_attempt(state: State) -> dict[str, Any]:
+    """Start an attempt: bump the counter and clear the conversation.
+
+    The conversation is cleared because the bound on how much of the untrusted script can
+    reach one prompt is a per-prompt bound, and `add_messages` accumulates. Keeping the
+    old messages would carry every earlier attempt's slices into the new context, so
+    three attempts of four looks would put twelve slices in front of the model at once.
+
+    The system message and the first human message survive, because they are ours: the
+    instructions and the description of the script. Everything the model said and
+    everything a tool returned goes.
+    """
+    keep = 0
+    for index, message in enumerate(state["messages"]):
+        if isinstance(message, (SystemMessage, HumanMessage)):
+            keep = index
+        else:
+            break
+    removals = [RemoveMessage(id=m.id) for m in state["messages"][keep + 1:] if m.id]
+
+    # The reset takes the reason with it, so the reason comes back as a message. This is
+    # the repair prompt: without it a rejected Dockerfile is retried by a model that no
+    # longer knows what was wrong with it, which the tests caught immediately.
+    #
+    # Both halves bounded. `evidence` already is, at the point it is produced. The
+    # candidate is bounded here because it is the model's own text quoting a script it
+    # has just read, and it survives across attempts: a Dockerfile whose comments hold
+    # what the model read would otherwise carry those slices into the next attempt on
+    # top of that attempt's own fresh look budget.
+    told = []
+    if state["evidence"]:
+        previous = state["candidate"] or ""
+        told = [HumanMessage(content=(
+            f"Your last Dockerfile did not work.\n\n"
+            f"--- what you submitted ---\n{bound(previous, DOCKERFILE_LIMIT)}\n"
+            f"--- end ---\n\n{state['evidence']}\n\n"
+            f"Submit a corrected Dockerfile."))]
+    return {"messages": removals + told, "attempt": state["attempt"] + 1, "seen": 0}
+
+
+def build_graph(script_text: str, checkpointer=None):
+    """Three nodes and two routes.
+
+    `inspect` is a `ToolNode` wrapping the read-only tools, followed by `counted`, which
+    does the counting.
+
+    The script is a parameter because the tools close over it, and they close over it so
+    that no tool call can name a file. A graph compiled once for every run and handed the
+    text at call time would need the tools to take a filename, which is the thing this
+    design does not have. Compiling is cheap; one graph per run is the cost of that.
+    """
+    graph = StateGraph(State, context_schema=Context)
+    graph.add_node("model", model_node)
+    graph.add_node("inspect", ToolNode(inspection_tools(script_text)))
+    graph.add_node("counted", counted_inspect)
+    graph.add_node("gate", gate_node)
+
+    graph.add_node("build", build_node)
+    graph.add_node("after_build", after_build)
+    graph.add_node("run", run_node)
+    graph.add_node("after_run", after_run)
+    graph.add_node("retry", retry_node)
+
+    graph.add_edge(START, "model")
+    graph.add_node("unusable", unusable_node)
+    graph.add_conditional_edges("model", route_model,
+                                {"inspect": "inspect", "gate": "gate",
+                                 "model": "model", "unusable": "unusable"})
+    graph.add_edge("unusable", "retry")
+    graph.add_edge("inspect", "counted")
+    graph.add_edge("counted", "model")
+    graph.add_conditional_edges("gate", route_gate,
+                                {"build": "build", "retry": "retry", END: END})
+    # The side effect and the decision are separate nodes throughout. `build` and `run`
+    # do one thing each and record it; `after_build` and `after_run` read what happened
+    # and say what it means. That is what keeps the replay question about a single line
+    # rather than about a node that also emits, routes and reasons.
+    graph.add_edge("build", "after_build")
+    graph.add_conditional_edges("after_build", route_build,
+                                {"run": "run", "retry": "retry", END: END})
+    graph.add_edge("run", "after_run")
+    graph.add_conditional_edges("after_run", route_run, {"retry": "retry", END: END})
+    graph.add_conditional_edges("retry", route_retry,
+                                {"model": "model", "build": "build", END: END})
+    return graph.compile(checkpointer=checkpointer)
+
+
+def start_state(run_id: str, language: str, script: str, full: str,
+                files: dict[str, str], system: str, first: str,
+                args: list[str] | None = None, max_attempts: int = 3,
+                max_refusals: int = 1) -> State:
+    """The state a run begins as."""
+    return State(
+        messages=[SystemMessage(content=system), HumanMessage(content=first)],
+        run_id=run_id, language=language, script=script, full=full, files=files,
+        args=list(args or []),
+        attempt=1, calls=0, looks=0, seen=0,
+        candidate=None, base_image="", evidence=None, rejection=None,
+        max_attempts=max_attempts, max_refusals=max_refusals, refusals=[],
+        used_fallback=False, input_tokens=0, output_tokens=0,
+        rebuilt_after_timeout=False, retry_to="model", build=None, result=None,
+    )
+
+
+def first_prompt(language: str, script: str, full: str,
+                 files: dict[str, str]) -> str:
+    """The opening message: the script, bounded, and what is missing from it.
+
+    Bounded because the script is untrusted text on its way into a prompt. The notice
+    saying how long the whole file is and which offsets were removed is what makes the
+    inspection tools usable: an offset means nothing without it, and a model that cannot
+    tell it is looking at a truncated file has no reason to look.
+
+    Built from the same templates the rest of the project uses rather than a second copy
+    of them, so a change to how a script is presented reaches this too.
+    """
+    shown = bound(full, SCRIPT_LIMIT)
+    context = CONTEXT.format(language=language, name=script, text=shown,
+                             about=describe(full, shown),
+                             files=manifests(files, script))
+    # `.format` on the template, never on the result. The context holds the sample, and a
+    # script full of f-strings and dict literals is a string full of braces: formatting
+    # it a second time raises KeyError on the sample's own text.
+    return FIRST.format(context=context, previous=None, evidence=None)
+
+
+class Agent:
+    """One script in, a stream of events out, and nothing of ours left on the machine.
+
+    Owns the run, which is what makes it the right place for cleanup: the images an
+    attempt built are this object's to remove, and removing them belongs in a `finally`
+    so it happens whether the run ended with a verdict, an exception or a keyboard
+    interrupt.
+
+    Cleanup lives here rather than in the command line, where it used to. That was fine
+    while the command line was the only caller, and it meant this engine leaked an image
+    per attempt for every run driven by anything else, which was every run in this
+    implementation until now.
+
+    `gate` has no default on purpose. Every Dockerfile reaching the daemon was written by
+    a model that had just read untrusted text, so an agent that can be built without a
+    gate is an agent that can build one unchecked.
+    """
+
+    def __init__(self, llm: Any, sandbox: Any, gate: Gate, max_attempts: int = 3,
+                 max_refusals: int = 1) -> None:
+        self.llm, self.sandbox, self.gate = llm, sandbox, gate
+        self.max_attempts, self.max_refusals = max_attempts, max_refusals
+
+    def run(self, workspace: Workspace, language: str, args: Sequence[str] = (),
+            emit=lambda event: None, checkpointer=None,
+            config: dict[str, Any] | None = None) -> Iterator[Event]:
+        """Stream the events the nodes produce, as they produce them."""
+        run_id = uuid.uuid4().hex
+        # Collect what earlier runs left behind, before making anything of our own. Not
+        # a background chore: a crashed run leaves a tagged image and an exited
+        # container, nothing else ever removes them, and the only alternative is that
+        # they accumulate until somebody notices the disk. Guarded by ownership and age,
+        # so a run in another terminal right now is never touched.
+        for gone in sweep(keep=run_id):
+            emit(Event("swept", f"removed {gone}, left by a run that did not finish"))
+        script = workspace.script
+        files = {name: workspace.read(name) for name in workspace.names()}
+        full = files[script]
+        state = start_state(run_id, language, script, full, files,
+                            SYSTEM, first_prompt(language, script, full, files),
+                            args=list(args), max_attempts=self.max_attempts,
+                            max_refusals=self.max_refusals)
+        graph = build_graph(full, checkpointer=checkpointer)
+        produced: list[Event] = []
+        context = Context(model=self.llm, gate=self.gate, sandbox=self.sandbox,
+                          emit=produced.append, exists=container_exists,
+                          remove_container=remove_container)
+        try:
+            yield from graph.stream(state, config or {}, context=context,
+                                    stream_mode="custom")
+        finally:
+            # Unconditional, and scoped to this run. `built_tags` may hold tags from
+            # other runs if a sandbox is shared, so the prefix is the ownership check:
+            # a run removes what it made and nothing else.
+            for tag in list(getattr(self.sandbox, "built_tags", [])):
+                if tag.startswith(f"envforge-{run_id}:"):
+                    self.sandbox.remove_image(tag)

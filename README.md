@@ -18,9 +18,11 @@ read-only root with a tmpfs, every capability dropped, `no-new-privileges`, and 
 user. No Docker socket is mounted anywhere, and the agent is never itself containerised,
 because that would put the socket back.
 
-Every container is named before it spawns and force-removed in a `finally`. Killing the
-docker client does not kill the container, which is measured behaviour rather than a
-precaution. Two ambiguous outcomes are separated by evidence rather than by an exit code:
+Every container is named before it spawns and killed in a `finally`. Killing the docker
+client does not kill the container, which is measured behaviour rather than a precaution.
+Removal comes later on purpose: the container is the only durable proof that an untrusted
+sample already ran, so it is removed once the result is written down, and a run that finds
+one of its own refuses to execute the sample a second time. Two ambiguous outcomes are separated by evidence rather than by an exit code:
 `--cidfile` tells our own malformed command apart from a script that exited 125 on purpose,
 and the daemon's `State.Error` tells an image that could not start its command apart from a
 script that chose 126 to look like one.
@@ -36,9 +38,18 @@ does not do is stated plainly: `pip install <name>` runs that package's own code
 time, and no instruction allowlist can prevent that, because installing packages is the
 product.
 
-**The repair loop**, `envforge/agent.py`. It asks, gates, builds, runs, and decides one
-thing repeatedly: could a different Dockerfile have changed this. A failed build could. A
-script exiting 1 could not, because the script ran, and watching it run is the point.
+**The agent**, `envforge/graph.py`. A LangGraph `StateGraph` and the only engine there
+is. Nodes ask the model, answer its questions about the script, gate the Dockerfile, build
+it and run it. Each node reads the state, does one thing, and returns the fields it
+changed, so what a node did to a run is exactly the dict it returned.
+
+The split between them is the security story. The model's tools read the script and
+nothing else. Submitting a Dockerfile is a tool the graph *routes on* rather than executes,
+so the gate, the build and the run are deterministic nodes that no tool call can reach.
+
+It decides one thing repeatedly: could a different Dockerfile have changed this. A failed
+build could. A script exiting 1 could not, because the script ran, and watching it run is
+the point.
 
 **The workspace**, `envforge/workspace.py`. The only code here that handles a path.
 Symlinks are resolved and then checked for containment, in that order.
@@ -95,9 +106,19 @@ What the model does not get is any influence over the loop. It chooses what to r
 does not choose whether an attempt is spent, whether the gate runs, or whether anything is
 built.
 
-334 tests, 321 of which need neither Docker nor an API key. The rest skip
+387 tests, 371 of which need neither Docker nor an API key. The rest skip
 automatically when no daemon is present. Both suites run on every push
 and every pull request.
+
+**What a run leaves behind.** Every image and container carries a label naming the run
+that made it. The run removes its own when it finishes, whatever it finished with, and a
+sweep at startup collects what a crashed run left, skipping anything younger than an hour
+so a second envforge running right now is never touched.
+
+One thing is deliberately not cleaned up, and saying so is the point: the BuildKit layer
+cache grows without bound. Pruning it is what would make every repair attempt pay full
+price, so `docker builder prune` is yours to run. A finished run does not leave the machine
+exactly as it found it.
 
 ## What is designed and not built
 
