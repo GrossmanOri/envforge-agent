@@ -16,7 +16,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Literal, Protocol, Sequence
+from typing import Any, Generator, Iterator, Literal, Protocol, Sequence
 
 from .events import Event
 from .llm import (LLM, Answered, Call, InvalidArguments, LLMError,
@@ -556,341 +556,60 @@ class Gate(Protocol):
                  allowed_files: frozenset[str]) -> str | None: ...
 
 
-class Agent:
-    """gate has no default on purpose. Every Dockerfile reaching the daemon was
-    written by a model that just read untrusted text, so a loop that can be built
-    without a gate is a loop that can build one unchecked."""
+def context_for(language: str, name: str, full: str, files: dict[str, str]) -> str:
+    """Everything about this run that does not change between attempts.
 
-    def __init__(self, llm: LLM, sandbox: Sandbox, gate: Gate,
-                 max_attempts: int = 3, max_refusals: int = 1) -> None:
-        self.llm, self.sandbox, self.gate = llm, sandbox, gate
-        self.max_attempts, self.max_refusals = max_attempts, max_refusals
-        # `max_attempts` is the only bound, and the only one needed: every attempt
-        # builds an image and runs a container. It used to cap the model calls at roughly
-        # seven as a side effect; with the looking tools that side effect is sixteen, and
-        # the `Usage` docstring above carries what that did to the argument for having no
-        # token ceiling.
+    Built once. It holds the script, so building it once is also what keeps the
+    `.format` below sound: the returned string is substituted into a template as a
+    value and is never itself formatted again. A script full of f-strings and dict
+    literals is a string full of braces, and running `.format` over it a second
+    time would raise KeyError on the sample's own text.
+    """
+    return CONTEXT.format(language=language, name=name,
+                          text=bound(full, SCRIPT_LIMIT),
+                          about=describe(full, bound(full, SCRIPT_LIMIT)),
+                          files=manifests(files, name))
 
-    @staticmethod
-    def _context(language: str, name: str, full: str, files: dict[str, str]) -> str:
-        """Everything about this run that does not change between attempts.
+def prompt(context: str, previous: str | None, evidence: str | None) -> str:
+    """The user half of one turn, whether this is a first attempt, a retry after an
+    unusable reply, or a repair. A repair carries the previous Dockerfile whole and
+    only the latest evidence, never an accumulated history. A retry has no previous
+    Dockerfile to carry, so it needs its own template: reusing FIRST would compute
+    the evidence and then silently drop it.
 
-        Built once. It holds the script, so building it once is also what keeps the
-        `.format` below sound: the returned string is substituted into a template as a
-        value and is never itself formatted again. A script full of f-strings and dict
-        literals is a string full of braces, and running `.format` over it a second
-        time would raise KeyError on the sample's own text.
-        """
-        return CONTEXT.format(language=language, name=name,
-                              text=bound(full, SCRIPT_LIMIT),
-                              about=describe(full, bound(full, SCRIPT_LIMIT)),
-                              files=manifests(files, name))
+    Built separately from the call so the text is inspectable before it is sent.
 
-    @staticmethod
-    def _prompt(context: str, previous: str | None, evidence: str | None) -> str:
-        """The user half of one turn, whether this is a first attempt, a retry after an
-        unusable reply, or a repair. A repair carries the previous Dockerfile whole and
-        only the latest evidence, never an accumulated history. A retry has no previous
-        Dockerfile to carry, so it needs its own template: reusing FIRST would compute
-        the evidence and then silently drop it.
+    `previous` is bounded here rather than where it is assigned, because there are
+    three assignment sites and this is the one place it enters a prompt, which is
+    what the bound is about. It is bounded at all because it is a channel out of the
+    look budget: the model wrote it, `previous` survives across attempts, and a
+    Dockerfile full of comments quoting what was read carries slices into the next
+    attempt on top of that attempt's own fresh budget.
+    """
+    if previous is not None:
+        template = REPAIR          # there is a Dockerfile to correct
+    elif evidence is not None:
+        template = RETRY           # the reply was unusable, so there is not
+    else:
+        template = FIRST
+    return template.format(context=context, evidence=evidence,
+                           previous=bound(previous or "", DOCKERFILE_LIMIT))
 
-        Built separately from the call so the text is inspectable before it is sent.
 
-        `previous` is bounded here rather than where it is assigned, because there are
-        three assignment sites and this is the one place it enters a prompt, which is
-        what the bound is about. It is bounded at all because it is a channel out of the
-        look budget: the model wrote it, `previous` survives across attempts, and a
-        Dockerfile full of comments quoting what was read carries slices into the next
-        attempt on top of that attempt's own fresh budget.
-        """
-        if previous is not None:
-            template = REPAIR          # there is a Dockerfile to correct
-        elif evidence is not None:
-            template = RETRY           # the reply was unusable, so there is not
-        else:
-            template = FIRST
-        return template.format(context=context, evidence=evidence,
-                               previous=bound(previous or "", DOCKERFILE_LIMIT))
+class EngineFailure(Exception):
+    """An engine stopped without producing a verdict.
 
-    @staticmethod
-    def _dead_end(reason: str, *, attempt: int, usage: Usage, refusals: list[Any],
-                  dockerfile: str, run_id: str, build: BuildResult | None = None,
-                  run: RunResult | None = None) -> Event:
-        """The end of the road, always after the fallback. Three different things can
-        go wrong with a Dockerfile we wrote ourselves, and in all three the honest
-        move is to stop and say which, never to ask the model again."""
-        return Event("finished", reason, {"outcome": Outcome(
-            ok=False, kind="failed", reason=reason, dockerfile=dockerfile,
-            build=build, run=run,
-            attempts=attempt, usage=usage, refusals=refusals, used_fallback=True,
-            run_id=run_id)})
+    Lives here rather than in the command line, and the reason is a bug that got as far
+    as a review. Under `python -m envforge`, Python runs `__main__.py` as the module named
+    `__main__`, so a `from .__main__ import EngineFailure` inside another module loads
+    that same file a second time as `envforge.__main__` and builds a second class object.
+    The `except` in the command line then held one class and the `raise` held the other,
+    so the ending this exception exists to name escaped as an unhandled traceback and
+    exit 1, which this project documents as the script having run and failed. Verified
+    against the real CLI, and invisible under pytest, where the file only ever loads
+    under one name.
 
-    def run(self, workspace: Workspace, language: str,
-            args: Sequence[str] = ()) -> Iterator[Event]:
-        """The agent never receives a path. The workspace read every file once, at
-        ingestion, and hands out names and contents from memory. Before this the script
-        was read twice, once here for the prompt and once from disk when the build
-        context was assembled, so the model could review one file while the container
-        ran another."""
-        run_id = uuid.uuid4().hex
-        if language not in LANGUAGES:
-            # Refused at the door rather than half-attempted. Without this the model is
-            # asked anyway and usually produces something, but there is no fallback
-            # Dockerfile for the language, so a refusal used to raise ValueError out of
-            # the generator. Half-working is also what the README promises not to do.
-            supported = ", ".join(sorted(LANGUAGES))
-            yield Event("finished", f"{language} is not supported",
-                        {"outcome": Outcome(
-                            ok=False, kind="unsupported",
-                            reason=f"this agent handles {supported}, not {language!r}",
-                            run_id=run_id)})
-            return
-
-        script = workspace.script
-        files = {name: workspace.read(name) for name in workspace.names()}
-        # The whole script, unbounded, and it never reaches a prompt in this form. It
-        # is what the looking tools read from: the bound exists to keep the sample out
-        # of a prompt, not to stop this program from holding a file it already has.
-        full = files[script]
-        context = self._context(language, script, full, files)
-        calls = input_tokens = output_tokens = looks = 0
-        refusals: list[Any] = []
-
-        def usage() -> Usage:
-            return Usage(calls, input_tokens, output_tokens, looks)
-
-        def charge(reply: Call | LLMError) -> None:
-            """Add what a reply cost to the ledger, whether we could use it or not.
-            A truncated reply burned the whole output ceiling, so a ledger that counted
-            only successes would under-report what a run actually cost."""
-            nonlocal input_tokens, output_tokens
-            input_tokens += reply.input_tokens
-            output_tokens += reply.output_tokens
-
-        # Run-scoped, not attempt-scoped: the free rebuild is offered once per run, so a
-        # Dockerfile that always times out cannot buy a fresh retry on every attempt.
-        rebuilt_after_timeout = False
-        dockerfile: str | None = None
-        base_image: str = ""
-        previous: str | None = None
-        evidence: str | None = None
-        used_fallback = False
-        attempt = 0
-
-        while attempt < self.max_attempts:
-            attempt += 1
-            # Per attempt, both of them. The transcript because a repair prompt is
-            # written to stand alone and carrying the last attempt's conversation into
-            # it would contradict that. The counter because the cap is a bound on how
-            # much of the sample one prompt can hold, and each attempt builds a new
-            # prompt: a per-run counter would leave the third attempt with no way to
-            # look at a script whose middle it still has not seen.
-            history: list[Answered] = []
-            seen = 0
-
-            while dockerfile is None:
-                user = self._prompt(context, previous, evidence)
-                # The cap is enforced by withdrawing the tools, never by asking the
-                # model to stop using them. A rule in a prompt is a request made of
-                # the thing the prompt is defending against; a tool that is not in
-                # the request cannot be called however the conversation goes.
-                tools = ([SEARCH_SCRIPT, READ_SCRIPT, WRITE_DOCKERFILE]
-                         if seen < MAX_LOOKS else [WRITE_DOCKERFILE])
-                yield Event("asking", f"attempt {attempt}: asking the model")
-                calls += 1
-                try:
-                    call = self.llm.call(SYSTEM, user, tools, history)
-                except Refused as exc:
-                    charge(exc)
-                    refusals.append(exc.reason)
-                    yield Event("refused", str(exc), {"reason": exc.reason})
-                    if len(refusals) <= self.max_refusals:
-                        continue  # the refusal counter, never the repair counter
-                    dockerfile = default_dockerfile(language, script)
-                    base_image = LANGUAGES[language].base_image
-                    used_fallback = True
-                    yield Event("fell_back", "refused twice, using our own Dockerfile")
-                except ProviderUnavailable as exc:
-                    # Not repairable, and not a finding about the script. Asking again
-                    # spends money to fail identically, and falling back would print a
-                    # verdict on a run the model never saw. Ends the run, saying which
-                    # kind, because a dead key and an empty account need different
-                    # actions from whoever is reading.
-                    # A rejected request is not an unreachable provider, and saying so
-                    # was a false sentence in our own output: the model was reached and
-                    # it answered. The distinction matters to whoever reads the exit
-                    # code, because one of these is worth retrying and the other is a
-                    # bug in us.
-                    if exc.kind == "rejected":
-                        reason = (f"the provider rejected our request, which is our bug "
-                                  f"rather than theirs: {exc}")
-                    else:
-                        reason = f"the model could not be reached ({exc.kind}): {exc}"
-                    yield Event("provider_unavailable", reason, {"kind": exc.kind})
-                    yield Event("finished", reason, {"outcome": Outcome(
-                        ok=False,
-                        kind="rejected" if exc.kind == "rejected" else "unavailable",
-                        reason=reason, attempts=attempt,
-                        usage=usage(), refusals=refusals, run_id=run_id)})
-                    return
-                except (InvalidArguments, Truncated, LLMError) as exc:
-                    # Repairable, but by rewriting the reply rather than the image.
-                    charge(exc)
-                    yield Event("unusable_reply", str(exc))
-                    # Bounded like every other evidence path. This one was missed, and
-                    # a provider message carrying model-chosen text put 200,000
-                    # characters into the next prompt.
-                    evidence = bound(str(exc), EVIDENCE_LIMIT)
-                    break
-                else:
-                    charge(call)
-                    if call.name != WRITE_DOCKERFILE.name:
-                        # A look, not an answer. The result is bounded and labelled
-                        # inside `look`, goes onto the transcript, and the same prompt
-                        # is asked again with the model's own question answered.
-                        #
-                        # Nothing here lets the model touch the loop. It chose what to
-                        # read; it did not choose whether an attempt was spent, whether
-                        # the gate runs, or whether anything is built.
-                        result = look(full, call)
-                        history.append(Answered(call, result))
-                        seen += 1
-                        looks += 1
-                        yield Event("looked",
-                                    f"attempt {attempt}: the model called {call.name} "
-                                    f"with {call.arguments}",
-                                    {"tool": call.name, "call": call,
-                                     "result": result, "run_id": run_id})
-                        if seen == MAX_LOOKS:
-                            yield Event("tool_capped",
-                                        f"that was look {MAX_LOOKS} of {MAX_LOOKS} for "
-                                        f"this attempt. The looking tools are withdrawn "
-                                        f"and the model must write now")
-                        continue
-                    dockerfile = call.arguments["dockerfile"]
-                    base_image = call.arguments["base_image"]
-                    # The whole Call, bodies included, goes on the event rather than
-                    # into the outcome. A consumer that wants the wire JSON reads it
-                    # here and lets it go; the trace module is one such consumer.
-                    yield Event("wrote", f"got {len(dockerfile)} characters",
-                                {"base_image": base_image, "call": call, "run_id": run_id})
-
-            if dockerfile is None:
-                continue  # the unusable-reply path, having spent this attempt
-
-            # The manifest, not a hardcoded singleton. A COPY may now name any file the
-            # workspace actually gathered, and nothing else.
-            rejection = self.gate(dockerfile, base_image, frozenset(files))
-            if rejection is not None:
-                yield Event("gate_rejected", rejection, {"dockerfile": dockerfile})
-                if used_fallback:
-                    yield self._dead_end(f"our fallback Dockerfile was rejected: {rejection}",
-                                         attempt=attempt, usage=usage(), refusals=refusals,
-                                         run_id=run_id,
-                                         dockerfile=dockerfile)
-                    return
-                previous, dockerfile = dockerfile, None
-                # Bounded like the other three evidence paths. The gate now caps both
-                # the file and what a reason may quote, so this is belt as well as
-                # braces, and it is here because this was the one evidence site without
-                # it: a rejection quoting a 200,000 character `WORKDIR` line put all of
-                # it into the next prompt. Three of four sites bounded is the shape that
-                # keeps producing these, so the fourth is bounded whether or not the
-                # source cap makes it reachable.
-                evidence = bound(
-                    f"the Dockerfile was rejected before it was built: {rejection}",
-                    EVIDENCE_LIMIT)
-                continue
-
-            tag = f"envforge-{run_id}:attempt{attempt}"
-            yield Event("building", f"building {tag}")
-            build = self.sandbox.build(dockerfile, files, tag)
-            if not build.ok and build.timed_out:
-                # A timeout is not a Dockerfile defect, and this file's own first rule is
-                # that a failure a rewrite cannot fix must not spend an attempt. The model
-                # cannot see a clock, so asking it again is asking the wrong question at
-                # full price.
-                #
-                # But it can be worth trying the same file again, once, for free. The
-                # incident this branch was written for was a cold base image taking longer
-                # to pull than the ceiling, and buildkit keeps the layers it managed to
-                # pull, so the second attempt starts warm and usually finishes. That costs
-                # wall clock and no tokens, which is the one retry this loop can afford to
-                # give away.
-                #
-                # Once, not until it works. A Dockerfile that genuinely asks for more work
-                # than the timeout allows would otherwise retry forever at full build cost,
-                # and the honest ending for that is the timeout ending below.
-                if not rebuilt_after_timeout:
-                    rebuilt_after_timeout = True
-                    yield Event("build_failed",
-                                f"the build timed out after {build.seconds:.0f}s. Trying "
-                                f"the same Dockerfile once more, which costs no tokens: a "
-                                f"partly-pulled image is kept and the retry starts warm")
-                    continue
-                reason = (f"the build timed out after {build.seconds:.0f}s, twice. The "
-                          f"Dockerfile asks for more work than the timeout allows, or the "
-                          f"image cannot be pulled from here")
-                yield Event("build_failed", reason)
-                yield Event("finished", reason, {"outcome": Outcome(
-                    ok=False, kind="build_timeout", reason=reason, dockerfile=dockerfile,
-                    build=build, attempts=attempt, usage=usage(), refusals=refusals,
-                    used_fallback=used_fallback, run_id=run_id)})
-                return
-            if not build.ok:
-                yield Event("build_failed", f"build exited {build.exit_code}")
-                if used_fallback:
-                    # Bug found 2026-08-23: this branch used to ask the model again,
-                    # which is precisely the re-asking the refusal policy rules out,
-                    # and the gate check above would then have blamed us for a
-                    # Dockerfile the model wrote.
-                    yield self._dead_end("our fallback Dockerfile did not build",
-                                         attempt=attempt, usage=usage(), refusals=refusals,
-                                         run_id=run_id,
-                                         dockerfile=dockerfile, build=build)
-                    return
-                previous, dockerfile = dockerfile, None
-                evidence = bound(build.log, EVIDENCE_LIMIT)
-                continue
-
-            yield Event("running", f"running {tag}")
-            result = self.sandbox.run(build.image, args)
-            if result.start_error:
-                # The daemon says the process never started, so the Dockerfile is
-                # wrong. This is deliberately not a test on 126 or 127: those codes
-                # can be produced by a script that wants to look like a broken image,
-                # and a script that can produce anything has already started.
-                yield Event("exec_failed", f"the container never started: {result.start_error}")
-                if used_fallback:
-                    yield self._dead_end("our fallback image could not run its command",
-                                         attempt=attempt, usage=usage(), refusals=refusals,
-                                         run_id=run_id,
-                                         dockerfile=dockerfile, build=build, run=result)
-                    return
-                previous, dockerfile = dockerfile, None
-                evidence = ("the container never started its command. docker said:\n"
-                            f"{bound(result.start_error, EVIDENCE_LIMIT)}")
-                continue
-
-            # The script ran. What it *means* is the verdict's problem, but whether it
-            # succeeded is observable here and the caller needs it: a run that ends in a
-            # nonzero exit is a finding, and reporting it as an unqualified success made
-            # the documented meaning of exit 1 unreachable.
-            yield Event("finished", f"the script ran and exited {result.exit_code}",
-                        {"outcome": Outcome(
-                            ok=True,
-                            kind="ran" if result.exit_code == 0 else "script_failed",
-                            reason=f"the script ran and exited {result.exit_code}",
-                            dockerfile=dockerfile,
-                            build=build, run=result, attempts=attempt, usage=usage(),
-                            refusals=refusals, used_fallback=used_fallback,
-                            run_id=run_id)})
-            return
-
-        yield Event("finished", f"gave up after {attempt} attempts",
-                    {"outcome": Outcome(
-                        ok=False, kind="no_image",
-                        reason=f"no Dockerfile worked in {attempt} attempts",
-                        dockerfile=previous, attempts=attempt, usage=usage(),
-                        refusals=refusals, used_fallback=used_fallback,
-                        run_id=run_id)})
+    Here also satisfies the reason it was not put in the command line to begin with: this
+    module defines what an engine is and has no graph dependency, so naming the exception
+    costs nobody an optional package.
+    """

@@ -12,10 +12,11 @@ import pytest
 
 from envforge.agent import (
     DOCKERFILE_LIMIT, EVIDENCE_LIMIT, LANGUAGES, MANIFEST_LIMIT, MAX_LOOKS, SCRIPT_LIMIT,
-    LISTED_OFFSETS, SEARCH_MATCHES, SLICE_HEADER, SLICE_LIMIT, Agent, Event, Outcome,
+    LISTED_OFFSETS, SEARCH_MATCHES, SLICE_HEADER, SLICE_LIMIT, Event, Outcome,
     Usage, bound,
     default_dockerfile, language_for, read_region, search,
 )
+from envforge.graph import Agent
 from envforge.events import Provenance
 from envforge.gate import check
 from envforge.llm import Call, InvalidArguments, ProviderUnavailable, Refused, Truncated

@@ -133,3 +133,108 @@ def test_the_check_would_actually_catch_something():
     # only judgment it makes and the one worth pinning down.
     assert CREDENTIAL.search("sk-ant-api03-" + "x" * 40), "a real-length key must be caught"
     assert not CREDENTIAL.search("sk-ant-REPLACE_ME"), "a placeholder must not be caught"
+
+
+# --- numbers in the records, checked against the code --------------------------------
+
+# Written as words, because that is how the records write them and a test that only
+# accepted digits would pass by never matching anything.
+NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+    "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+    "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+    "nineteen": 19, "twenty": 20,
+}
+
+
+def test_the_records_state_the_real_number_of_event_kinds():
+    """ADR-014 names a count, and the count went stale twice without anyone noticing.
+
+    It said thirteen while the code had twelve, and stayed at thirteen when the tool loop
+    took the code to fourteen. Both slipped through a records pass whose whole subject was
+    retiring stale claims, and through three review passes, because everybody was reading
+    the security bounds instead.
+
+    So the number is checked rather than remembered. This is the same lesson as the file
+    size claim that went stale twice in two days and was moved onto a fixture that never
+    changes: a number in a record with no test behind it is a promise to be wrong later.
+    The difference here is that the number is worth stating, so it gets a test instead of
+    being removed.
+    """
+    from envforge.events import VOCABULARY
+
+    text = (ROOT / "ARCHITECTURE.md").read_text()
+    match = re.search(r"`envforge/events\.py` holds the (\w+) kinds", text)
+    assert match, "ADR-014 no longer states a count of event kinds in the form this checks"
+    stated = NUMBER_WORDS.get(match.group(1))
+    assert stated is not None, f"{match.group(1)!r} is not a number word this test knows"
+    assert stated == len(VOCABULARY), (
+        f"ARCHITECTURE.md says {match.group(1)} ({stated}) event kinds, "
+        f"the code has {len(VOCABULARY)}: {', '.join(sorted(VOCABULARY))}"
+    )
+
+
+def test_the_records_state_the_real_worst_case_number_of_model_calls():
+    """ADR-015 names the worst case a run can reach, and it is the argument for having no
+    token ceiling, so a stale number there is a stale decision.
+
+    Driven rather than derived, because deriving it is how it was got wrong: the formula
+    `max_attempts * (MAX_LOOKS + 1)` gives fifteen and the true answer is sixteen, since a
+    refusal spends no attempt and is a free extra call. This drives a run that refuses
+    once, looks the maximum every attempt, and fails every build.
+
+    The third number in these records to be given a test rather than a correction, after
+    the event kinds. The ones without a test went stale four times between them.
+    """
+    from envforge.agent import MAX_LOOKS
+    from envforge.graph import Agent
+    from envforge.llm import Call, Refused
+    from envforge.sandbox import BuildResult
+    from envforge.workspace import Files
+
+    class Sandbox:
+        built_tags: list[str] = []
+
+        def build(self, dockerfile, files, tag):
+            return BuildResult(ok=False, image="", exit_code=1, log="x",
+                               truncated=False, timed_out=False, seconds=0.1)
+
+        def run(self, image, args=()):
+            raise AssertionError("no build ever succeeds here")
+
+        def remove_image(self, tag):
+            pass
+
+    def reply(name, arguments):
+        return Call(arguments=arguments, name=name, tool_use_id="t", model="m",
+                    input_tokens=0, output_tokens=0, request={}, response={},
+                    assistant={})
+
+    class Worst:
+        """Refuses once, which is free, then spends every look of every attempt."""
+
+        def __init__(self):
+            self.refused = False
+
+        def call(self, system, user, tools, history=()):
+            if not self.refused:
+                self.refused = True
+                raise Refused("no", reason="r")
+            if "read_script" in [t.name for t in tools] and len(history) < MAX_LOOKS:
+                return reply("read_script", {"start": 0, "end": 10})
+            return reply("write_dockerfile",
+                         {"dockerfile": 'FROM python:3.12-slim\nCMD ["python"]\n',
+                          "base_image": "python:3.12-slim"})
+
+    events = list(Agent(Worst(), Sandbox(), lambda d, b, f: None).run(
+        Files(script="s.py", contents={"s.py": "print(1)\n"}), "python"))
+    worst = events[-1].data["outcome"].usage.calls
+
+    text = (ROOT / "ARCHITECTURE.md").read_text()
+    match = re.search(r"the worst case (\w+) calls rather than seven", text)
+    assert match, "ADR-015 no longer states the worst case in the form this checks"
+    stated = NUMBER_WORDS.get(match.group(1))
+    assert stated is not None, f"{match.group(1)!r} is not a number word this test knows"
+    assert stated == worst, (
+        f"ARCHITECTURE.md says {match.group(1)} ({stated}) worst-case model calls, "
+        f"a driven worst case makes {worst}")

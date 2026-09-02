@@ -132,6 +132,19 @@ same gate before any build.
     behaviour for a file that large: `bound` keeps the head and the tail, so `FROM` and
     the command survive, and the marker says what was removed.
 
+29. Both engines drive the same three steps. The plain loop and the graph do not each
+    implement the machine; they each decide what to call next, and a step returns its
+    events as they happen and returns the name of the successor. A contract test runs
+    every scenario through both and compares the event kinds in order, the message of
+    every event, and every field of the outcome except the run's uuid, so two engines
+    that disagree fail a test rather than being discovered by whoever switched.
+
+    A step yields rather than returning its events, and that is a correctness rule and
+    not a style. The first version returned lists, so nothing reached the caller until a
+    step was over: `building` arrived after the build had finished, and a step that
+    raised lost everything it had already said. The command line prints these live, so a
+    five-minute build narrated nothing and then printed the whole run at once.
+
 Invariants 4 and 5 are asserted against the argv that `sandbox.py` actually builds, so
 dropping a flag from the code fails a test rather than passing review.
 
@@ -235,7 +248,7 @@ They need error types that retain provider wire data, so the trace module owns
 that design rather than adding half a trace to the repair loop.
 
 ### ADR-014: the engine seam is a labelled vocabulary, not a topology
-Decided 2026-08-27. `envforge/events.py` holds the thirteen kinds an engine may yield, and
+Decided 2026-08-27. `envforge/events.py` holds the fourteen kinds an engine may yield, and
 `Event` refuses anything else at construction. The plain loop and the LangGraph port both
 honour it, which a node-shaped interface could not be: a plain loop has no nodes.
 
@@ -444,6 +457,63 @@ The three prompt templates were collapsed onto one shared context in the same ch
 truncation notice and the manifest have to appear on a repair as well as on a first ask,
 and three copies of a paragraph is the shape where the third copy goes missing. That shape
 is what kept the manifest out of the prompt for months.
+
+### ADR-019: the LangGraph port shares the steps rather than the control flow
+Decided 2026-09-01. `envforge/graph.py` registers three nodes, `author`, `look` and
+`execute`, and every one of them is a function that already existed in `agent.py`. The
+node wrapper is the loop that drains one step into the stream and returns where it went,
+and nothing else. The state a node receives is the same mutable `Run` the plain
+loop drives, carried rather than copied.
+
+The alternative, and the reason this is written down: wrap the existing `while` loop in a
+single graph node. It would pass every test in the repository, add a dependency, and buy
+nothing, which is the same shape as making the manifest a tool and calling it agency. The
+check that it is real is mechanical: replace the conditional edges with a straight edge
+to the exit and most of the contract suite goes red, because the topology is what routes
+the run. Deliberately not a count: it was twelve when written and seventeen a review
+later, and a number nothing checks is a promise to be wrong.
+
+The refactor came first and had to be invisible. `Agent.run` was a generator holding the
+whole machine in its local variables, which is a fine way to write one engine and no way
+to write two: a generator's state lives on its frame and a graph cannot resume a frame.
+Naming that state as `Run` and the transitions as three functions is what lets both
+drivers exist without the control flow being written twice. All 334 tests that existed
+before the port passed unchanged afterwards, several of which assert exact event
+sequences, which is the evidence that the extraction changed nothing.
+
+Rejected: a graph-shaped state separate from `Run`. It would be a second definition of
+what a run is, and the first change to either would begin the drift the port was supposed
+to remove. The state channel that did exist, an `Annotated[list[Event], operator.add]`
+accumulating every event, was deleted for a related reason: nothing read it, because the
+events reach the caller through the stream, and it was not free. An event can carry a
+whole `Call` with both wire bodies, so holding them all in graph state made one run peak
+at 43 MB, still held after the caller had released every event. Deleting the channel takes
+that to 10.4 MB peak and 10.2 MB held, against the plain engine's 0.16 MB: the remainder
+is cyclic garbage the automatic collector does not reach rather than a leak, since a
+`gc.collect()` per event flattens it to 0.31 MB with no `Event` alive. So this is an
+improvement and not a fix, and the graph engine still costs memory the plain one does
+not. ADR-013 moved the bodies onto the stream so they could be consumed and let
+go, and a channel nobody read was quietly undoing that.
+
+The route map is uniform: every node routes to every node, because each step returns one
+of the same four names. So the compiled graph is a complete digraph and the two cycles a
+run takes, `author` to `look` and back, and `execute` to `author`, are a property of what
+the steps return rather than of the edge list. The first test written for this asserted
+four particular edges were present and called that the shape, which every complete digraph
+also satisfies; the transitions are now observed by watching a run instead.
+
+Rejected: subclassing. `GraphAgent` needs what an `Agent` holds and none of what it does,
+since the loop is exactly the part being replaced, so it composes one and forwards
+attribute reads to it.
+
+One number is derived rather than chosen. LangGraph stops a graph at `recursion_limit`,
+default 25, and this machine legitimately uses about thirty node visits at three attempts
+of four looks. That mattered more than a tuning value because of how it fails: every
+ending here is a `finished` event carrying an `Outcome`, and a graph stopped by its own
+limit emits no such event, so the run would end with no verdict rather than a bad one.
+`step_ceiling` computes the bound from `max_attempts`, `MAX_LOOKS` and `max_refusals`,
+with slack, and a test drives a worst-case run through it. If it ever fires it is a bug in
+the derivation, because `max_attempts` is the bound that is supposed to stop a run.
 
 ## What crosses each boundary
 

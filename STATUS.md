@@ -15,13 +15,13 @@ Updated 2026-09-01.
 Built and tested: the sandbox that holds the untrusted script, the model layer, the
 deterministic gate every Dockerfile passes before a build, the repair loop, the workspace
 that is the only code here handling a path, the closed event vocabulary with its provenance
-labels, the command line, and the two tools the model uses to read the part of a script it
-was not shown.
+labels, the command line, the two tools the model uses to read the part of a script it was
+not shown, and the two engines that drive the same machine.
 
 Not built: the verdict and the trace. The command line reports what a script did and what
 it cost; nothing yet decides what that behaviour means.
 
-334 tests, 321 of which need neither Docker nor an API key. The rest skip
+366 tests, 353 of which need neither Docker nor an API key. The rest skip
 automatically when no daemon is present. Both suites run on every push
 and every pull request.
 
@@ -1464,3 +1464,244 @@ Confirmed on the next live run, which is the only way this kind of fix can be co
 `search_script("import")`, then one `read_script` at 10800 to 11300, then the Dockerfile.
 Two looks instead of four, three model calls instead of five, and 17,328 tokens against
 32,882. The search now points and the read goes there, which is what the tool was for.
+
+## Two engines, one machine, 2026-09-01
+
+`envforge/graph.py`. The same run, driven by LangGraph instead of a `while` loop, chosen
+at the command line with `--engine graph`.
+
+### The refactor that had to come first
+`Agent.run` was one generator holding the whole machine in its local variables. That is a
+fine way to write one engine and no way at all to write two, and the reason is structural
+rather than stylistic: a generator's state lives on its frame, and a graph cannot resume a
+frame. It calls a node, takes what the node returns, and calls the next one.
+
+So the locals became a `Run` dataclass and the transitions became three functions,
+`author`, `look_step` and `execute`, each returning the events it produced and the name of
+the step that comes next. What is left of the plain engine is one line,
+`step = yield from STEPS[step](run)`.
+
+The evidence that the extraction changed nothing is that all 334 tests passed unchanged
+afterwards, several of which assert exact event sequences and exact usage totals. Nothing
+in that suite was edited to accommodate the refactor.
+
+### What makes it a port and not decoration
+The honest failure mode here is a graph with one node containing the old loop. It would
+pass every test in this repository, add a dependency, and buy nothing. It is the same shape
+as wrapping the manifest in a tool to claim the model has agency over it, which this
+project already rejected once.
+
+So the claim is checked mechanically rather than asserted. Replace the conditional edges
+with a straight edge to the exit and most of the contract suite goes red, because the
+routing is what walks the run. Other mutations of the graph were tried and all died:
+delivering each node's events only once the node returns, which stops the run narrating
+itself; forcing every node to terminate; and dropping the derived recursion limit back to
+LangGraph's default.
+
+No count in that sentence, and it used to say twelve. It was twelve, then seventeen, then
+eighteen, across three review passes, while a later section of this same file explained
+that the count had been deleted for going stale. Correcting a claim in two records and
+leaving a third copy in the document that tells the story of correcting it is the rule
+this project keeps writing down and then breaking: adding a correction is not removing
+what it corrects.
+
+There are two cycles, not one, and neither was visible in the shape of the program before.
+`author` to `look` and back is the model reading the script. `execute` to `author` is the
+repair loop. Both existed as `continue` statements that only Python could see.
+
+### The seam, finally checked
+`ARCHITECTURE.md` has said since the event vocabulary landed that the interface between
+engines is a labelled vocabulary rather than a topology, because a plain loop has no nodes
+and cannot honour a node-shaped interface. That was a claim with one implementation behind
+it. `tests/test_engines.py` now runs ten scenarios through both engines and compares the event
+kinds in order, the message of every event, and every field of the outcome except the run's
+uuid. It said eleven, and it compared eight of the outcome's eleven fields while claiming
+all of them: `build` and `run` were missing, which are exactly what the not-yet-built
+verdict will read.
+
+Parametrised rather than written twice, for the same reason the steps are shared: two test
+files would drift exactly as two loops would.
+
+### One number that had to be derived rather than picked
+LangGraph stops a graph at `recursion_limit` and raises. The default is 25, and this
+machine legitimately uses about thirty node visits at three attempts of four looks each, so
+the default would have ended long runs.
+
+The reason it got a derivation instead of a bigger constant is how it fails. Every ending
+in this project is a `finished` event carrying an `Outcome`, and a graph stopped by its own
+recursion limit emits no such event: the run would end with no verdict at all, rather than
+with a bad one. `step_ceiling` computes the bound from `max_attempts`, `MAX_LOOKS` and
+`max_refusals` with slack, and a test drives a worst-case run of twelve looks and three
+failed attempts through it. If that limit ever fires it is a bug in the derivation, because
+`max_attempts` is the thing that is supposed to stop a run.
+
+### Confirmed against a real model
+`--engine graph` on the fixture produced the same event sequence as the plain engine, the
+same two looks in the same places, the same verdict, and 17,328 tokens against 17,328. The
+identical token count is the part worth noticing: it means both engines built byte-identical
+prompts, which is a stronger statement than the events matching.
+
+### A stale number this work had to fix first
+ADR-014 said `events.py` holds thirteen kinds. It held twelve when that was written and
+fourteen after the tool loop, so the number was wrong in both directions and had survived a
+records pass whose entire subject was retiring stale claims, plus three review passes.
+
+It is now checked by a test that reads the number out of ARCHITECTURE.md and compares it to
+`len(VOCABULARY)`, and the test was mutated in both directions: change the record and it
+fails, delete a kind from the code and it fails. That is the third number in two days that
+went stale, after the file size claim and the worst-case call count, and it is the first one
+where the fix was a test rather than a correction. A number in a record with nothing
+checking it is a promise to be wrong later.
+
+### What the review of the port found
+
+Blocked on one line, and it was the one thing the extraction was most likely to break.
+
+**The default engine stopped streaming.** Making the steps return their events as lists
+meant nothing reached the caller until a step was over. Measured against fake operations
+that take half a second each: `asking` used to arrive at 0.00s and arrived at 0.51s;
+`building` and `running` used to be 0.51s apart and both arrived at 1.52s, after the
+container had already finished. The command line prints these as they come and passes
+`flush=True` to do it, so a cold-pull build like the one that motivated the build timeout
+would have shown an operator nothing for five minutes and then printed the whole run at
+once. A step that raised also lost everything it had already said, which is exactly the
+moment a trace is worth having.
+
+Not one of 352 tests caught it, and the reason is worth keeping: every test in this
+repository compares finished runs, and a finished run is byte-identical whether its events
+arrived as they happened or all at once at the end. The fix is that a step is a generator,
+so the plain driver is `step = yield from STEPS[step](run)` and the events leave as they
+are produced. The graph engine writes them to LangGraph's custom stream from inside each
+node, for the same reason: returning them from the node would buffer per node, which is
+the same bug one layer up.
+
+The new test measures arrival times rather than order, because order was never wrong.
+
+Then it was deleted, by me, three edits later. A slice edit replacing the section above it
+took the streaming section with it, the suite stayed green because the count was rising
+from other additions, and this paragraph went on describing a guard that was no longer in
+the tree. The second review found it by re-running the mutation and getting zero red.
+
+That is worse than the bug it was written about. A stale number misleads a reader; a
+record claiming a test exists tells everyone to stop looking. The tests are restored, at
+the end of the file where a slice edit above them cannot reach, and the mutation is
+written down so the next person can re-run it instead of believing this paragraph:
+buffer the plain driver by draining `STEPS[step](run)` into a list before yielding, and
+buffer the graph node by collecting what it writes and emitting on return. Each reddens
+only its own engine's parametrisation.
+
+**Two behaviour changes the 334 tests did not cover.** The give-up path used to say "gave
+up after 3 attempts" as the event a person reads and record "no Dockerfile worked in 3
+attempts" as the outcome's reason, two deliberately different strings, and a single helper
+filling both from one argument collapsed them. Nothing asserted an event's message
+anywhere, so the contract test now compares messages as well as kinds. And `max_attempts=0`
+ran one full attempt and reported success, because the old loop tested its bound before a
+step and the machine tests it after one has already gone.
+
+**The contract test claimed more than it checked.** It compared eight of the outcome's
+eleven fields while three records said "every field". The two missing ones were `build` and
+`run`, which are precisely what the verdict will read when it is built. It now compares
+every field except the run's uuid.
+
+**"Three nodes with two cycles" described the steps, not the graph.** The compiled graph is
+a complete digraph: thirteen edges, every node to every node. The test asserted four
+particular edges were present, which every complete digraph also satisfies, so it could not
+have noticed `look` gaining a route to `execute`. The uniform map is still right, because
+each step returns one of the same four names and a per-node map would be a second place
+that decision lives. What changed is that the claim is now stated accurately and the real
+transitions are asserted by watching a run.
+
+**A write-only channel was costing 43 MB.** The graph state accumulated every event through
+an `operator.add` reducer that nothing ever read, since the events reach the caller through
+the stream. An event can carry a whole `Call` with both wire bodies, so one run peaked at
+43 MB and still held it after the caller had released everything. ADR-013 moved the bodies
+onto the stream so they could be consumed and let go, and this was quietly undoing that.
+
+Deleting the channel takes it to 10.4 MB peak and 10.2 MB held, against the plain engine's
+0.16 MB. The remainder is cyclic garbage rather than a leak, since collecting per event
+flattens it to 0.31 MB with no `Event` alive, but the honest summary is that this is an
+improvement and the graph engine still costs memory the plain one does not.
+
+**Two smaller things.** `GraphAgent.__getattr__` recursed forever rather than raising
+`AttributeError` whenever `_agent` was missing, which is every `copy`, `deepcopy` and
+`__new__`. And a graph that exceeded its step ceiling raised out of the command line as an
+unhandled traceback, which exits 1, which this project documents as the script having run
+and failed: a run with no verdict was being reported as a verdict about the sample. It is
+now its own exception and exit 7.
+
+The reviewer also confirmed what did not break, which was most of it: 25 scenarios driven
+through the old engine, the new plain engine and the graph produced byte-identical events
+and outcomes apart from the two regressions above; both laundering attacks still hold
+invariant 24 on both engines at three, six and twelve attempts; and the derived step
+ceiling has 22 to 24 visits of headroom against the worst case the caps allow.
+
+### The second review, and a mistake worse than the one it was reviewing
+
+Blocked again, on three things, and two of them were mine from the fix rather than from
+the original work.
+
+**`EngineFailure` was two different classes.** It was defined in `__main__.py` and
+imported by `graph.py` as `from .__main__ import EngineFailure`. Under `python -m
+envforge`, Python runs that file as the module named `__main__`, so the relative import
+loads the same file a second time under the name `envforge.__main__` and builds a second
+class object. The `except` held one and the `raise` held the other, so the ending this
+exception exists to name escaped as an unhandled traceback and exit 1, which this project
+documents as the script having run and failed. Exactly the failure it was added to
+prevent, reintroduced by where it was put.
+
+Invisible under pytest, where the file only ever loads under one name, so the test written
+for it passed while the real command line did not. It now lives in `agent.py`, which is
+where an engine is defined, has no graph dependency, and is already imported by both
+sides. Verified by driving the real CLI through `runpy` into the failure: exit 7.
+
+**I deleted my own streaming tests and then wrote that they existed.** A slice edit
+replacing the graph-shape test took the streaming section with it, because the section
+happened to sit between the two anchors. The suite stayed green at a rising count, so
+nothing looked wrong, and the paragraph above claiming they were mutation tested stayed in
+this file. The review re-ran the mutation, got zero red, and found the orphaned `import
+time` at the top of the file as the fingerprint.
+
+The mutation claim had been true when it was written. That is the part worth keeping: a
+record can be accurate at the moment of writing and false by the time it ships, and the
+only defence is re-running the check before the claim goes out rather than after the work
+that would invalidate it. Both tests are restored at the end of the file, where a slice
+edit above cannot reach them, and the mutation is now written down rather than asserted.
+
+Second slice-edit deletion in the same piece of work: the first removed the exit-code
+constants from `__main__.py` and was caught immediately by a NameError. This one was
+caught by a reviewer, four edits later. The difference is only that Python noticed one of
+them.
+
+The restored test then turned out to be half a test. It slowed the sandbox but not the
+model, so `asking` was the one event never timed, and buffering the `author` step alone
+reddened nothing. `asking` moving from 0.00s to 0.51s was the original regression's first
+symptom, so the test written for that regression could not see the half that started it.
+The fake model is slow now too, and a mutation that announces `asking` only after the
+model has answered reddens exactly the timing test on both engines.
+
+**A test that could not fail, which also broke three others.** The one asserting the plain
+engine works with no LangGraph reloaded `envforge.agent` inside the process to fake the
+absence. It could not fail, because the plain factory is `lambda *a: Agent(*a)` and is
+true whatever `sys.modules` holds. And the reload rebuilt `Agent`, `Run`, `Usage` and
+`Outcome` as new classes while every already-imported module kept the old ones, so
+dataclass equality compared two different `Usage` classes and three unrelated tests failed
+the moment pytest collected that file first. It was green only because of collection
+order. It now runs in a subprocess with an import hook, and the first version of that used
+`find_module`, removed in Python 3.12, which blocked nothing and passed by doing nothing.
+
+**Four stale numbers, so the count is gone rather than corrected.** "Twelve contract tests
+go red" was twelve when written, seventeen a review later, and eighteen after that. That is
+the fourth number in this work to go stale, after the event-kind count, the file size and
+the worst-case call count. The claim is now the property rather than the number.
+
+Then the same review found a copy of that count still in this file, two hundred lines above
+the paragraph explaining why it had been deleted. Corrected in two records and left in the
+third, which is the rule this project keeps restating and then breaking: adding a
+correction is not removing what it corrects.
+
+So the rule now has a mechanism rather than another paragraph. Two numbers in the records
+are checked by tests that read the sentence and compare it to the code: the event-kind
+count, and the worst-case model call count, which is driven by a run that refuses once and
+spends every look rather than derived from a formula, because deriving it is exactly how it
+was got wrong. Every other number in these records is either historical narrative, where
+being fixed in time is the point, or has been deleted.

@@ -9,6 +9,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import subprocess
+import sys
+import textwrap
+
 import pytest
 
 from envforge.__main__ import (
@@ -20,6 +24,8 @@ from envforge.__main__ import (
 from envforge.agent import Outcome, Usage
 from envforge.events import Event
 from envforge.sandbox import RunResult
+
+PROJECT = Path(__file__).resolve().parent.parent
 
 
 # --- what the shell learns ------------------------------------------------------------
@@ -69,7 +75,7 @@ def test_the_kind_comes_from_the_agent_and_not_from_a_literal_in_this_file():
     mapping and not the wiring, so rewording a sentence in `agent.py` could change what
     the shell learns while every test still passed. This drives the real loop to each
     terminal state and asserts the code the shell would actually get."""
-    from envforge.agent import Agent
+    from envforge.graph import Agent
     from envforge.llm import ProviderUnavailable
     from tests.test_agent import ALLOW, FakeLLM, FakeSandbox, _call
 
@@ -603,3 +609,71 @@ def test_an_unreadable_or_undecodable_dotenv_does_not_crash(tmp_path, capsys):
     target.write_bytes("ANTHROPIC_API_KEY=x\n".encode("utf-16"))
     assert load_env(tmp_path, environ={}) == []
     assert "ignoring" in capsys.readouterr().err
+
+
+# --- the engine flag ------------------------------------------------------------------
+
+def test_the_engine_flag_builds_the_engine_it_names():
+    """`ENGINES` was entirely unexercised: the dict, the lazy import and the argparse
+    choice. The lazy import in particular is load-bearing, because `plain` is the default
+    and must keep working with no LangGraph installed."""
+    from envforge.__main__ import ENGINES
+    from envforge.graph import Agent
+    from envforge.graph import GraphAgent
+
+    made = {name: factory(object(), object(), object())
+            for name, factory in ENGINES.items()}
+    assert type(made["plain"]) is Agent
+    assert type(made["graph"]) is GraphAgent
+    # Both answer the same questions about their own configuration.
+    for engine in made.values():
+        assert engine.max_attempts == 3 and engine.max_refusals == 1
+
+
+def test_the_parser_rejects_an_engine_that_does_not_exist(capsys):
+    from envforge.__main__ import build_parser, ENGINES
+
+    parser = build_parser()
+    assert parser.parse_args(["s.py"]).engine == "plain"          # the default
+    for name in ENGINES:
+        assert parser.parse_args(["s.py", "--engine", name]).engine == name
+    with pytest.raises(SystemExit):
+        parser.parse_args(["s.py", "--engine", "langchain"])
+
+
+def test_the_plain_engine_works_with_no_langgraph_installed():
+    """`plain` is the default and must not need an optional dependency.
+
+    Run in a subprocess with the package blocked, because that is the only honest way to
+    test an absent import. The version of this test that ran in-process reloaded
+    `envforge.agent` to fake it, and did two bad things: it could not fail, since the
+    plain factory is `lambda *a: Agent(*a)` and is true whatever `sys.modules` holds, and
+    the reload rebuilt `Agent`, `Run`, `Usage` and `Outcome` as new classes while every
+    already-imported module kept the old ones. Dataclass equality compares classes, so
+    three unrelated tests failed as soon as pytest collected this file first. It passed
+    only because of collection order.
+    """
+    program = textwrap.dedent("""
+        import sys
+        class Blocked:
+            # find_spec, not find_module: the latter was removed in Python 3.12, so a
+            # hook using it blocks nothing and the test passes by doing nothing.
+            def find_spec(self, name, path=None, target=None):
+                if name == "langgraph" or name.startswith("langgraph."):
+                    raise ImportError("langgraph is not installed")
+        sys.meta_path.insert(0, Blocked())
+        from envforge.__main__ import ENGINES, main
+        engine = ENGINES["plain"](object(), object(), object())
+        assert type(engine).__name__ == "Agent", type(engine)
+        assert "envforge.graph" not in sys.modules
+        try:
+            ENGINES["graph"](object(), object(), object())
+        except ImportError:
+            print("OK")
+        else:
+            raise AssertionError("the graph engine built without langgraph")
+    """)
+    finished = subprocess.run([sys.executable, "-c", program],
+                              capture_output=True, text=True, cwd=str(PROJECT))
+    assert finished.returncode == 0, finished.stderr
+    assert "OK" in finished.stdout

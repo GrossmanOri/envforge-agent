@@ -95,7 +95,27 @@ What the model does not get is any influence over the loop. It chooses what to r
 does not choose whether an attempt is spent, whether the gate runs, or whether anything is
 built.
 
-334 tests, 321 of which need neither Docker nor an API key. The rest skip
+**Two engines**, `envforge/agent.py` and `envforge/graph.py`, chosen with `--engine`. The
+plain one is a `while` loop and the LangGraph one is three nodes. Neither implements the
+machine. Both drive the same three steps, and a step yields its events as they happen and
+returns the name of the next step, so the only thing either engine decides is what to call
+next.
+
+A run takes two cycles through those steps: `author` to `look` and back is the model
+reading the script, and `execute` to `author` is the repair loop. That is a property of
+what the steps return rather than of the graph's edges, which are uniform, and it is
+asserted by watching a run rather than by reading the edge list.
+
+The seam is checked rather than claimed. A contract test runs every scenario through both
+engines and compares the event kinds in order, the message of every event, and every field
+of the verdict except the run's uuid. Replacing the graph's routing with a straight edge to
+the exit reddens most of that file. A port that wrapped the existing loop inside one node
+would have passed everything else in this repository.
+
+No count here on purpose. It was written as twelve, and one review later it was seventeen,
+which is the fourth number in this work that went stale because nothing checked it.
+
+366 tests, 353 of which need neither Docker nor an API key. The rest skip
 automatically when no daemon is present. Both suites run on every push
 and every pull request.
 

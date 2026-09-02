@@ -9,7 +9,8 @@ import json
 
 import pytest
 
-from envforge.agent import Agent, default_dockerfile
+from envforge.agent import default_dockerfile
+from envforge.graph import Agent
 from envforge.gate import MAX_DOCKERFILE, QUOTED_LINE, RUN_COMMANDS, check
 
 FILES = frozenset({"s.py"})

@@ -21,7 +21,8 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from .agent import Agent, LANGUAGES, Outcome, language_for
+from .agent import EngineFailure, LANGUAGES, Outcome, language_for
+from .graph import Agent
 from .events import Event, Provenance
 from .gate import check
 from .llm import MissingKey, ProviderUnavailable, kind_for_status, make_llm
@@ -394,6 +395,16 @@ def main(argv: Sequence[str] | None = None, environ=None) -> int:
                     return EXIT_NO_DOCKER
             if event.kind == "finished":
                 outcome = event.data["outcome"]
+    except EngineFailure as exc:
+        # The graph engine ran out of steps. Its own bound is derived from `max_attempts`
+        # and is meant to be unreachable, so this is our bug rather than the script's,
+        # and it is exit 7 for the same reason a rejected request is: our code asked for
+        # something wrong. Named here because it escapes as an unhandled traceback
+        # otherwise, and an unhandled traceback exits 1, which this file documents as the
+        # script having run and failed. A run with no verdict must never be reported as a
+        # verdict about the sample.
+        print(f"\nthe run did not finish: {printable(str(exc))}", file=sys.stderr)
+        return EXIT_BAD_REQUEST
     except SandboxError as exc:
         # Our own precondition, not the daemon. Collapsing the two told an operator the
         # daemon was broken when it was fine and the caller had made a mistake.
