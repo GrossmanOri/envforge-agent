@@ -302,7 +302,7 @@ def _ours(kind: str, list_argv: list[str]) -> list[tuple[str, str, int]]:
 
 
 def sweep(keep: str = "", older_than: float = 3600.0) -> list[str]:
-    """Remove containers and images left behind by runs that did not finish.
+    """Remove images left behind by runs that did not finish.
 
     Images, not containers. See the comment below: a container is the proof that an
     attempt already executed an untrusted sample, and removing it is what would let a

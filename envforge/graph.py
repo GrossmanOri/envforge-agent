@@ -744,11 +744,14 @@ class Agent:
         here the moment it is made rather than when its node returns.
         """
         run_id = uuid.uuid4().hex
-        # Collect what earlier runs left behind, before making anything of our own. Not
-        # a background chore: a crashed run leaves a tagged image and an exited
-        # container, nothing else ever removes them, and the only alternative is that
-        # they accumulate until somebody notices the disk. Guarded by ownership and age,
-        # so a run in another terminal right now is never touched.
+        # Collect the images earlier runs left behind, before making anything of our
+        # own. Not a background chore: a crashed run leaves a tagged image that nothing
+        # else removes, and the alternative is that they accumulate until somebody
+        # notices the disk. Guarded by ownership and age, so a run in another terminal
+        # right now is never touched.
+        #
+        # Images only. A crashed run's container is left where it is, because it is the
+        # proof that its attempt already executed an untrusted sample; see invariant 32.
         #
         # Best effort about the daemon, deliberately. A sweep is housekeeping, and no
         # part of it is worth refusing to start a run over.

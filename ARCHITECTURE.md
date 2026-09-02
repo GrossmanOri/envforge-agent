@@ -91,6 +91,14 @@ same gate before any build.
     the start of every attempt, which is a security property and not housekeeping: the
     message list accumulates, so without the reset three attempts of four looks would put
     twelve slices of the sample in one context.
+
+    The manifests are bounded separately, at `MANIFEST_LIMIT` each, and are a different
+    file rather than the script. They are untrusted by the same argument and are not
+    covered by the arithmetic above, which is about reassembling the sample. This
+    sentence was on `main`, was dropped when the invariants were deduped, and a review
+    caught it: a separate bound on untrusted text entering a prompt went from stated to
+    unstated while the code kept enforcing it, which is the quieter half of the rule
+    about retiring claims.
 25. Every tool result is bounded and labelled where it is produced, not where it is
     consumed. There is one function that cuts a piece out of the sample, which is the
     only place the rule cannot be forgotten by a later caller.

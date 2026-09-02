@@ -96,8 +96,8 @@ budget: a model that asks for region after region has reassembled the whole file
 at a time. Every slice is labelled as the sample's own words on the way back, because a
 tool result arrives in the one position a model is trained to trust.
 
-The bound that follows from those numbers is written out in full as invariant 24, and it
-is written in full because the short version of it was wrong. Bounding the direct path is
+The bound that follows from those numbers is invariant 24, and it is worth reading there
+rather than trusting a summary, because a short version of it has been wrong twice. Bounding the direct path is
 not the same as bounding the sample: the model's previous Dockerfile is replayed into every
 repair and survives across attempts, so a model that copied what it read into comment lines
 carried its slices forward and collected a fresh look budget on top. A review found it by
