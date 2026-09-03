@@ -240,6 +240,28 @@ def remove_container(name: str) -> None:
     _docker("rm", "--force", name)
 
 
+def container_running(name: str) -> bool:
+    """Whether a container of this name is running right now.
+
+    Separate from `container_exists`, because stopping and deleting are separate things
+    and this is the question that decides the first. A crashed process leaves its
+    container behind, and the daemon does not stop it for us: killing the docker client
+    does not kill the container, which is measured behaviour. So a replay may find one
+    still executing the sample it is about to refuse to execute.
+    """
+    try:
+        finished = subprocess.run(["docker", "ps", "--filter", f"name=^{name}$",
+                                   "--format", "{{.Names}}"],
+                                  capture_output=True, text=True, timeout=20)
+    except (subprocess.TimeoutExpired, OSError):
+        # Fails closed the other way from `container_exists`, and for the same reason.
+        # There, an unanswered question must not be read as "no evidence"; here it must
+        # not be read as "nothing is running", because the response to running is to
+        # stop it and stopping something already stopped costs nothing.
+        return True
+    return name in finished.stdout.split()
+
+
 def container_exists(name: str) -> bool:
     """Whether a container with this name is still on the host, in any state.
 
@@ -302,7 +324,8 @@ def _ours(kind: str, list_argv: list[str]) -> list[tuple[str, str, int]]:
 
 
 def sweep(keep: str = "", older_than: float = 3600.0) -> list[str]:
-    """Remove images left behind by runs that did not finish.
+    """Tidy what runs that did not finish left behind: stop stray containers, remove
+    their images.
 
     Images, not containers. See the comment below: a container is the proof that an
     attempt already executed an untrusted sample, and removing it is what would let a
@@ -322,6 +345,17 @@ def sweep(keep: str = "", older_than: float = 3600.0) -> list[str]:
     """
     cutoff = time.time() - older_than
     removed = []
+    # Stop, never delete. A container left running by a process that died is still
+    # executing an untrusted sample, and nothing else will stop it; a stopped one is the
+    # evidence that its attempt already ran, and deleting it is what would let a resumed
+    # run execute that sample again. The two words are not interchangeable anywhere in
+    # this file, and this is the place it would be easiest to conflate them.
+    for object_id, run_id, started in _ours(
+            "container", ["docker", "ps", "--quiet", "--filter", f"label={RUN_LABEL}"]):
+        if run_id == keep or started > cutoff:
+            continue
+        force_stop(object_id)
+        removed.append(f"stopped container {object_id[:12]} from run {run_id[:8]}")
     # Images only. Containers are deliberately left, and that is the resolution of a
     # contradiction rather than an oversight: a crashed attempt's container is the
     # durable evidence that its sample already ran, so sweeping it lets a run resumed an

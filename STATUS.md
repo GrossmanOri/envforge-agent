@@ -18,13 +18,14 @@ the only engine, the workspace that is the only code here handling a path, the c
 vocabulary with its provenance labels, the command line, and the two tools the model uses
 to read the part of a script it was not shown.
 
-Not yet ported to the graph: the command line, which still drives the old loop, and the
-model layer's provider handling, which still builds requests by hand.
+Everything runs through the graph. The command line builds it, the `while` loop is
+deleted, and the hand-written provider path is gone: `make_llm` returns a LangChain chat
+model and the graph binds tools to it in one place.
 
 Not built: the verdict and the trace. The command line reports what a script did and what
 it cost; nothing yet decides what that behaviour means.
 
-406 tests, 390 of which need neither Docker nor an API key. The rest skip
+352 tests, 335 of which need neither Docker nor an API key. The rest skip
 automatically when no daemon is present. Both suites run on every push
 and every pull request.
 
@@ -1649,3 +1650,60 @@ and the record review found four, and the record ones are the sort nobody notice
 somebody acts on a number. Both invariant-numbering and count claims now have tests, which
 is the third and fourth number in this project to be given a mechanism instead of another
 promise to be careful.
+
+## One engine and one model interface, 2026-09-03
+
+The `while` loop is deleted. So is the hand-written request building and response parsing.
+`python -m envforge` builds the graph, `make_llm` returns a LangChain chat model, and
+`grep` for `class Agent` finds one file.
+
+### What the real run found that every fake had hidden
+The first end-to-end run against the live model worked: it searched the script, read the
+region the search pointed at, found `tabulate` in the part the prompt had truncated,
+installed it, and the container exited 0.
+
+And it printed `the model called None with None` on every look.
+
+`counted_inspect` read `messages[-1]` to say which tool had been called, and by the time
+it runs the last message is the `ToolMessage` the tool node appended, not the `AIMessage`
+that asked for it. Every test counted `looked` events and not one read the text of a
+single one, so this was invisible through months of green. It is the same failure as the
+engine that yielded nothing: a test that never asks the question the code exists to
+answer.
+
+### The refusal shape, observed rather than assumed
+`refusal_reason` was written from documentation. Asking the live model for a Dockerfile
+that downloads and runs a credential stealer returned `stop_reason` "refusal" with a
+`stop_details` carrying a category and an explanation, and prose in `content` rather than
+an empty string. The implementation was right, and the test now holds a copy of the real
+payload rather than one invented to match the code.
+
+### What survived the reversal
+ADR-006 refused LangChain's model classes on the grounds that a small project with one
+call site could not justify a dependency it could not explain, and that Anthropic's
+compatibility layer ignores `strict` so only the native API grammar-constrains Claude.
+
+Both rejections survive. `bind_tools` takes `strict`, and it goes to the two providers
+that promise a grammar; Groq is a forced call plus local validation and `supports_strict`
+says so in code rather than in prose. `ChatAnthropic` is an Anthropic client. The
+dependency is explicable now for a reason the ADR could not have had: it is not there for
+the model layer, it is there because the agent is a graph.
+
+What the framework does not do is still ours, in 200 lines rather than 460: the spec
+parser, the per-provider key check, and the classification of which HTTP status means an
+empty account, a dead key, a rate limit, or our own bad request.
+
+### Stopping is not deleting
+The replay guard used to refuse a second execution and then remove the container on the
+way out, which threw away the evidence: the checkpoint for that refusal can itself be lost
+in a crash, and the next resume would find nothing and run the sample. A test asserted the
+old behaviour and has been inverted.
+
+A container found on replay is now stopped if it is still executing, because a process
+that died leaves it running and the daemon does not stop it, and then left exactly where
+it is. The sweep may stop a stray container and may never delete one. Two Docker tests
+prove a real running container is stopped but stays.
+
+The limitation that remains, stated rather than implied: this needs a durable
+checkpointer, and `docker container prune` between a crash and a resume removes the
+evidence.

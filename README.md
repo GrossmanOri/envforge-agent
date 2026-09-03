@@ -27,9 +27,17 @@ one of its own refuses to execute the sample a second time. Two ambiguous outcom
 and the daemon's `State.Error` tells an image that could not start its command apart from a
 script that chose 126 to look like one.
 
-**The model layer**, `envforge/llm.py`. One forced, schema-constrained tool call to
-Anthropic, OpenAI or Groq, so the Dockerfile arrives as validated arguments rather than
-prose we have to extract.
+**The model layer**, `envforge/llm.py`, 200 lines of what a framework does not do.
+`make_llm("provider:model")` returns a LangChain chat model: `ChatAnthropic` for
+Anthropic, `ChatOpenAI` for OpenAI and for Groq through its own base url. What stays ours
+is the failure classification, which says whether an HTTP status means an empty account, a
+dead key, a rate limit, or our own malformed request, because those need different actions
+from whoever reads the exit code.
+
+Strict tool schemas go to the two providers that promise one. Groq documents its schema
+guarantee as not covering tool use, so it is not asked for one and this README does not
+claim it has one; a submitted Dockerfile is validated locally on every provider, which is
+the only check Groq actually has.
 
 **The gate**, `envforge/gate.py`. An allowlist of six instructions and nothing else, run
 before every build including the fallback we write ourselves. `RUN` is exec form, so its
@@ -38,10 +46,9 @@ does not do is stated plainly: `pip install <name>` runs that package's own code
 time, and no instruction allowlist can prevent that, because installing packages is the
 product.
 
-**The agent**, `envforge/graph.py`. A LangGraph `StateGraph`, and the engine everything
-new is built on. The `while` loop it replaces is still in `envforge/agent.py` and still
-what `python -m envforge` drives, because the command line has not been ported yet; that
-is the next piece of work and it is said here rather than implied. Nodes ask the model, answer its questions about the script, gate the Dockerfile, build
+**The agent**, `envforge/graph.py`. A LangGraph `StateGraph`, and the only engine there
+is: the `while` loop it replaced is deleted, not deprecated, and `python -m envforge`
+builds this and nothing else. Nodes ask the model, answer its questions about the script, gate the Dockerfile, build
 it and run it. Each node reads the state, does one thing, and returns the fields it
 changed, so what a node did to a run is exactly the dict it returned.
 
@@ -104,13 +111,28 @@ carried its slices forward and collected a fresh look budget on top. A review fo
 building the attack rather than by reading the rule, and it put 25,326 characters of a
 40,000 character sample into a single prompt before the previous Dockerfile was bounded too.
 
-What the model does not get is any influence over the loop. It chooses what to read. It
+What the model does not get is any influence over the run. It chooses what to read. It
 does not choose whether an attempt is spent, whether the gate runs, or whether anything is
 built.
 
-406 tests, 390 of which need neither Docker nor an API key. The rest skip
+352 tests, 335 of which need neither Docker nor an API key. The rest skip
 automatically when no daemon is present. Both suites run on every push
 and every pull request.
+
+**Running a sample twice, which must never happen.** A checkpoint is written after a node
+returns, so a crash between a container exiting and that checkpoint means the run node is
+replayed. The container is the evidence: it is named from the run and the attempt, killed
+rather than removed when the node finishes, and removed only once the result is durable.
+A resumed run that finds one stops it if it is still executing, leaves it where it is, and
+reports the attempt as interrupted rather than running the sample again or inventing a
+verdict.
+
+Stopping and deleting are different everywhere in this codebase, and that is the reason.
+The sweep below may stop a container a dead process left running; it never deletes one.
+
+The limit is worth stating: this needs a durable checkpointer, since an in-memory one
+loses the state with the process, and `docker container prune` between a crash and a
+resume throws the evidence away.
 
 **What a run leaves behind.** Every image and container carries a label naming the run
 that made it. The run removes its own when it finishes, whatever it finished with, and a

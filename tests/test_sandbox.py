@@ -355,12 +355,14 @@ def _sweep(monkeypatch, objects, keep="", older_than=3600.0):
                                             for _, oid, run, started in listings[kind]])
     monkeypatch.setattr(sandbox_module, "remove_container", dropped.append)
     monkeypatch.setattr(sandbox_module, "remove_image", dropped.append)
-    return sandbox_module.sweep(keep=keep, older_than=older_than), dropped
+    stopped: list[str] = []
+    monkeypatch.setattr(sandbox_module, "force_stop", stopped.append)
+    return sandbox_module.sweep(keep=keep, older_than=older_than), dropped, stopped
 
 
 def test_the_sweep_skips_the_run_that_asked_for_it(monkeypatch):
     """A run must not delete the image it is about to run."""
-    _, dropped = _sweep(monkeypatch,
+    _, dropped, _stopped = _sweep(monkeypatch,
                         [("image", "mine", "run-a", 0),
                          ("image", "theirs", "run-b", 0)], keep="run-a")
     assert dropped == ["theirs"]
@@ -370,14 +372,14 @@ def test_the_sweep_leaves_anything_young_alone(monkeypatch):
     """A second envforge may be running right now and its objects are labelled exactly
     like ours. There is no way to ask whether that process is alive, so age stands in."""
     now = int(time.time())
-    _, dropped = _sweep(monkeypatch,
+    _, dropped, _stopped = _sweep(monkeypatch,
                         [("image", "fresh", "run-b", now),
                          ("image", "stale", "run-c", now - 7200)])
     assert dropped == ["stale"]
 
 
 def test_the_sweep_reports_what_it_removed(monkeypatch):
-    removed, _ = _sweep(monkeypatch,
+    removed, _, _stopped = _sweep(monkeypatch,
                         [("image", "deadbeefcafe0000", "run-x" + "y" * 27, 0)])
     assert removed == ["image deadbeefcafe from run run-xyyy"]
 
@@ -386,7 +388,7 @@ def test_the_sweep_never_removes_a_container(monkeypatch):
     """A crashed attempt's container is the only proof its sample already ran, so
     collecting it would let a run resumed later execute that sample again and report an
     ordinary verdict. Images fill the disk; containers cost kilobytes and are evidence."""
-    _, dropped = _sweep(monkeypatch, [("container", "c1", "old", 0),
+    _, dropped, _stopped = _sweep(monkeypatch, [("container", "c1", "old", 0),
                                       ("image", "i1", "old", 0)])
     assert dropped == ["i1"]
 
@@ -542,3 +544,85 @@ def test_the_sweep_says_nothing_when_docker_is_not_there(monkeypatch):
     # And a lookup that cannot be answered fails closed: assuming no container would let
     # a resumed run execute the sample again on the strength of a failed lookup.
     assert sandbox_module.container_exists("anything") is True
+
+
+@pytest.mark.docker
+def test_a_running_container_is_stopped_but_stays_on_the_host(sandbox):
+    """Stopping and deleting are different, and this is the difference.
+
+    A process that dies leaves its container behind and the daemon does not stop it,
+    because killing the docker client does not kill the container. So a replay can find
+    one still executing the sample it is about to refuse to execute. It has to be
+    stopped, and it has to stay, because it is the only proof the attempt already ran.
+    """
+    from envforge.sandbox import (container_exists, container_running, force_stop,
+                                  labels_for, remove_image)
+
+    run_id = "stoptest" + uuid.uuid4().hex[:8]
+    labels = labels_for(run_id)
+    tag = f"envforge-{run_id}:attempt1"
+    name = f"envforge-{run_id}-attempt1"
+    # A container that keeps running, so there is something to stop.
+    built = sandbox.build('FROM python:3.12-slim\nCMD ["sleep", "120"]\n', {}, tag,
+                          labels)
+    assert built.ok, built.log
+    try:
+        subprocess.run(["docker", "run", "--detach", "--name", name,
+                        *[a for k, v in labels.items() for a in ("--label", f"{k}={v}")],
+                        built.image], capture_output=True, text=True, check=True)
+        assert container_running(name), "the fixture did not start"
+
+        force_stop(name)
+        assert not container_running(name), "it was not stopped"
+        assert container_exists(name), "stopping deleted it, which loses the evidence"
+    finally:
+        remove_container(name)
+        remove_image(tag)
+
+
+@pytest.mark.docker
+def test_the_sweep_stops_a_stray_container_and_leaves_it_there(sandbox):
+    """The sweep's half of the same rule: it may stop what a dead process left running,
+    and it may never delete a stopped container, because a stopped one is evidence."""
+    from envforge.sandbox import (RUN_LABEL, STARTED_LABEL, container_exists,
+                                  container_running, remove_image, sweep)
+
+    run_id = "straytest" + uuid.uuid4().hex[:8]
+    old = {RUN_LABEL: run_id, STARTED_LABEL: str(int(time.time()) - 7200)}
+    tag = f"envforge-{run_id}:attempt1"
+    name = f"envforge-{run_id}-attempt1"
+    built = sandbox.build('FROM python:3.12-slim\nCMD ["sleep", "120"]\n', {}, tag, old)
+    assert built.ok, built.log
+    try:
+        subprocess.run(["docker", "run", "--detach", "--name", name,
+                        *[a for k, v in old.items() for a in ("--label", f"{k}={v}")],
+                        built.image], capture_output=True, text=True, check=True)
+        assert container_running(name)
+
+        reported = sweep(keep="", older_than=3600.0)
+        assert any("stopped container" in line for line in reported), reported
+        assert not container_running(name), "the sweep left it executing"
+        assert container_exists(name), "the sweep deleted replay evidence"
+    finally:
+        remove_container(name)
+        remove_image(tag)
+
+
+def test_the_sweep_stops_a_stray_container_rather_than_leaving_it_executing(monkeypatch):
+    """A container left running by a process that died is still executing an untrusted
+    sample, and nothing else will stop it: killing the docker client does not kill the
+    container. So the sweep stops it, and only stops it, because a stopped one is the
+    evidence that its attempt already ran."""
+    _, dropped, stopped = _sweep(monkeypatch, [("container", "stray", "old-run", 0)])
+    assert stopped == ["stray"]
+    assert dropped == [], "the sweep deleted replay evidence"
+
+
+def test_the_sweep_leaves_a_young_container_running(monkeypatch):
+    """A second envforge may be running right now, and stopping its container would kill
+    a run in another terminal. The age guard covers stopping as well as deleting."""
+    import time as clock
+
+    _, dropped, stopped = _sweep(
+        monkeypatch, [("container", "theirs", "other-run", int(clock.time()))])
+    assert stopped == [] and dropped == []

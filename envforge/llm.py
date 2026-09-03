@@ -18,20 +18,11 @@ seen a provider's JSON and that does not change here.
 
 from __future__ import annotations
 
-import json
 import os
-from dataclasses import dataclass
-from typing import Any, Protocol, Sequence
 
 MAX_TOKENS = 16000
 PROVIDERS = ("anthropic", "openai", "groq")
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-
-_JSON_TYPES: dict[str, type | tuple[type, ...]] = {
-    "string": str, "integer": int, "number": (int, float),
-    "boolean": bool, "object": dict, "array": list,
-}
-
 
 class LLMError(Exception):
     """The call did not produce usable arguments.
@@ -113,132 +104,45 @@ class Truncated(LLMError):
     """The response hit the token ceiling, so the arguments are incomplete."""
 
 
-@dataclass(frozen=True)
-class Tool:
-    """One tool, in our shape. Each provider renders it into its own."""
+def kind_for_status(status: int, reported: str = "") -> str:
+    """What an HTTP status from a provider means to us.
 
-    name: str
-    description: str
-    schema: dict[str, Any]
+    Its own function because there were two copies, and they disagreed: one widened
+    `rejected` to every 4xx while the other stayed on 400, so the same 422 was "our bug,
+    do not retry" from a run and "provider unavailable, retry" from `--check`. Two entry
+    points disagreeing about one event is what this exists to prevent.
 
-    def __post_init__(self) -> None:
-        # Strict mode is a contract with the schema: both providers reject a
-        # schema without these, and they reject it at request time, which would
-        # make a caller's mistake look like a model failure inside the loop.
-        if self.schema.get("additionalProperties") is not False:
-            raise ValueError("a strict schema must set additionalProperties to false")
-        if not self.schema.get("required"):
-            raise ValueError("a strict schema must list its required fields")
-
-
-@dataclass(frozen=True)
-class Call:
-    """What every provider returns. `model` comes from the response, not the
-    request, because a provider is free to serve something other than what was
-    asked for, and the trace has to record what actually answered."""
-
-    arguments: dict[str, Any]
-    # Which tool was called. Meaningless when one tool was offered and the whole
-    # answer when several were, which is why it has no default: a provider that
-    # forgets to set it is a TypeError here rather than a caller reading a name
-    # that was never chosen.
-    name: str
-    # The provider's own id for this call, needed to pair a result back to it.
-    tool_use_id: str
-    model: str
-    input_tokens: int
-    output_tokens: int
-    request: dict[str, Any]
-    response: dict[str, Any]
-    # The assistant turn exactly as the provider returned it, kept whole so a
-    # follow-up request can replay it verbatim.
-    #
-    # Kept rather than rebuilt from `arguments`, because a reconstruction can only
-    # contain the parts of a reply this code already models. Anything else the
-    # provider put in that turn is dropped silently, and the failure would appear as
-    # a 400 on the *next* request rather than on the one that lost it.
-    #
-    # Extended thinking is the concrete case, and it is a contingency here rather than
-    # a description of today: `build_request` sends no `thinking` parameter, so these
-    # requests do not have it on, and Anthropic documents forced tool choice as
-    # incompatible with it anyway. If that ever changes, a turn carrying thinking
-    # blocks has to go back with them, and this field already does the right thing.
-    # An earlier version of this comment asserted thinking was on by default and that
-    # the round trip depended on it. Neither was checked, and one review later neither
-    # is claimed.
-    #
-    # Opaque above this module. Only the provider that produced it reads it.
-    assistant: dict[str, Any]
-
-
-@dataclass(frozen=True)
-class Answered:
-    """One tool call the model made, and the text we sent back for it.
-
-    The transcript is a list of these rather than a list of provider messages, so
-    the agent can hold a conversation without ever constructing one. What we sent
-    back is a plain string on purpose: it is a slice of the untrusted sample, and a
-    string is the only shape that cannot smuggle a role, an image or another tool
-    call into the next request.
+    `reported` is the provider's own error type, needed only where a status is genuinely
+    ambiguous: 403 is both an exhausted account and a key without model access.
     """
-
-    call: Call
-    result: str
-
-
-class LLM(Protocol):
-    def call(self, system: str, user: str, tools: Sequence[Tool],
-             history: Sequence[Answered] = ()) -> Call: ...
-
-
-def validate(arguments: Any, tool: Tool) -> dict[str, Any]:
-    """Check arguments against the tool's own schema.
-
-    Runs on every provider, including the two whose grammar constraint should
-    make it unnecessary. Groq documents its schema guarantee as incompatible
-    with tool use, so for Groq this is the only check there is.
-    """
-    if not isinstance(arguments, dict):
-        raise InvalidArguments(f"expected an object, got {type(arguments).__name__}")
-    properties = tool.schema.get("properties", {})
-    for key in tool.schema.get("required", []):
-        if key not in arguments:
-            raise InvalidArguments(f"missing required field {key!r}")
-    for key, value in arguments.items():
-        if key not in properties:
-            raise InvalidArguments(f"unexpected field {key!r}")
-        declared = properties[key].get("type")
-        expected = _JSON_TYPES.get(declared)
-        if expected and not isinstance(value, expected):
-            raise InvalidArguments(f"field {key!r} should be {declared}")
-    return arguments
-
-
-def chosen(tools: Sequence[Tool], name: str, spent: tuple[int, int]) -> Tool:
-    """The tool the model named, or an unusable reply saying it named nothing we sent.
-
-    `tool_choice` forces a call to one of the tools in the request, so a name outside
-    that set is the provider not honouring its own constraint. An `LLMError` rather
-    than an exception, because that is the repairable family: asking again is a
-    reasonable response to a provider that answered off-menu once.
-
-    The point of checking is what happens next. The caller looks the arguments up
-    against the schema of the tool that was called, so a name we accepted without
-    matching would be validated against the wrong schema, or against none.
-    """
-    for tool in tools:
-        if tool.name == name:
-            return tool
-    offered = ", ".join(tool.name for tool in tools)
-    raise LLMError(f"the model called {name!r}, which was not offered. "
-                   f"Offered: {offered}", *spent)
+    if status == 402:
+        # Payment Required is an empty account, the same event as a 403 billing error and
+        # needing the same action. A blanket 4xx rule reported it as our own malformed
+        # request, telling someone out of credit not to retry and that the bug was theirs.
+        return "billing"
+    if status == 403:
+        return "billing" if "billing" in reported else "permission"
+    if status == 404:
+        return "no_such_model"
+    if status == 401:
+        return "auth"
+    if status == 408:
+        return "network"
+    if status == 429:
+        return "rate_limit"
+    if status >= 500:
+        return "server"
+    if 400 <= status < 500:
+        # Anything else the provider refuses. Enumerating statuses always misses the next
+        # one, so an unmapped 4xx falls to a side rather than to the floor.
+        return "rejected"
+    return "unavailable"
 
 
 def _connection_errors() -> tuple[type[BaseException], ...]:
     """The connection-failure base class of whichever SDKs are installed.
 
-    Imported lazily and tolerantly so this module still works with only one of them
-    present, which is the reason the original check matched on a class name instead.
+    Imported lazily and tolerantly so this module works with only one of them present.
     Matching the base class is what makes a timeout count, since both SDKs derive their
     timeout error from their connection error.
     """
@@ -251,347 +155,87 @@ def _connection_errors() -> tuple[type[BaseException], ...]:
     return tuple(found) or (OSError,)
 
 
-def kind_for_status(status: int, reported: str = "") -> str:
-    """What an HTTP status from a provider means to us.
+def classify(exc: BaseException) -> ProviderUnavailable | None:
+    """The provider failing, named, or None if this is not that.
 
-    Its own function because there were two copies. `reachable` widened `rejected` to
-    every 4xx while the `--check` command stayed on 400 alone, so the same 422 was "our
-    bug, do not retry" from a run and "provider unavailable, retry" from `--check`. Two
-    entry points disagreeing about one event is what this exists to prevent.
+    The one piece of the old hand-written layer worth keeping, and the reason it is kept
+    rather than rewritten: it took several rounds to get right and each round was a real
+    incident. 402 is an empty account, and so is a 403 whose error type says billing,
+    while a 403 without it is a key that cannot use the model. 401 is a dead key. 429 is
+    a rate limit. Any other 4xx is our own malformed request, which is a bug in us rather
+    than the provider being down, and the two need different actions from whoever reads
+    the exit code.
 
-    `reported` is the provider's own error type, needed only where a status is genuinely
-    ambiguous: 403 is both an exhausted account and a key without model access.
+    LangChain passes the SDK's exception through untouched, so the status is where it
+    always was and this rule applies unchanged to a chat model.
+
+    Returns None for anything that is not a provider failure, so a caller re-raises
+    rather than dressing a bug of ours up as a tidy verdict about the sample.
     """
-    if status == 402:
-        # Payment Required is an empty account, which is the same event as a 403 billing
-        # error and needs the same action. A blanket 4xx rule had it reported as our own
-        # malformed request, telling someone out of credit not to retry and that the bug
-        # was theirs.
-        return "billing"
-    if status == 403:
-        return "billing" if "billing" in reported else "permission"
-    if status == 404:
-        return "no_such_model"
-    if status in (401,):
-        return "auth"
-    if status in (408,):
-        return "network"
-    if status == 429:
-        return "rate_limit"
-    if status >= 500:
-        return "server"
-    if 400 <= status < 500:
-        # Anything else the provider refuses. Enumerating statuses always misses the
-        # next one, so unmapped 4xx falls to a side rather than to the floor.
-        return "rejected"
-    return "unavailable"
-
-
-def reachable(send):
-    """Call the provider, and turn "we could not reach it" into one typed failure.
-
-    Both SDKs raise their own exception classes, and neither is an `LLMError`, so
-    without this they escape the loop's handlers entirely: the run dies mid-generator
-    with a traceback, no outcome, and whatever was already spent unrecorded.
-
-    Matched by HTTP status rather than by class name, because the two SDKs do not share
-    a hierarchy and the statuses are the part both agree on. 403 is read further, since
-    an exhausted account and a key that cannot use the model are the same status and
-    only the provider's own error type separates them.
-    """
-    try:
-        return send()
-    except Exception as exc:               # noqa: BLE001 - narrowed immediately below
-        status = getattr(exc, "status_code", None)
-        if isinstance(exc, TypeError) and "resolve authentication" in str(exc):
-            # A backstop, not the mechanism. Credentials are checked when the client is
-            # built, so this only fires if that check is bypassed or the SDK changes
-            # where it resolves them from. Matched on the SDK's specific phrase rather
-            # than on the word "auth", which would have swallowed any TypeError from our
-            # own code that happened to mention authentication.
-            raise MissingKey("ANTHROPIC_API_KEY") from exc
-        if status is None:
+    if isinstance(exc, ProviderUnavailable):
+        return exc
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        if isinstance(exc, _connection_errors()):
             # No HTTP response at all: DNS, TLS, a dropped connection, a timeout.
-            # Matched by inheritance rather than by class name. The name test that was
-            # here first missed `APITimeoutError`, which subclasses the connection error
-            # in both SDKs but does not contain "connection", so a timed-out call went
-            # back to escaping the loop entirely.
-            if isinstance(exc, _connection_errors()):
-                raise ProviderUnavailable(f"could not reach the provider: {exc}",
-                                          kind="network") from exc
-            raise
-        # 400 is the provider rejecting the request we sent, which is not the provider
-        # being unavailable and must not be reported as one: the model was reached and
-        # answered. It is the same event as docker exit 125 one layer up, and ADR-008
-        # already settled what that means, which is that our own code is broken.
-        #
-        # Two causes share the status. A prompt over the context window, which this tool
-        # can produce by feeding a long log into a repair, and a malformed request, which
-        # is a bug in us. Neither is fixed by retrying and neither is the provider's
-        # fault, so they share an ending; the message carries which one the provider
-        # said it was, since that is the only thing that separates them.
-        kind = kind_for_status(status, getattr(exc, "type", "") or "")
-        raise ProviderUnavailable(f"{kind}: {exc}", kind=kind) from exc
+            # Matched by inheritance rather than by class name, because the name test
+            # that was here first missed `APITimeoutError`, which subclasses the
+            # connection error in both SDKs and does not contain "connection".
+            return ProviderUnavailable(f"could not reach the provider: {exc}",
+                                       kind="network")
+        return None
+    kind = kind_for_status(status, getattr(exc, "type", "") or "")
+    return ProviderUnavailable(f"{kind}: {exc}", kind=kind)
 
 
-def charge(check, arguments: Any, tool: Tool, spent: tuple[int, int]) -> dict[str, Any]:
-    """Run `validate` and make sure a failure carries what the reply cost.
+def make_llm(spec: str):
+    """Build a LangChain chat model from "provider:model", failing at startup.
 
-    `validate` is called from both providers and knows nothing about tokens, and a
-    reply that fails its schema cost exactly as much as one that passes.
+    The hand-written request building and response parsing this replaced is gone. What
+    it was protecting is not: strict tool schemas still go to the two providers that
+    honour them, the arguments are still validated locally, and the failure
+    classification above is still ours.
+
+    Groq is deliberately not given `strict`. It documents its schema guarantee as not
+    applying to tool use, so asking for it would be claiming a guarantee the provider
+    does not give; `graph.py` validates a submission's arguments itself, on every
+    provider, which is the only check Groq actually has.
     """
-    try:
-        return check(arguments, tool)
-    except InvalidArguments as exc:
-        exc.input_tokens, exc.output_tokens = spent
-        raise
-
-
-class AnthropicLLM:
-    """The native SDK. Anthropic's OpenAI-compatibility layer ignores `strict`,
-    so this is the only path that grammar-constrains Claude's arguments."""
-
-    def __init__(self, model: str, client: Any = None):
-        import anthropic
-
-        self.model = model
-        if client is not None:
-            self._client = client
-            return
-        try:
-            self._client = anthropic.Anthropic()
-        except anthropic.AnthropicError as exc:
-            # A named profile that is missing or corrupt makes the constructor itself
-            # raise. Left uncaught this was the same traceback the credential check was
-            # added to remove, just moved one line earlier.
-            raise ProviderUnavailable(f"anthropic credentials: {exc}",
-                                      kind="no_key") from exc
-        # Asked of the constructed client rather than of the environment, and asked here
-        # rather than left to request time. This SDK resolves credentials from several
-        # places and raises nothing when it finds none, deferring to the first request
-        # and raising `TypeError` there, which is not an exception any handler in this
-        # program was looking for: a missing key crashed the run with a traceback.
-        #
-        # All three slots, not two. The first version read `api_key` and `auth_token`
-        # only, which told anyone authenticated through `ant auth login` that their key
-        # was not set: `credentials` is where the SDK puts a profile's bearer token and
-        # a workload identity, and it is as valid as the other two. The test enshrined
-        # the bug, since deleting two environment variables cannot reveal a third slot.
-        if not any(getattr(self._client, name, None)
-                   for name in ("api_key", "auth_token", "credentials")):
-            raise MissingKey("ANTHROPIC_API_KEY")
-
-    def build_request(self, system: str, user: str, tools: Sequence[Tool],
-                      history: Sequence[Answered] = ()) -> dict[str, Any]:
-        messages: list[dict[str, Any]] = [{"role": "user", "content": user}]
-        for answered in history:
-            messages.append(answered.call.assistant)
-            messages.append({"role": "user", "content": [{
-                "type": "tool_result",
-                "tool_use_id": answered.call.tool_use_id,
-                "content": answered.result,
-            }]})
-        # One tool is still forced by name, so the request for a Dockerfile goes over
-        # the wire exactly as it did before any of this existed. Several tools become
-        # "any", which forces a call without saying which: that is the whole point,
-        # since choosing is what the model is here to do.
-        #
-        # `disable_parallel_tool_use` is not a preference. Two tool_use blocks in one
-        # reply means one of them never gets a tool_result, and Anthropic rejects the
-        # next request for exactly that. It would also be a silent hole in the cap:
-        # a reply carrying four reads costs one look.
-        choice: dict[str, Any] = ({"type": "tool", "name": tools[0].name}
-                                  if len(tools) == 1 else {"type": "any"})
-        choice["disable_parallel_tool_use"] = True
-        return {
-            "model": self.model,
-            "max_tokens": MAX_TOKENS,
-            "system": system,
-            "messages": messages,
-            "tools": [{
-                "name": tool.name,
-                "description": tool.description,
-                "strict": True,
-                "input_schema": tool.schema,
-            } for tool in tools],
-            "tool_choice": choice,
-        }
-
-    @staticmethod
-    def tokens(response: Any) -> tuple[int, int]:
-        """What the reply cost, read off the response rather than the request, and
-        read on the failing paths too. Defaults to zero only when there is no usage
-        to read, which is a missing measurement rather than a free call."""
-        usage = getattr(response, "usage", None)
-        if usage is None:
-            return 0, 0
-        return getattr(usage, "input_tokens", 0), getattr(usage, "output_tokens", 0)
-
-    def call(self, system: str, user: str, tools: Sequence[Tool],
-             history: Sequence[Answered] = ()) -> Call:
-        request = self.build_request(system, user, tools, history)
-        response = reachable(lambda: self._client.messages.create(**request))
-        spent = self.tokens(response)
-        if response.stop_reason == "refusal":
-            details = response.stop_details
-            raise Refused(f"{self.model} declined: {details}",
-                          reason=details.model_dump(mode="json") if details else None,
-                          input_tokens=spent[0], output_tokens=spent[1])
-        if response.stop_reason == "max_tokens":
-            raise Truncated(f"{self.model} hit {MAX_TOKENS} tokens", *spent)
-        # Scanned rather than indexed, because a reply may carry blocks this code does
-        # not model and their order is the provider's business. An earlier comment here
-        # justified it with thinking being on by default; no `thinking` parameter is sent,
-        # so that was never true of these requests. Scanning is correct either way, which
-        # is why the line survived its own reason.
-        block = next((b for b in response.content if b.type == "tool_use"), None)
-        if block is None:
-            raise LLMError(f"no tool_use block, stop_reason={response.stop_reason}", *spent)
-        body = response.model_dump(mode="json")
-        return Call(
-            arguments=charge(validate, block.input, chosen(tools, block.name, spent), spent),
-            name=block.name,
-            tool_use_id=block.id,
-            model=response.model,
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-            request=request,
-            response=body,
-            # The content blocks as they arrived, thinking and all. Taken from the
-            # dump rather than rebuilt, so a block type this code has never heard of
-            # still survives the round trip.
-            assistant={"role": "assistant", "content": body["content"]},
-        )
-
-
-class OpenAICompatLLM:
-    """OpenAI and Groq, which speak the same wire format through `base_url`.
-
-    OpenAI grammar-constrains the arguments. Groq accepts the forced named call
-    but documents its schema guarantee as not applying to tool use, so `strict`
-    is left off there and `validate` is the whole guarantee.
-    """
-
-    def __init__(self, model: str, base_url: str | None = None, strict: bool = True,
-                 api_key_env: str = "OPENAI_API_KEY", client: Any = None):
-        import openai
-
-        self.model = model
-        self.strict = strict
-        if client is not None:
-            self._client = client
-            return
-        # Read the key ourselves. Handing openai a None key makes it fall back to
-        # OPENAI_API_KEY, which would quietly send an OpenAI key to Groq and fail
-        # as a 401 from the wrong provider halfway through a run.
-        key = os.environ.get(api_key_env)
-        if not key:
-            raise MissingKey(api_key_env)
-        self._client = openai.OpenAI(base_url=base_url, api_key=key)
-
-    def _function(self, tool: Tool) -> dict[str, Any]:
-        function: dict[str, Any] = {
-            "name": tool.name,
-            "description": tool.description,
-            "parameters": tool.schema,
-        }
-        if self.strict:
-            function["strict"] = True
-        return {"type": "function", "function": function}
-
-    def build_request(self, system: str, user: str, tools: Sequence[Tool],
-                      history: Sequence[Answered] = ()) -> dict[str, Any]:
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]
-        for answered in history:
-            messages.append(answered.call.assistant)
-            messages.append({"role": "tool",
-                             "tool_call_id": answered.call.tool_use_id,
-                             "content": answered.result})
-        # Named while there is one tool, "required" once there are several: the same
-        # two shapes the Anthropic path uses, under this wire format's own names.
-        choice: Any = ({"type": "function", "function": {"name": tools[0].name}}
-                       if len(tools) == 1 else "required")
-        return {
-            "model": self.model,
-            # One tool call per reply. Same reason as the Anthropic path: a second
-            # call in the same reply would go unanswered and be rejected on the next
-            # request, and it would let one look return four slices.
-            "parallel_tool_calls": False,
-            # The same ceiling the Anthropic path sends. Without it the budget's
-            # estimate is a guess about a limit that does not exist: `estimate` adds
-            # MAX_TOKENS on the assumption a reply cannot exceed it, so one reply here
-            # could overshoot the whole budget before the next call is refused. It also
-            # gives `Truncated` something to fire on, which is otherwise unreachable
-            # on this path.
-            "max_completion_tokens": MAX_TOKENS,
-            "messages": messages,
-            "tools": [self._function(tool) for tool in tools],
-            "tool_choice": choice,
-        }
-
-    @staticmethod
-    def tokens(response: Any) -> tuple[int, int]:
-        """The same measurement under this wire format's own names."""
-        usage = getattr(response, "usage", None)
-        if usage is None:
-            return 0, 0
-        return getattr(usage, "prompt_tokens", 0), getattr(usage, "completion_tokens", 0)
-
-    def call(self, system: str, user: str, tools: Sequence[Tool],
-             history: Sequence[Answered] = ()) -> Call:
-        request = self.build_request(system, user, tools, history)
-        response = reachable(lambda: self._client.chat.completions.create(**request))
-        spent = self.tokens(response)
-        choice = response.choices[0]
-        refusal = getattr(choice.message, "refusal", None)
-        if refusal:
-            raise Refused(f"{self.model} declined: {refusal}", reason=refusal,
-                          input_tokens=spent[0], output_tokens=spent[1])
-        if choice.finish_reason == "length":
-            raise Truncated(f"{self.model} ran out of output tokens", *spent)
-        calls = choice.message.tool_calls or []
-        if not calls:
-            raise LLMError(f"no tool call, finish_reason={choice.finish_reason}", *spent)
-        made = calls[0]
-        try:
-            arguments = json.loads(made.function.arguments)
-        except json.JSONDecodeError as exc:
-            raise InvalidArguments(f"arguments were not JSON: {exc}", *spent) from exc
-        return Call(
-            arguments=charge(validate, arguments,
-                             chosen(tools, made.function.name, spent), spent),
-            name=made.function.name,
-            tool_use_id=made.id,
-            model=response.model,
-            input_tokens=response.usage.prompt_tokens,
-            output_tokens=response.usage.completion_tokens,
-            request=request,
-            response=response.model_dump(mode="json"),
-            # Null fields dropped. The SDK's dump carries every optional key the
-            # schema has, and sending `"function_call": null` and `"audio": null`
-            # back is at best noise and at worst a 400 from a compatible provider
-            # that is stricter than OpenAI about keys it does not implement.
-            assistant={key: value
-                       for key, value in choice.message.model_dump(mode="json").items()
-                       if value is not None},
-        )
-
-
-def make_llm(spec: str) -> LLM:
-    """Build a provider from "provider:model", failing at startup rather than
-    mid-run. The client is constructed here for the same reason: a missing key
-    should stop the process before a container has been built."""
     provider, separator, model = spec.partition(":")
     if not separator or not model:
         raise ValueError(f"spec must be provider:model, got {spec!r}")
     if provider not in PROVIDERS:
-        raise ValueError(f"unknown provider {provider!r}, expected one of {', '.join(PROVIDERS)}")
+        raise ValueError(f"unknown provider {provider!r}, expected one of "
+                         f"{', '.join(PROVIDERS)}")
+
     if provider == "anthropic":
-        return AnthropicLLM(model)
-    if provider == "openai":
-        return OpenAICompatLLM(model)
-    return OpenAICompatLLM(model, base_url=GROQ_BASE_URL, strict=False,
-                           api_key_env="GROQ_API_KEY")
+        from langchain_anthropic import ChatAnthropic
+
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            raise MissingKey("ANTHROPIC_API_KEY")
+        return ChatAnthropic(model=model, max_tokens=MAX_TOKENS)
+
+    from langchain_openai import ChatOpenAI
+
+    # Read the key ourselves rather than letting the client default it. Handing
+    # `ChatOpenAI` no key makes it fall back to OPENAI_API_KEY, which would quietly send
+    # an OpenAI secret to Groq's servers and fail as a 401 from the wrong provider
+    # halfway through a run.
+    variable = "OPENAI_API_KEY" if provider == "openai" else "GROQ_API_KEY"
+    key = os.environ.get(variable)
+    if not key:
+        raise MissingKey(variable)
+    base_url = None if provider == "openai" else GROQ_BASE_URL
+    return ChatOpenAI(model=model, api_key=key, base_url=base_url,
+                      max_completion_tokens=MAX_TOKENS)
+
+
+def supports_strict(spec: str) -> bool:
+    """Whether this provider grammar-constrains tool arguments.
+
+    Anthropic and OpenAI do. Groq accepts the parameter and documents its schema
+    guarantee as not covering tool use, so it is not asked for one: claiming it would be
+    claiming something the provider does not promise, which is the sentence this project
+    keeps a rule about.
+    """
+    return spec.partition(":")[0] in ("anthropic", "openai")

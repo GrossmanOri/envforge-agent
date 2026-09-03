@@ -36,9 +36,10 @@ from .agent import (CONTEXT, DOCKERFILE_LIMIT, EVIDENCE_LIMIT, FIRST, LANGUAGES,
                     SCRIPT_LIMIT, SYSTEM, EngineFailure, Outcome, Usage,
                     default_dockerfile, describe, manifests)
 from .context import Context
-from .sandbox import container_exists, remove_container, sweep
+from .sandbox import (container_exists, container_running, force_stop,
+                      remove_container, sweep)
 from .events import Event
-from .llm import ProviderUnavailable, kind_for_status
+from .llm import classify
 from .sandbox import BuildResult, RunResult, labels_for
 from .tools import (INSPECTION, SUBMIT, bound, inspection_tools, submit_dockerfile)
 
@@ -84,6 +85,10 @@ class State(MessagesState):
     # The run ended for a reason that is not about the sample at all, so nothing further
     # should be asked, built or run. Only the provider failing sets this.
     stopped: bool
+    # This attempt found its own container already on the host, so it refused to execute
+    # the sample again. Distinct from `stopped`: that is the provider failing, this is
+    # the replay guard firing, and the difference decides whether the container is kept.
+    interrupted: bool
 
     max_attempts: int
     max_refusals: int
@@ -175,7 +180,7 @@ def model_node(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
         # This escaped the graph entirely until a review ran it: a dead key came out as
         # a raw SDK exception with no `finished` event, so a caller got no verdict and no
         # sign that one was missing.
-        failure = as_unavailable(exc)
+        failure = classify(exc)
         if failure is None:
             raise
         if failure.kind == "rejected":
@@ -266,6 +271,19 @@ def unusable_node(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
     return {"retry_to": "model", "evidence": reason}
 
 
+def _last_tool_call(messages: list[Any]) -> dict[str, Any] | None:
+    """The most recent tool call the model made, searching backwards.
+
+    Backwards from the end rather than at the end, because between the call and any node
+    that wants to describe it there is a `ToolMessage` carrying the result.
+    """
+    for message in reversed(messages):
+        calls = getattr(message, "tool_calls", None)
+        if calls:
+            return calls[0]
+    return None
+
+
 def counted_inspect(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
     """Count the look and say what was read.
 
@@ -273,8 +291,11 @@ def counted_inspect(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
     graph's rule and not the tool's. A tool that counted its own uses would be the thing
     being limited keeping the tally.
     """
-    last = state["messages"][-1]
-    call = (getattr(last, "tool_calls", None) or [{}])[0]
+    # The last message here is the `ToolMessage` the `ToolNode` just appended, not the
+    # `AIMessage` that asked for it, so the call has to be looked up rather than taken
+    # from the end. Reading the end printed "the model called None with None" on every
+    # real run, and no test saw it: they counted `looked` events and never read one.
+    call = _last_tool_call(state["messages"]) or {}
     seen = state["seen"] + 1
     _emit(runtime, Event("looked",
                          f"attempt {state['attempt']}: the model called "
@@ -287,6 +308,23 @@ def counted_inspect(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
                              f"attempt. The looking tools are withdrawn and the model "
                              f"must submit now"))
     return {"seen": seen, "looks": state["looks"] + 1}
+
+
+def _malformed(dockerfile: Any, base_image: Any) -> str | None:
+    """Why a submission cannot be used, or None if it can.
+
+    Shape only. Whether the Dockerfile is *allowed* is the gate's question and is asked
+    next; this asks whether there is a Dockerfile at all.
+    """
+    for name, value in (("dockerfile", dockerfile), ("base_image", base_image)):
+        if value is None:
+            return f"your submission left out {name}. Send both fields."
+        if not isinstance(value, str):
+            return (f"{name} must be a string, and arrived as "
+                    f"{type(value).__name__}. Send both fields as text.")
+        if not value.strip():
+            return f"your submission had an empty {name}. Send both fields."
+    return None
 
 
 def gate_node(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
@@ -305,8 +343,21 @@ def gate_node(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
         answers: list[Any] = []
     else:
         args = call.get("args", {})
-        dockerfile, base_image = args.get("dockerfile", ""), args.get("base_image", "")
+        dockerfile, base_image = args.get("dockerfile"), args.get("base_image")
         answers = [call]
+        # Validated here because nothing else does. Every other tool's arguments are
+        # checked by its own schema when `ToolNode` runs it, and this one is never run:
+        # the graph routes on it. Anthropic and OpenAI grammar-constrain the arguments
+        # anyway, but Groq documents its schema guarantee as not covering tool use, so
+        # for Groq this is the only check there is. Without it a malformed submission
+        # reached the gate as an empty string and was refused for the wrong reason.
+        wrong = _malformed(dockerfile, base_image)
+        if wrong is not None:
+            _emit(runtime, Event("unusable_reply", wrong))
+            return {"messages": [ToolMessage(content=wrong,
+                                             tool_call_id=call.get("id", ""))],
+                    "retry_to": "model", "evidence": wrong,
+                    "rejection": wrong, "candidate": None}
 
     rejection = runtime.context.gate(dockerfile, base_image, frozenset(state["files"]))
     answer = ("the Dockerfile passed the gate" if rejection is None
@@ -464,13 +515,26 @@ def run_node(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
     """
     name = container_name(state)
     if runtime.context.exists(name):
+        # Stop it, and do not remove it. Two different things, and conflating them is
+        # what this whole path exists to avoid.
+        #
+        # Stopping, because a process that died leaves its container behind and the
+        # daemon does not stop it: the sample may still be executing right now, while we
+        # are about to report the attempt as interrupted.
+        #
+        # Keeping, because the container is the only proof that this attempt already ran.
+        # Removing it here would be the same mistake one layer along: the checkpoint for
+        # this refusal can itself be lost in a crash, and the next resume would then find
+        # no evidence and run the sample again.
+        if runtime.context.running(name):
+            runtime.context.stop_container(name)
         reason = ("this attempt already started a container and the run was interrupted "
                   "before its result was recorded. Refusing to run the sample a second "
                   "time")
         _emit(runtime, Event("exec_failed", reason))
         _emit(runtime, finished_event(state, reason, ok=False, kind="failed",
                                       dockerfile=state["candidate"]))
-        return {"result": None}
+        return {"result": None, "interrupted": True}
 
     tag = f"envforge-{state['run_id']}:attempt{state['attempt']}"
     _emit(runtime, Event("running", f"running {tag}"))
@@ -489,8 +553,16 @@ def after_run(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
     left neither a checkpoint nor a container, and a resumed run executed the sample a
     second time.
     """
+    if state["interrupted"]:
+        # The one path that must not clean up. This node removes the container once the
+        # result is durable, and on a normal run that is right. Here there is no result
+        # and the container is the evidence, so removing it would throw away the only
+        # thing standing between a later resume and a second execution of the sample.
+        # An earlier version removed it here and a test asserted that, which was the
+        # cleanup rule winning an argument it should have lost.
+        return {}
     runtime.context.remove_container(container_name(state))
-    if state["result"] is None:            # the interrupted-replay path already ended
+    if state["result"] is None:            # nothing ran, so there is nothing to report
         return {}
     result = RunResult(**state["result"])
     if result.start_error:
@@ -638,32 +710,11 @@ def start_state(run_id: str, language: str, script: str, full: str,
         args=list(args or []),
         attempt=1, calls=0, looks=0, seen=0,
         candidate=None, base_image="", evidence=None, rejection=None,
-        stopped=False,
+        stopped=False, interrupted=False,
         max_attempts=max_attempts, max_refusals=max_refusals, refusals=[],
         used_fallback=False, input_tokens=0, output_tokens=0,
         rebuilt_after_timeout=False, retry_to="model", build=None, result=None,
     )
-
-
-def as_unavailable(exc: Exception) -> ProviderUnavailable | None:
-    """The provider failing, classified, or None if this is not that.
-
-    The classification is `llm.py`'s and is reused rather than rewritten. It took several
-    rounds to get right: 402 and a 403 whose type says billing are an empty account, 401
-    is a dead key, 429 is a rate limit, and any other 4xx is our own malformed request,
-    which is a bug in us rather than the provider being down. LangChain passes the SDK's
-    exception through, so the same status is on it and the same rule applies.
-
-    Returns None for anything that is not a provider failure, so the caller re-raises
-    rather than turning a bug of ours into a tidy verdict.
-    """
-    if isinstance(exc, ProviderUnavailable):
-        return exc
-    status = getattr(exc, "status_code", None)
-    if status is None:
-        return None
-    kind = kind_for_status(status, getattr(exc, "type", "") or "")
-    return ProviderUnavailable(str(exc), kind=kind)
 
 
 def step_ceiling(max_attempts: int, max_refusals: int) -> int:
@@ -725,15 +776,22 @@ class Agent:
     """
 
     def __init__(self, llm: Any, sandbox: Any, gate: Gate, max_attempts: int = 3,
-                 max_refusals: int = 1, exists=container_exists,
-                 remove=remove_container, sweeper=sweep) -> None:
+                 max_refusals: int = 1, exists=None, remove=None, sweeper=None,
+                 running=None, stop=None) -> None:
         self.llm, self.sandbox, self.gate = llm, sandbox, gate
         self.max_attempts, self.max_refusals = max_attempts, max_refusals
         # The three host lookups, injectable for the same reason the sandbox is. They
         # reach for the docker binary, and a test of the graph's decisions should not
         # need one: leaving them hard-wired made four unit tests require a daemon and
         # perform real removals on the developer's machine.
-        self.exists, self.remove, self.sweeper = exists, remove, sweeper
+        # Resolved here rather than as default arguments, which bind at definition time:
+        # a caller that replaces one of these on the module afterwards, which is what a
+        # test without a daemon does, would otherwise be ignored entirely.
+        self.exists = exists or container_exists
+        self.remove = remove or remove_container
+        self.sweeper = sweeper or sweep
+        self.running = running or container_running
+        self.stop = stop or force_stop
 
     def run(self, workspace: Workspace, language: str, args: Sequence[str] = (),
             checkpointer=None,
@@ -773,7 +831,8 @@ class Agent:
         # generator yields; an extra list collected on the side is what hid the fact that
         # nothing was reaching a caller at all.
         context = Context(model=self.llm, gate=self.gate, sandbox=self.sandbox,
-                          exists=self.exists, remove_container=self.remove)
+                          exists=self.exists, remove_container=self.remove,
+                          running=self.running, stop_container=self.stop)
         limit = step_ceiling(self.max_attempts, self.max_refusals)
         try:
             yield from graph.stream(state, {**(config or {}),

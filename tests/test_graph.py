@@ -40,9 +40,14 @@ class FakeModel:
         self.bound_with = kwargs
         return self
 
-    def invoke(self, messages):
+    def invoke(self, messages, **kwargs):
         self.seen_messages.append(list(messages))
-        return self.queue.pop(0)
+        reply = self.queue.pop(0)
+        if isinstance(reply, Exception):
+            # A queued exception is raised rather than returned, so a provider failure
+            # can be scripted the same way a reply is.
+            raise reply
+        return reply
 
 
 def looks_at(name="search_script", **args):
@@ -67,6 +72,9 @@ class FakeSandbox:
     def __init__(self, builds=(), runs=()):
         self.builds, self.runs = list(builds), list(runs)
         self.built_tags, self.ran_as = [], []
+        # What the engine asked to be removed. Cleanup belongs to the object that owns
+        # the run, so a fake that could not record it would leave that untestable.
+        self.removed: list[str] = []
 
     def build(self, dockerfile, files, tag, labels=None):
         self.built_tags.append(tag)
@@ -77,7 +85,7 @@ class FakeSandbox:
         return self.runs.pop(0) if self.runs else _ran()
 
     def remove_image(self, tag):
-        pass
+        self.removed.append(tag)
 
 
 def _build(ok=True, exit_code=0, log="", timed_out=False, seconds=0.1):
@@ -97,7 +105,8 @@ def _offline():
     engine that reach for it.
     """
     return {"exists": lambda name: False, "remove": lambda name: None,
-            "sweeper": lambda keep="", older_than=3600.0: []}
+            "sweeper": lambda keep="", older_than=3600.0: [],
+            "running": lambda name: False, "stop": lambda name: None}
 
 
 def _workspace(text=None):
@@ -117,13 +126,15 @@ def DENY(dockerfile, base_image, files):
 
 def run(model, gate=ALLOW, events=None, script=SCRIPT, checkpointer=None, config=None,
         sandbox=None, exists=lambda name: False, max_attempts=3,
-        remove=lambda name: None):
+        remove=lambda name: None, running=lambda name: False,
+        stop=lambda name: None):
     graph = build_graph(script, checkpointer=checkpointer)
     state = start_state("r1", "python", "s.py", script, {"s.py": script},
                         "you write Dockerfiles", "here is the script",
                         max_attempts=max_attempts)
     context = Context(model=model, gate=gate, sandbox=sandbox or FakeSandbox(),
                       exists=exists, remove_container=remove,
+                      running=running, stop_container=stop,
                       emit=events.append if events is not None else (lambda e: None))
     return graph.invoke(state, context=context, config=config or {})
 
@@ -513,12 +524,39 @@ def test_the_container_is_removed_only_after_its_result_is_recorded():
                      ("removed", "envforge-r1-attempt1")]
 
 
-def test_an_interrupted_attempt_still_has_its_container_cleaned_up():
-    """Refusing to re-run must not leave the evidence lying around forever."""
+def test_an_interrupted_attempt_keeps_its_container_as_evidence():
+    """The opposite of what this asserted, and the change is the point.
+
+    It said refusing must not leave the evidence lying around, and cleaned it up. That
+    is the cleanup rule winning an argument it should lose: the checkpoint for the
+    refusal can itself be lost in a crash, and the next resume would then find nothing
+    and execute the sample a second time. The container stays.
+    """
     removed = []
     run(FakeModel(submits()), sandbox=FakeSandbox(), remove=removed.append,
         exists=lambda name: name == "envforge-r1-attempt1")
-    assert removed == ["envforge-r1-attempt1"]
+    assert removed == [], "the evidence that the sample already ran was deleted"
+
+
+def test_a_container_found_still_running_is_stopped_but_not_removed():
+    """A process that died leaves its container behind and the daemon does not stop it,
+    so the sample may still be executing while we report the attempt as interrupted.
+    Stopping ends that. Removing would destroy the proof it happened."""
+    stopped, removed = [], []
+    events = []
+    run(FakeModel(submits()), sandbox=FakeSandbox(), events=events,
+        remove=removed.append, exists=lambda name: True,
+        running=lambda name: True, stop=stopped.append)
+    assert stopped == ["envforge-r1-attempt1"]
+    assert removed == []
+    assert "second time" in outcome_of(events).reason
+
+
+def test_a_container_already_stopped_is_not_stopped_again():
+    stopped = []
+    run(FakeModel(submits()), sandbox=FakeSandbox(), exists=lambda name: True,
+        running=lambda name: False, stop=stopped.append)
+    assert stopped == []
 
 
 # --- refusals and the fallback --------------------------------------------------------
@@ -928,3 +966,108 @@ def test_a_bug_of_ours_is_not_dressed_up_as_a_provider_failure():
 
     with pytest.raises(ValueError, match="a bug in our own code"):
         run(Broken())
+
+
+# --- tool binding, and the submission nobody executes -----------------------------------
+
+def test_tools_are_bound_in_one_place_with_parallel_calls_off():
+    """One binding site, so there is one place a tool can be added or a flag forgotten."""
+    model = FakeModel(submits())
+    run(model)
+    assert model.bound_with["parallel_tool_calls"] is False
+    assert set(model.offered[0]) == {"read_script", "search_script", "submit_dockerfile"}
+
+
+@pytest.mark.parametrize("args, expected", [
+    ({"base_image": "python:3.12-slim"}, "left out dockerfile"),
+    ({"dockerfile": "FROM x"}, "left out base_image"),
+    ({"dockerfile": 7, "base_image": "x"}, "must be a string"),
+    ({"dockerfile": "", "base_image": "x"}, "empty dockerfile"),
+    ({"dockerfile": "FROM x", "base_image": "   "}, "empty base_image"),
+], ids=["no dockerfile", "no base_image", "not a string", "empty", "whitespace"])
+def test_a_malformed_submission_is_refused_before_the_gate_sees_it(args, expected):
+    """The one tool nobody executes is the one nobody validates.
+
+    Every other tool's arguments are checked by its own schema when `ToolNode` runs it,
+    and this one is never run: the graph routes on it. Anthropic and OpenAI
+    grammar-constrain the arguments anyway, but Groq documents its schema guarantee as
+    not covering tool use, so for Groq this is the only check there is. Without it a
+    malformed submission reached the gate as an empty string and was refused for the
+    wrong reason.
+    """
+    gated = []
+
+    def watching(dockerfile, base_image, files):
+        gated.append(dockerfile)
+        return None
+
+    broken = AIMessage(content="", tool_calls=[
+        {"name": "submit_dockerfile", "args": args, "id": "callsubmit"}])
+    events = []
+    run(FakeModel(broken, submits()), gate=watching, events=events)
+
+    assert "unusable_reply" in [e.kind for e in events]
+    assert expected in [e.message for e in events if e.kind == "unusable_reply"][0]
+    # The gate saw only the good one, so it never had to guess what an empty string meant.
+    assert gated == [GOOD]
+
+
+def test_a_well_formed_submission_reaches_the_gate_untouched():
+    """The check is about shape, not about whether the Dockerfile is allowed. Deciding
+    that is the gate's job and it must still get its turn."""
+    gated = []
+    run(FakeModel(submits("FROM python:3.12-slim\nCMD [\"x\"]\n")),
+        gate=lambda d, b, f: gated.append(d) or None)
+    assert gated == ["FROM python:3.12-slim\nCMD [\"x\"]\n"]
+
+
+def test_a_look_says_which_tool_was_called_and_with_what():
+    """The event's words, not just its kind.
+
+    Every test here counted `looked` events and none read one, so a real run printed
+    "the model called None with None" for months of fake-driven green. The node read
+    `messages[-1]`, which by then is the `ToolMessage` the tool node appended rather
+    than the `AIMessage` that asked for it.
+    """
+    events = []
+    run(FakeModel(looks_at(name="read_script", start=10, end=99), submits()),
+        events=events)
+    looked = [e for e in events if e.kind == "looked"][0]
+    assert "read_script" in looked.message
+    assert "'start': 10" in looked.message and "'end': 99" in looked.message
+    assert "None" not in looked.message
+    assert looked.data["tool"] == "read_script"
+
+
+def test_a_search_look_names_the_pattern_it_searched_for():
+    events = []
+    run(FakeModel(looks_at(name="search_script", pattern="tabulate"), submits()),
+        events=events)
+    looked = [e for e in events if e.kind == "looked"][0]
+    assert "search_script" in looked.message and "tabulate" in looked.message
+
+
+def test_the_refusal_shape_is_the_one_a_live_model_actually_returns():
+    """Copied from a real reply, not invented.
+
+    Asked Claude on 2026-09-03 for a Dockerfile that downloads and runs a credential
+    stealer. It declined with `stop_reason` "refusal" and a `stop_details` carrying a
+    category and an explanation, and `content` set to prose rather than empty. That last
+    part matters: a refusal is a successful reply with no tool call, so anything reading
+    "no tool call" as an error would report the model's judgment of the sample as our own
+    malfunction.
+    """
+    from envforge.graph import refusal_reason
+
+    real = AIMessage(
+        content="I can't help with",
+        response_metadata={
+            "stop_reason": "refusal",
+            "stop_details": {"category": "cyber", "type": "refusal",
+                             "explanation": "This request triggered cyber-related "
+                                            "safeguards."}},
+        tool_calls=[])
+    said = refusal_reason(real)
+    assert said is not None and "cyber-related safeguards" in said
+    # And it is not mistaken for a reply we could not use, which spends an attempt.
+    assert refusal_reason(AIMessage(content="just chatting")) is None

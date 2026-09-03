@@ -47,3 +47,8 @@ class Context:
     # next node runs, the result has been written down and the container has stopped
     # being the only record of it.
     remove_container: Callable[[str], None] = field(default=lambda name: None)
+    # Whether a container is running, and how to stop one without removing it. The two
+    # are separate on purpose: stopping ends an execution, removing destroys the evidence
+    # that an execution happened, and the replay guard needs the first without the second.
+    running: Callable[[str], bool] = field(default=lambda name: False)
+    stop_container: Callable[[str], None] = field(default=lambda name: None)
