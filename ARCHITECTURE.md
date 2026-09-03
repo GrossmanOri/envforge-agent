@@ -5,25 +5,26 @@ file does, it belongs in the file instead.
 
 ## The pipeline
 
-    script.py
-       |
-       v
-    LLM writes a Dockerfile  (forced strict tool call, one string field)
-       |
-       v
-    gate: allowlist of six instructions, no continuations   --reject--> repair
-       |                                                                  ^
-       v                                                                  |
-    build  (network ON, apt and pip need it)  ------------- fails --------+
-       |                                                                  |
-       v                                                                  |
-    run  (network OFF, all caps dropped, non-root, read-only) -- fails ---+
-       |                                                          bounded evidence
-       v
-    verdict  (computed from observed behaviour; LLM opinion advisory)   NOT BUILT
+    START -> model -+-> inspect -> counted -> model      the model reading the script
+                    |
+                    +-> unusable -> retry                 a reply we cannot use
+                    |
+                    +-> gate -+-> build -> after_build -+-> run -> after_run -+-> END
+                              |                          |                     |
+                              +-> retry                  +-> retry ------------+
+                                                              |
+                                                              +-> model or build
 
-The repair loop is the single back-edge, capped. Every repaired Dockerfile re-enters the
-same gate before any build.
+The nodes the model can reach are `inspect` and the routing out of its own reply.
+`gate`, `build` and `run` are deterministic and no tool call touches them: submitting a
+Dockerfile is a tool the graph routes on rather than executes.
+
+`retry` is the single back-edge and it is where the attempt cap lives, so every path that
+could loop passes one counter. Every repaired Dockerfile re-enters the same gate before
+any build.
+
+The verdict is not built. The command line reports what a script did and what it cost;
+nothing yet decides what that behaviour means.
 
 ## Invariants
 
@@ -39,7 +40,11 @@ same gate before any build.
 4. Build has network. Run has none.
 5. The run has a memory cap, a pids cap, a cpu cap, read-only root with a tmpfs,
    cap-drop ALL, no-new-privileges, and a non-root user.
-6. Every container is named and force-removed in a `finally`.
+6. Every container is named before it spawns and killed in a `finally`, so killing the
+   docker client can never leave one running. Removal is deliberately later: the
+   container is the only durable proof that an untrusted sample already ran, so it is
+   removed once the run's result has been checkpointed, and a sweep collects whatever a
+   crashed run left behind.
 7. No Docker socket is mounted anywhere, and the agent is never containerised.
 8. Test arguments are passed only after the image name, so an ENTRYPOINT image receives
    them as argv and never as docker flags.
@@ -65,7 +70,8 @@ same gate before any build.
     charged only for successes could be walked past by a loop that never succeeds.
 19. Every event an engine yields is one of a closed set, and every string it carries has
     its authors declared. An engine cannot invent a kind, and no record reaches a reader
-    without saying whether we wrote it.
+    without saying whether we wrote it. A test reads both engine modules and fails if the
+    union of what they emit is not exactly the table.
 20. A run that cannot reach the model ends with `ok` false and never falls back to a
     Dockerfile we wrote. It is not a finding about the script, and a verdict no judgment
     went into must not be reported as a success.
@@ -77,40 +83,48 @@ same gate before any build.
 22. What the shell learns comes from a typed `Outcome.kind`, never from matching words in
     a sentence. `reason` splices in filenames and provider text, so a sample could
     otherwise choose the exit code.
-23. The model chooses what it reads and never what the loop does. A tool call cannot
-    spend an attempt, reach the gate, start a build, or change the attempt count.
-24. One prompt holds at most `SCRIPT_LIMIT + MAX_LOOKS * SLICE_LIMIT` characters of the
-    script directly, plus at most `DOCKERFILE_LIMIT + EVIDENCE_LIMIT` of text written by
-    the model or produced by a build, either of which may quote the sample back. The cap
-    on tool calls is what makes the first term true, so it is a security control and not
-    a budget: without it a model that asks for region after region has reassembled the
-    sample one slice at a time without breaking a single other rule.
-
-    The second term is not padding, and this invariant was false without it for the
-    length of one review. Every untrusted string entering a prompt is bounded except,
-    originally, the previous Dockerfile: the model wrote it, `previous` is not reset
-    between attempts, and it is replayed whole into every repair. A model that writes
-    what it read into comment lines, which the gate permits, therefore carried its
-    slices into the next attempt on top of that attempt's own fresh look budget.
-    Measured before the fix: 25,326 characters of a 40,000 character sample in a single
-    prompt against a ceiling then claimed to be 16,384, growing linearly with
-    `max_attempts`. The lesson is the one this project keeps relearning: a bound stated
-    over the direct path is not a bound, because the interesting channel is the one
-    nobody counted as a channel.
+23. The model chooses what it reads and never what the run does. The tools it may call
+    are read-only inspections of the script. Submitting a Dockerfile is a tool the graph
+    routes on rather than executes, so the gate, the build and the run are deterministic
+    nodes that no tool call can reach.
+24. One prompt holds at most the bounded script, plus `MAX_LOOKS` slices of it, plus the
+    previous Dockerfile and the evidence, each bounded. The conversation is cleared at
+    the start of every attempt, which is a security property and not housekeeping: the
+    message list accumulates, so without the reset three attempts of four looks would put
+    twelve slices of the sample in one context.
 
     The manifests are bounded separately, at `MANIFEST_LIMIT` each, and are a different
-    file rather than the script. They are untrusted by the same argument and are not
-    covered by the arithmetic above, which is about reassembling the sample.
+    file rather than the script. Per file is not the whole story and the total is worth
+    stating: Python's sibling menu is three files, so up to 12,288 characters of
+    untrusted text, and a language with a longer menu would carry more. They are untrusted by the same argument and are not
+    covered by the arithmetic above, which is about reassembling the sample. This
+    sentence was on `main`, was dropped when the invariants were deduped, and a review
+    caught it: a separate bound on untrusted text entering a prompt went from stated to
+    unstated while the code kept enforcing it, which is the quieter half of the rule
+    about retiring claims.
 25. Every tool result is bounded and labelled where it is produced, not where it is
-    consumed. There is one function that creates a slice of the sample, which is the only
-    place the rule cannot be forgotten by a later caller.
+    consumed. There is one function that cuts a piece out of the sample, which is the
+    only place the rule cannot be forgotten by a later caller.
 26. A search pattern is a literal, never a regular expression. The pattern is chosen by a
     model that has just read attacker-controlled text, and `re` on a model-chosen pattern
-    is catastrophic backtracking on the host, which is the one machine here that is not
-    in a sandbox.
-27. Every reply is exactly one tool call. Parallel tool use is disabled on both providers,
-    because a second call in one reply never receives a result and would also make one
-    look return several slices.
+    is catastrophic backtracking on the host, which is the one machine here not in a
+    sandbox.
+27. Every reply is exactly one tool call, and the graph refuses one that is not.
+    `parallel_tool_calls=False` asks the provider, and a request made of the thing the
+    prompt is defending against is not a rule. That is the same argument the look cap in
+    invariant 24 rests on, where the tools are withdrawn from the request rather than the
+    model asked to stop; it was written in `route_model`'s comment and not here, and
+    applying it to one channel and not the other is how this happened. A reply arriving
+    with more than one call is routed to `unusable` and spends an attempt.
+
+    The reason first written here was that a second call never receives a result. That is
+    false: `ToolNode` answers every call in a message. What actually happened is that the
+    look counter grew by one however many calls a reply held, so forty `read_script`
+    calls in one reply returned forty slices for the price of one look and put 52,641
+    characters of a 60,000 character sample into a single prompt. Measured by a review
+    that drove the compiled graph rather than reading the flag. Against a ceiling of
+    18,432 at the time; the same review added the bounded evidence term, so invariant
+    24's terms now sum to 22,528, which is what the suite asserts.
 28. A gate rejection is repair evidence, so its size is a security property and not a
     formatting one. The gate refuses a Dockerfile over `MAX_DOCKERFILE`, and a rejection
     quotes at most `QUOTED_LINE` characters of the offending line. Both are the same rule
@@ -132,6 +146,65 @@ same gate before any build.
     behaviour for a file that large: `bound` keeps the head and the tail, so `FROM` and
     the command survive, and the marker says what was removed.
 
+29. Nothing that cannot be serialised goes in graph state. The model, the sandbox, the
+    gate and the event sink are runtime context. State is what a checkpointer writes
+    down, so a credential in state is a credential written to wherever checkpoints go.
+30. Every image and container this project creates carries an `envforge.run` label naming
+    the run that made it, and a second label saying when that run started. The images a
+    run built are removed by that run when it finishes, in a `finally`. Containers are
+    removed only where removing one is safe: a container whose name a caller chose is
+    kept until its result is durable and then removed by the node after the one that ran
+    it, and a container with a generated name is removed immediately, because nothing can
+    look for it and a container nobody can find is not evidence.
+
+    That distinction was missing and it leaked: 353 containers on one machine and nine
+    per run of the Docker suite, all from the generated-name path, before anybody
+    counted.
+
+    "Removed immediately" is a shade stronger than the code, and the gap is worth naming:
+    removal happens in a `finally` inside our own process, so a hard kill leaves even a
+    generated-name container behind. The sweep will stop it and will never remove it,
+    because a label cannot say whether a name was chosen or generated and removing the
+    wrong one destroys the evidence invariant 32 rests on. So the residue is real, is
+    bounded by how often a run is killed outright, and is what `docker container prune`
+    is for. A sweep at startup removes
+    labelled **images** from other runs older than an hour, and both guards matter: the
+    ownership check stops a run deleting the image it is about to execute, and the age
+    check stops it deleting the work of a second envforge running right now, which labels
+    its objects identically and cannot be asked whether it is alive.
+
+    Containers are never swept, and that is invariant 32 winning an argument with this
+    one. The tension does not go away, and pretending otherwise is the failure mode:
+    this invariant recommends `docker container prune` for the containers a crashed run
+    leaves, and that command destroys exactly the evidence invariant 32 depends on. Run
+    it when no run is waiting to resume, which is almost always, and know that it is the
+    one action that reopens the window 32 closes. A crashed attempt's container is the only proof that its sample already ran, so
+    collecting it would let a run resumed later execute that sample again and report an
+    ordinary verdict. An exited container costs kilobytes; images are what fill a disk
+    and were never evidence. The cost is that a machine running many crashed runs
+    accumulates exited containers, which `docker container prune` clears.
+31. The BuildKit cache is never pruned automatically. Layer reuse is what makes a repair
+    attempt cheap, and a loop that deleted its own base layers would pay full price on
+    every attempt. It is unbounded by design, and `docker builder prune` is the user's to
+    run. `remove_image` removes a tag, and with it the image and any layers nothing else
+    references; it does not touch that cache, and reading it as "cleanup" is what would
+    let someone conclude a finished run leaves nothing behind on the machine.
+32. An untrusted sample is executed at most once per attempt, and the guarantee is
+    durable rather than best effort. The container is named from the run and the attempt,
+    it is killed but not removed when the run node finishes, and it is removed only after
+    the result has been checkpointed. A container bearing an attempt's name is therefore
+    proof that the attempt already executed, and a resumed run that finds one refuses to
+    execute again and reports the attempt as interrupted rather than producing a verdict.
+    This holds with a durable checkpointer; `InMemorySaver` loses the state with the
+    process, so there is no resume to protect.
+
+    It held for only an hour until a review measured it. The sweep collected another
+    run's containers, so a run resumed later found no evidence, executed the sample again
+    and reported an ordinary verdict, which is the worst output this tool has: not an
+    error, a confident wrong answer. The sweep no longer touches containers at all. That
+    is this invariant winning against 30 on purpose, and the reasoning is written in both
+    so neither can be read alone and believed.
+
 Invariants 4 and 5 are asserted against the argv that `sandbox.py` actually builds, so
 dropping a flag from the code fails a test rather than passing review.
 
@@ -142,21 +215,49 @@ instead of the thing the text means is not a rule.
 
 ## Decision log
 
-### ADR-006: LLM provider layer is a hand-rolled Protocol, not a framework
-Decided 2026-08-22. `envforge/llm.py`: an `LLM` Protocol, `AnthropicLLM` (native SDK,
-strict tool use, GA 2026-01), `OpenAICompatLLM` (openai SDK plus `base_url`, covering
-OpenAI and Groq), `make_llm("provider:model")`. Rejected: one OpenAI client for all
-three, because Anthropic's compatibility layer ignores `strict`, so the only
-grammar-guaranteed structured output for Claude is native-API-only, and Anthropic labels
-that layer non-production. Rejected: LiteLLM and LangChain's model classes, because a
-650-line project with one call site cannot justify a dependency it cannot explain, and
-the trace module needs the unwrapped wire JSON. Provider wire differences live in two
-classes of about thirty lines each; argument validation is uniform above them.
+### ADR-006: the model layer, hand-rolled and then reversed
+Decided 2026-08-22, reversed 2026-09-03. Kept because a decision that was right for a
+year and wrong afterwards is worth reading whole; the reasoning below is not current
+design.
+
+The original: an `LLM` Protocol, `AnthropicLLM` on the native SDK with strict tool use,
+`OpenAICompatLLM` on the openai SDK covering OpenAI and Groq through `base_url`, and
+`make_llm("provider:model")`. Rejected at the time: one OpenAI client for all three,
+because Anthropic's compatibility layer ignores `strict`; and LangChain's model classes,
+because a small project with one call site could not justify a dependency it could not
+explain, and the trace module wanted the unwrapped wire JSON.
+
+What changed is the call site. The engine is a LangGraph graph, and a graph binds tools
+to a chat model: `bind_tools`, a `ToolNode`, and messages rather than a request we
+assemble. Keeping the hand-written layer would have meant an adapter between our `Call`
+objects and LangChain messages, which is more code than the layer saved and a second
+place for the two shapes to disagree.
+
+Both of the original rejections survive the reversal, which is the part worth noticing.
+`bind_tools` takes `strict`, so Claude still gets a grammar guarantee, and it goes to the
+two providers that promise one; Groq is still a forced call plus local validation, and
+`supports_strict` says so in code rather than in prose. Anthropic still uses an Anthropic
+client, because `ChatAnthropic` is one. The dependency the ADR refused is now carrying
+the engine, so it is explicable: it is not there for the model layer, it is there because
+the agent is a graph.
+
+`envforge/llm.py` still exists and is 200 lines rather than 460. What is left is the part
+the framework does not do: `make_llm`, the missing-key check per provider, and the
+failure classification that says which HTTP status is an empty account, which is a dead
+key, and which is our own malformed request. That took several rounds and several real
+incidents to get right, and LangChain passes the SDK exception through untouched, so it
+applies unchanged.
 
 ### ADR-007: Dockerfile generation shape
-Decided 2026-08-22. Forced strict tool call, two fields, `dockerfile` and
-`base_image`, with `additionalProperties` false. The same call serves
-generation and repair; repair is a full rewrite, never a diff. The gate bans line
+Decided 2026-08-22, still current. A tool call with two fields, `dockerfile` and
+`base_image`. The same call serves generation and repair; repair is a full rewrite,
+never a diff.
+
+One thing changed in 2026-09: `submit_dockerfile` is declared to the model but never
+executed. The graph routes on it and a deterministic node does the work, so the gate,
+the build and the run are places no tool call can reach. That makes it the one tool
+whose arguments nothing validates by running it, so they are validated explicitly, on
+every provider, because Groq has no grammar guarantee to fall back on. The gate bans line
 continuations, so every physical line starts with an allowlisted instruction. Rejected:
 raw text with fence stripping, because the extraction heuristic becomes a second parser
 standing in front of the gate. Rejected: structured fields plus a renderer, because the
@@ -220,24 +321,35 @@ wherever it actually lives; siblings were discovered rather than named and may n
 that root. `Sandbox.build` takes those contents rather than a path, so the script is read
 exactly once and the bytes the model reviewed are the bytes the container runs.
 
-### ADR-013: the outcome carries totals, the event stream carries the bodies
-Decided 2026-08-25, revised 2026-08-27. `Outcome` held every `Call`, and a `Call` holds the
-full request and response JSON. Harmless at four small calls and megabytes once a tool loop
-runs fifteen turns, on the one event every consumer must hold. It now carries a `Usage` of
-counts and token totals plus a full UUID `run_id`; the whole `Call` rides the `wrote` event,
-which carries the same `run_id`. `Usage.calls` counts every request sent to the model, and
-since invariant 18 its token totals count every reply that reported a usage, a refusal and a
-truncation included, rather than successes alone. Rejected: dropping the bodies until
-the trace module exists, which would lose the wire JSON the trace is being built to record.
+### ADR-013: the outcome carries totals, and the bodies are gone
+Decided 2026-08-25, revised 2026-08-27 and again 2026-09-03. `Outcome` held every `Call`,
+and a `Call` held the full request and response JSON. Harmless at four small calls and
+megabytes once a tool loop runs fifteen turns, on the one event every consumer must hold.
+It carries a `Usage` of counts and token totals plus a full UUID `run_id`.
 
-Raw provider bodies for refusals, truncations and invalid replies are not yet preserved.
-They need error types that retain provider wire data, so the trace module owns
-that design rather than adding half a trace to the repair loop.
+The second half of this decision no longer holds and is retired rather than reworded. The
+wire bodies rode the `wrote` event so a trace module could pick them up, and there is no
+`Call` any more: the graph talks to a chat model and holds LangChain messages, so `wrote`
+and `looked` carry `None` where a body used to be. Nothing is lost that anything reads,
+because the trace module was never built, and the honest state is that raw provider
+bodies are not preserved anywhere today.
+
+That is a real gap for a trace, and the note it leaves for whoever builds one: the
+messages are in graph state, which is checkpointed, so a trace can read a run's
+conversation from the checkpointer rather than from an event stream. That is a better
+source than the one this ADR was protecting, and it is the reason losing the bodies is
+acceptable rather than a regression.
+
+`Usage.calls` counts every request sent to the model, and since invariant 18 its token
+totals count every reply that reported a usage, a refusal included, rather than successes
+alone.
 
 ### ADR-014: the engine seam is a labelled vocabulary, not a topology
-Decided 2026-08-27. `envforge/events.py` holds the thirteen kinds an engine may yield, and
-`Event` refuses anything else at construction. The plain loop and the LangGraph port both
-honour it, which a node-shaped interface could not be: a plain loop has no nodes.
+Decided 2026-08-27. `envforge/events.py` holds the fifteen kinds an engine may yield, and
+`Event` refuses anything else at construction. There is one engine now, so the seam has
+no second implementation to hold apart, and it earned its keep anyway: the vocabulary
+outlived the engine it was written for. A node-shaped interface could not have, because
+the loop it replaced had no nodes.
 
 Each kind declares the authors of its message and of every data key, as a set rather than
 one value, because most of these strings have more than one: `gate_rejected` is our
@@ -250,9 +362,10 @@ The labels are declared per kind and are the union over every path emitting it, 
 asked for. Rejected: a label chosen at each emission, which is more precise and is not a
 contract, since nothing can check that an emitter filled it in honestly.
 
-Nothing reads the labels yet; the trace module will. They are written now because only
-the code emitting an event knows who wrote the strings in it, so this is the one property
-that cannot be added afterwards.
+The command line reads them: a leading `!` on a printed line means at least part of it
+came from outside this program. The rest is for the trace module, and they are written at
+emission because only the code emitting an event knows who wrote the strings in it, which
+is the one property that cannot be added afterwards.
 
 ### ADR-015: the token budget, and why it was deleted
 Decided 2026-08-27, reversed 2026-09-01. `envforge/budget.py` bounded model spend in tokens
@@ -288,7 +401,7 @@ was built for a tool loop that did not exist, on the argument that a loop writte
 turn counter would be a rewrite later. That argument is how speculative code gets written:
 it is always cheaper to add the thing now, and the cost only shows up as the surface it
 drags behind it. This one cost an exit code, an `Outcome` kind, an event kind, a terminal
-path in the loop, a CLI flag, an environment variable and a share of seven review rounds,
+path in the engine, a CLI flag, an environment variable and a share of seven review rounds,
 for 16 lines of logic wrapped in 65 lines of prose defending them.
 
 What replaces it is what was already there. `max_attempts` bounds container work and bounds
@@ -338,10 +451,12 @@ provider: a refusal is the model judging the script and a fair reason to fall ba
 our own failure to work is not, and building on it prints a verdict no judgment went into.
 
 A provider failure was not caught at all. `AuthenticationError`, `PermissionDeniedError`
-and `RateLimitError` are none of the three `LLMError` types the loop handles, so each one
-escaped the generator: no outcome, and whatever had been spent unrecorded. `llm.reachable`
-now turns them into one `ProviderUnavailable`, deliberately not an `LLMError` so it cannot
-reach the repair path. Matched on HTTP status rather than exception class, because the two
+and `RateLimitError` were none of the three `LLMError` types the loop then handled, so each
+escaped the generator: no outcome, and whatever had been spent unrecorded. `llm.classify`
+now turns them into one `ProviderUnavailable`, and the model node routes straight to the
+end so it cannot reach the repair path. It escaped a second time when the engine became a
+graph, which had no handler at all until a review ran it, so this is a rule that has been
+lost twice and is now pinned by five tests, one per status. Matched on HTTP status rather than exception class, because the two
 SDKs share no hierarchy; 403 is read further, since an exhausted account and a key without
 model access are the same status and only the provider's error type separates them.
 
@@ -444,6 +559,68 @@ The three prompt templates were collapsed onto one shared context in the same ch
 truncation notice and the manifest have to appear on a repair as well as on a first ask,
 and three copies of a paragraph is the shape where the third copy goes missing. That shape
 is what kept the manifest out of the prompt for months.
+
+### ADR-019: the agent is a LangGraph graph, and there is only one of it
+Decided 2026-09-02, replacing an earlier attempt that is kept unmerged as reference.
+
+`envforge/graph.py` is the engine, and everything new is built on it. `StateGraph` over
+an extended `MessagesState`, a chat model with `bind_tools`, `@tool` functions inside a
+`ToolNode`, and conditional edges.
+
+There is one engine. The `while` loop was deleted on 2026-09-03 together with the
+hand-written provider layer, and `python -m envforge` builds this agent and nothing else.
+For a day this ADR said "there will be one engine" and named the loop that was still in
+the next file, because writing "there is no second engine" while one was still in the
+tree is the kind of sentence this project has a rule against. The sentence is true now, so it is written
+plainly.
+
+That is the reversal worth recording. The first port kept the existing `while` loop and
+added a graph beside it, with a contract test proving the two agreed. It passed every
+test and bought nothing: two engines mean upkeep, and the second can never be allowed to
+behave differently from the first without failing the contract, so it can never become
+the thing LangGraph is for. What LangGraph is for is checkpointing, resuming and
+inspecting a run between nodes, and none of that arrives while a loop is still the thing
+actually running.
+
+The state is plain data and travels between nodes. Nodes return only the fields they
+changed and the framework merges them. The first attempt carried one mutable object
+through the graph and mutated it inside the nodes, which looks identical from outside and
+is a loop wearing a graph costume: nothing is checkpointable, nothing is resumable, and a
+node's effect on a run cannot be read from what it returns.
+
+The division of labour is the security story. The model's tools read the script and
+nothing else. Submitting a Dockerfile is a tool the graph routes on rather than executes,
+so the gate, the build and the run are nodes the model cannot call. `ToolNode` therefore
+holds only read-only tools, which is a cleaner statement of the boundary than a comment
+would be.
+
+Rejected: `tools_condition`. It answers "tools" or "end", and there are two kinds of tool
+call here that must go to different places, so the routing reads the tool name itself.
+
+Rejected: keeping the loop as a fallback engine. See above; it is the whole point.
+
+### ADR-020: what a run leaves on the machine
+Decided 2026-09-02, after being asked a question nobody had asked.
+
+Cleanup belongs to the object that owns the run, in a `finally`, and not to the command
+line. It lived in the command line because that was the only caller, and the consequence
+was invisible until the engine changed: every run driven by anything else leaked an image
+per attempt, which was every run of the graph implementation until this was written.
+
+Objects are labelled rather than name-matched. A sweep has to say "this is ours" on
+somebody else's machine, and a prefix match on `envforge-` would also match a container a
+user named that themselves. Deleting it would be our bug in their workspace.
+
+The start time is a label rather than the object's own creation timestamp, so the sweep
+never parses a date. Docker prints creation times in a human format that varies with
+locale and version, and an age rule built on parsing that is a rule that breaks somewhere
+else.
+
+The limitation is stated rather than fixed: the BuildKit cache grows without bound and
+nothing here prunes it. That is deliberate, because pruning it is what would make every
+repair attempt pay full price, and it means a finished run does not leave the machine as
+it found it. Invariant 31 says so, because the honest failure of a cleanup policy is
+someone reading "cleanup" and believing more than it does.
 
 ## What crosses each boundary
 

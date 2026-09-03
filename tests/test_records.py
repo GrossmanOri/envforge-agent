@@ -133,3 +133,65 @@ def test_the_check_would_actually_catch_something():
     # only judgment it makes and the one worth pinning down.
     assert CREDENTIAL.search("sk-ant-api03-" + "x" * 40), "a real-length key must be caught"
     assert not CREDENTIAL.search("sk-ant-REPLACE_ME"), "a placeholder must not be caught"
+
+
+def test_no_two_decisions_share_a_number():
+    """ADR numbers are how one entry refers to another, so a duplicate makes both
+    references ambiguous and neither wrong enough to notice.
+
+    Written after ADR-018 was used twice: once for the looking tools and once, a
+    fortnight later, for the engine. Counting the headings by hand is exactly the check
+    a person skips.
+    """
+    text = (ROOT / "ARCHITECTURE.md").read_text()
+    numbers = re.findall(r"^### (ADR-\d+):", text, flags=re.M)
+    duplicates = sorted({n for n in numbers if numbers.count(n) > 1})
+    assert not duplicates, f"used more than once: {', '.join(duplicates)}"
+    assert numbers == sorted(numbers), "the decision log is out of order"
+
+
+def test_no_two_invariants_share_a_number():
+    """Six places in the code and tests cite an invariant by number, so a duplicate makes
+    each of those citations name two different rules.
+
+    Written after an edit appended a new block of 23 to 31 without retiring the old 23 to
+    28, leaving two different invariant 24s and two different invariant 28s. The sibling
+    test guards ADR numbers and would not have seen this, which is the whole reason both
+    exist rather than one.
+    """
+    text = (ROOT / "ARCHITECTURE.md").read_text()
+    section = text.split("## Invariants", 1)[1].split("\n## ", 1)[0]
+    numbers = [int(n) for n in re.findall(r"^(\d+)\. ", section, flags=re.M)]
+    duplicates = sorted({n for n in numbers if numbers.count(n) > 1})
+    assert not duplicates, f"invariant number used more than once: {duplicates}"
+    assert numbers == sorted(numbers), "the invariants are out of order"
+    assert numbers == list(range(1, len(numbers) + 1)), "the numbering has a gap"
+
+
+NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+    "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+    "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+    "nineteen": 19, "twenty": 20,
+}
+
+
+def test_the_records_state_the_real_number_of_event_kinds():
+    """ADR-014 names a count and it has gone stale twice: thirteen while the code had
+    twelve, then still thirteen after two kinds were added, then more wrong again when
+    this change added `swept`.
+
+    So the number is checked rather than remembered. Written as a word because that is
+    how the records write it, and a test that only accepted digits would pass by never
+    matching anything.
+    """
+    from envforge.events import VOCABULARY
+
+    text = (ROOT / "ARCHITECTURE.md").read_text()
+    match = re.search(r"`envforge/events\.py` holds the (\w+) kinds", text)
+    assert match, "ADR-014 no longer states a count in the form this checks"
+    stated = NUMBER_WORDS.get(match.group(1))
+    assert stated is not None, f"{match.group(1)!r} is not a number word this test knows"
+    assert stated == len(VOCABULARY), (
+        f"ARCHITECTURE.md says {match.group(1)} ({stated}) event kinds, the code has "
+        f"{len(VOCABULARY)}: {', '.join(sorted(VOCABULARY))}")

@@ -21,10 +21,12 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from .agent import Agent, LANGUAGES, Outcome, language_for
+from .agent import EngineFailure, LANGUAGES, Outcome, language_for
+from .graph import Agent
 from .events import Event, Provenance
 from .gate import check
-from .llm import MissingKey, ProviderUnavailable, kind_for_status, make_llm
+from .llm import (MissingKey, ProviderUnavailable, classify, make_llm,
+                  supports_strict)
 from .sandbox import DockerSandbox, SandboxError, daemon_error
 from .workspace import WorkspaceError, gather
 
@@ -134,36 +136,23 @@ def check_key(spec: str) -> int:
         print(f"bad provider spec: {printable(str(exc))}", file=sys.stderr)
         return EXIT_USAGE
 
-    client = getattr(llm, "_client", None)
-    if client is None or not hasattr(client, "models"):
-        print(f"{printable(spec)}: key present. This provider has no cheap way to verify it "
-              f"without spending a call, so it was not checked further.")
-        return EXIT_OK
+    # One token, deliberately. This used to list the provider's models through the raw
+    # client, which a chat model does not expose and which answered a slightly different
+    # question anyway: whether a key may list models, not whether it may be used. A
+    # one-token completion asks exactly what a run asks, for a fraction of a cent.
     try:
-        # No kwargs: `limit` is Anthropic-only and made this command report a
-        # perfectly good OpenAI or Groq key as unusable.
-        models = list(client.models.list())
-    except Exception as exc:
-        status = getattr(exc, "status_code", "?")
-        reported = getattr(exc, "type", "") or type(exc).__name__
-        print(f"{printable(spec)}: FAILED ({printable(str(status))} "
-              f"{printable(str(reported))}) {printable(str(exc))}", file=sys.stderr)
-        # The same rule a run uses, called rather than copied. This carried its own
-        # mapping and stayed on 400 alone while `reachable` widened to every 4xx, so a
-        # 422 was "our bug, do not retry" from a run and "provider unavailable, retry"
-        # from here, for one event. Two entry points disagreeing is the thing to avoid.
-        if not isinstance(status, int):
-            return EXIT_UNAVAILABLE
-        kind = kind_for_status(status, str(reported))
-        return EXIT_BAD_REQUEST if kind == "rejected" else EXIT_UNAVAILABLE
-
-    wanted = spec.partition(":")[2]
-    names = [getattr(m, "id", "") for m in models]
-    print(f"{printable(spec)}: key works, {len(names)} model(s) visible.")
-    if names and wanted not in names:
-        # Not fatal. The listing is paginated and a model missing from it may still
-        # answer, so this is a warning rather than a refusal to proceed.
-        print(f"  note: {wanted!r} is not in the visible listing", file=sys.stderr)
+        llm.invoke("hi")
+    except Exception as exc:                              # noqa: BLE001, narrowed below
+        failure = classify(exc)
+        if failure is None:
+            raise
+        print(f"{printable(spec)}: FAILED ({printable(failure.kind)}) "
+              f"{printable(str(exc))}", file=sys.stderr)
+        # The same rule a run uses, called rather than copied. Two entry points
+        # disagreeing about one event is what this prevents: a 422 must not be "our bug,
+        # do not retry" from a run and "provider unavailable, retry" from here.
+        return EXIT_BAD_REQUEST if failure.kind == "rejected" else EXIT_UNAVAILABLE
+    print(f"{printable(spec)}: the key works.")
     return EXIT_OK
 
 
@@ -372,7 +361,9 @@ def main(argv: Sequence[str] | None = None, environ=None) -> int:
         return EXIT_NO_DOCKER
 
     sandbox = DockerSandbox()
-    agent = Agent(llm, sandbox, check)
+    # Strict where the provider promises a grammar, which is where `make_llm`
+    # says it does rather than wherever the flag happens to be accepted.
+    agent = Agent(llm, sandbox, check, strict=supports_strict(args.model))
     outcome = None
     try:
         for event in agent.run(workspace, language, tuple(args.arg)):
@@ -411,13 +402,10 @@ def main(argv: Sequence[str] | None = None, environ=None) -> int:
         # reported the script as having run and failed.
         print(f"\ncannot reach Docker: {printable(str(exc))}", file=sys.stderr)
         return EXIT_NO_DOCKER
-    finally:
-        # Every attempt builds a tagged image and nothing removed them, so a machine
-        # that had run this a hundred times held a hundred images. Layers are shared, so
-        # the disk cost is far smaller than the count suggests, but the clutter is real
-        # and each one was built from a Dockerfile an untrusted script influenced.
-        for tag in sandbox.built_tags:
-            sandbox.remove_image(tag)
+    # Nothing to clean up here any more. The images an attempt builds belong to the run
+    # that made them, and the agent removes them in its own `finally`, so a run driven by
+    # anything other than this command line is cleaned up too. It was here, and that is
+    # exactly why the graph leaked an image per attempt until somebody asked.
     if outcome is None:                     # the generator cannot end without one
         print("the run ended without an outcome", file=sys.stderr)
         return EXIT_RUN_FAILED
