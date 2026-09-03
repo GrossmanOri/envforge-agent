@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import asdict
-from typing import Any, Literal
+from typing import Any, Iterator, Literal, Sequence
 
 from langchain_core.messages import (AIMessage, AnyMessage, HumanMessage, RemoveMessage,
                                      SystemMessage, ToolMessage)
@@ -32,13 +32,14 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 from langgraph.runtime import Runtime
 
-from .agent import (CONTEXT, DOCKERFILE_LIMIT, EVIDENCE_LIMIT, FIRST, LANGUAGES,
+from .agent import (CONTEXT, Gate, DOCKERFILE_LIMIT, EVIDENCE_LIMIT, FIRST, LANGUAGES,
                     SCRIPT_LIMIT, SYSTEM, EngineFailure, Outcome, Usage,
                     default_dockerfile, describe, manifests)
 from .context import Context
 from .sandbox import (container_exists, container_running, force_stop,
                       remove_container, sweep)
 from .events import Event
+from .workspace import Workspace
 from .llm import classify
 from .sandbox import BuildResult, RunResult, labels_for
 from .tools import (INSPECTION, SUBMIT, bound, inspection_tools, submit_dockerfile)
@@ -160,13 +161,22 @@ def model_node(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
     tools = list(inspection_tools(state["full"]))
     if state["seen"] >= MAX_LOOKS:
         tools = []
-    bound_model = runtime.context.model.bind_tools(
-        tools + [submit_dockerfile],
-        # One tool call per reply. Two would leave one without a result, which the next
-        # request rejects, and it would let a single reply return several slices and walk
-        # past the look cap.
-        parallel_tool_calls=False,
-    )
+    binding: dict[str, Any] = {
+        # One tool call per reply, asked of the provider. `route_model` refuses a reply
+        # that arrives with more anyway, because this is a request and that is a rule.
+        "parallel_tool_calls": False,
+        # Force a tool call rather than allowing prose. A reply with no tool call is
+        # still possible, since a refusal overrides this, and `unusable` handles the
+        # rest; forcing removes the ordinary case rather than the adversarial one.
+        "tool_choice": "any",
+    }
+    if runtime.context.strict:
+        # Grammar-constrained arguments, from the two providers that promise them. Groq
+        # is left out on purpose: it documents its schema guarantee as not applying to
+        # tool use, so asking would be claiming something it does not give.
+        binding["strict"] = True
+    bound_model = runtime.context.model.bind_tools(tools + [submit_dockerfile],
+                                                   **binding)
     _emit(runtime, Event("asking", f"attempt {state['attempt']}: asking the model"))
     try:
         reply = bound_model.invoke(state["messages"])
@@ -244,6 +254,15 @@ def route_model(state: State) -> str:
         # have caught it. Asking again is not a repair, so this does not touch `retry`.
         return "model"
     calls = getattr(last, "tool_calls", None) or []
+    if len(calls) > 1:
+        # `parallel_tool_calls=False` asks the provider for one call per reply, and a
+        # request made of the thing the prompt is defending against is not a rule. That
+        # is the argument this file already makes about a withdrawn tool a few lines
+        # below, and it was not made here: `ToolNode` answers every call in a message,
+        # `seen` grew by one however many there were, and a reply carrying forty
+        # `read_script` calls put 52,641 characters of a 60,000 character sample into one
+        # prompt against a ceiling of 18,432.
+        return "unusable"
     if not calls:
         # A reply that neither called a tool nor declined. Unusable rather than final:
         # ending here would report no verdict at all, so it spends an attempt and the
@@ -262,11 +281,33 @@ def route_model(state: State) -> str:
     return "unusable"
 
 
+def why_unusable(state: State) -> str:
+    """What was wrong with the reply, in its own words.
+
+    Four different things route here and they shared one hardcoded sentence, so a model
+    that called a tool past the cap was told "your reply called no tool", lost an
+    attempt, and was asked to repair a description of its own reply that was false.
+    """
+    last = state["messages"][-1]
+    calls = getattr(last, "tool_calls", None) or []
+    if len(calls) > 1:
+        return (f"your reply made {len(calls)} tool calls. Make one at a time: call a "
+                f"tool, read the answer, then decide what to do next.")
+    if not calls:
+        return ("your reply called no tool. Answer by calling one of the tools you were "
+                "given, not with prose.")
+    name = calls[0].get("name")
+    if name in INSPECTION:
+        return (f"you have used all {MAX_LOOKS} looks for this attempt, so {name} is no "
+                f"longer available. Submit a Dockerfile with what you have.")
+    return (f"you called {name!r}, which is not one of the tools you were given. Call "
+            f"one of those.")
+
+
 def unusable_node(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
     """A reply we cannot use. Repairable, but by rewriting the reply rather than the
-    image, so it spends an attempt and the model is told what shape was expected."""
-    reason = ("your reply called no tool. Answer by calling one of the tools you were "
-              "given, not with prose")
+    image, so it spends an attempt and the model is told what was actually wrong."""
+    reason = why_unusable(state)
     _emit(runtime, Event("unusable_reply", reason))
     return {"retry_to": "model", "evidence": reason}
 
@@ -603,7 +644,7 @@ def retry_node(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
             ok=False, kind="no_image", dockerfile=state["candidate"],
             used_fallback=state["used_fallback"]))
         return {"retry_to": END}
-    return {**new_attempt(state), "previous_candidate": None}
+    return new_attempt(state)
 
 
 def route_retry(state: State) -> Literal["model", "build", "__end__"]:
@@ -647,7 +688,7 @@ def new_attempt(state: State) -> dict[str, Any]:
         told = [HumanMessage(content=(
             f"Your last Dockerfile did not work.\n\n"
             f"--- what you submitted ---\n{bound(previous, DOCKERFILE_LIMIT)}\n"
-            f"--- end ---\n\n{state['evidence']}\n\n"
+            f"--- end ---\n\n{bound(state['evidence'], EVIDENCE_LIMIT)}\n\n"
             f"Submit a corrected Dockerfile."))]
     return {"messages": removals + told, "attempt": state["attempt"] + 1, "seen": 0}
 
@@ -776,10 +817,11 @@ class Agent:
     """
 
     def __init__(self, llm: Any, sandbox: Any, gate: Gate, max_attempts: int = 3,
-                 max_refusals: int = 1, exists=None, remove=None, sweeper=None,
-                 running=None, stop=None) -> None:
+                 max_refusals: int = 1, strict: bool = False, exists=None, remove=None,
+                 sweeper=None, running=None, stop=None) -> None:
         self.llm, self.sandbox, self.gate = llm, sandbox, gate
         self.max_attempts, self.max_refusals = max_attempts, max_refusals
+        self.strict = strict
         # The three host lookups, injectable for the same reason the sandbox is. They
         # reach for the docker binary, and a test of the graph's decisions should not
         # need one: leaving them hard-wired made four unit tests require a daemon and
@@ -830,7 +872,8 @@ class Agent:
         # No second sink here. The nodes write to the stream, and the stream is what this
         # generator yields; an extra list collected on the side is what hid the fact that
         # nothing was reaching a caller at all.
-        context = Context(model=self.llm, gate=self.gate, sandbox=self.sandbox,
+        context = Context(model=self.llm, strict=self.strict, gate=self.gate,
+                          sandbox=self.sandbox,
                           exists=self.exists, remove_container=self.remove,
                           running=self.running, stop_container=self.stop)
         limit = step_ceiling(self.max_attempts, self.max_refusals)

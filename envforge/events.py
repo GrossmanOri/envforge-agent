@@ -97,7 +97,8 @@ VOCABULARY: dict[str, Kind] = {kind.name: kind for kind in (
     # about the script at all: a dead key, an empty account, a rate limit.
     _kind("provider_unavailable", (US, PROVIDER),
           kind=(US,)),
-    # str(exc) on InvalidArguments names the offending field, which the model chose.
+    # Our sentence saying what was wrong with the reply, and it quotes the model:
+    # the tool it called, or how many calls it made at once.
     _kind("unusable_reply", (US, MODEL)),
     _kind("wrote", (US,),                  # a character count and nothing else
           base_image=(MODEL,),

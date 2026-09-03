@@ -626,3 +626,33 @@ def test_the_sweep_leaves_a_young_container_running(monkeypatch):
     _, dropped, stopped = _sweep(
         monkeypatch, [("container", "theirs", "other-run", int(clock.time()))])
     assert stopped == [] and dropped == []
+
+
+@pytest.mark.docker
+def test_a_container_nobody_named_is_removed_rather_than_left(sandbox, image):
+    """A container nothing can look for is not evidence, it is litter.
+
+    The evidence rule applies to a container whose name a caller chose, because that
+    caller means to find it again after a crash. A generated name is known to nobody, so
+    keeping it protects nothing. Leaving both put 353 containers on one machine and nine
+    per run of this suite before anybody counted.
+    """
+    from envforge.sandbox import container_exists
+
+    before = _envforge_containers()
+    sandbox.run(image, ["exit0"])
+    assert _envforge_containers() == before, "a run left a container nobody can find"
+
+    named = "envforge-namedtest" + uuid.uuid4().hex[:8]
+    try:
+        sandbox.run(image, ["exit0"], name=named)
+        assert container_exists(named), "the evidence a caller asked for was removed"
+    finally:
+        remove_container(named)
+
+
+def _envforge_containers() -> set[str]:
+    found = subprocess.run(["docker", "ps", "--all", "--format", "{{.Names}}",
+                            "--filter", "name=envforge-"],
+                           capture_output=True, text=True, check=True)
+    return set(found.stdout.split())

@@ -78,7 +78,7 @@ unavailable, no Dockerfile that would build, or the provider refusing the reques
 which is our bug rather than theirs. Those say nothing about the
 script and a caller should fix its setup rather than read a verdict into them.
 
-**The looking tools**, in `envforge/agent.py` and `envforge/llm.py`. A script is bounded
+**The looking tools**, in `envforge/tools.py`, wired up in `envforge/graph.py`. A script is bounded
 to 8,192 characters before it reaches a prompt, because it is untrusted text and it is
 resent on every repair. Most real scripts are longer than that, so the model was deciding
 what to install from the first and last quarter of a file with the middle replaced by a
@@ -115,7 +115,7 @@ What the model does not get is any influence over the run. It chooses what to re
 does not choose whether an attempt is spent, whether the gate runs, or whether anything is
 built.
 
-352 tests, 335 of which need neither Docker nor an API key. The rest skip
+365 tests, 347 of which need neither Docker nor an API key. The rest skip
 automatically when no daemon is present. Both suites run on every push
 and every pull request.
 

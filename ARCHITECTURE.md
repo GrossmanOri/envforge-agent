@@ -107,9 +107,18 @@ nothing yet decides what that behaviour means.
     model that has just read attacker-controlled text, and `re` on a model-chosen pattern
     is catastrophic backtracking on the host, which is the one machine here not in a
     sandbox.
-27. Every reply is exactly one tool call. Parallel tool use is disabled, because a second
-    call in one reply never receives a result and would let one reply return several
-    slices past the look cap.
+27. Every reply is exactly one tool call, and the graph refuses one that is not.
+    `parallel_tool_calls=False` asks the provider, and a request made of the thing the
+    prompt is defending against is not a rule, which is the argument invariant 23 already
+    makes about a withdrawn tool. A reply arriving with more than one call is routed to
+    `unusable` and spends an attempt.
+
+    The reason first written here was that a second call never receives a result. That is
+    false: `ToolNode` answers every call in a message. What actually happened is that the
+    look counter grew by one however many calls a reply held, so forty `read_script`
+    calls in one reply returned forty slices for the price of one look and put 52,641
+    characters of a 60,000 character sample into a single prompt. Measured by a review
+    that drove the compiled graph rather than reading the flag.
 28. A gate rejection is repair evidence, so its size is a security property and not a
     formatting one. The gate refuses a Dockerfile over `MAX_DOCKERFILE`, and a rejection
     quotes at most `QUOTED_LINE` characters of the offending line. Both are the same rule
@@ -135,15 +144,27 @@ nothing yet decides what that behaviour means.
     gate and the event sink are runtime context. State is what a checkpointer writes
     down, so a credential in state is a credential written to wherever checkpoints go.
 30. Every image and container this project creates carries an `envforge.run` label naming
-    the run that made it, and a second label saying when that run started. The run that
-    made them removes them when it finishes, in a `finally`. A sweep at startup removes
+    the run that made it, and a second label saying when that run started. The images a
+    run built are removed by that run when it finishes, in a `finally`. Containers are
+    removed only where removing one is safe: a container whose name a caller chose is
+    kept until its result is durable and then removed by the node after the one that ran
+    it, and a container with a generated name is removed immediately, because nothing can
+    look for it and a container nobody can find is not evidence.
+
+    That distinction was missing and it leaked: 353 containers on one machine and nine
+    per run of the Docker suite, all from the generated-name path, before anybody
+    counted. A sweep at startup removes
     labelled **images** from other runs older than an hour, and both guards matter: the
     ownership check stops a run deleting the image it is about to execute, and the age
     check stops it deleting the work of a second envforge running right now, which labels
     its objects identically and cannot be asked whether it is alive.
 
     Containers are never swept, and that is invariant 32 winning an argument with this
-    one. A crashed attempt's container is the only proof that its sample already ran, so
+    one. The tension does not go away, and pretending otherwise is the failure mode:
+    this invariant recommends `docker container prune` for the containers a crashed run
+    leaves, and that command destroys exactly the evidence invariant 32 depends on. Run
+    it when no run is waiting to resume, which is almost always, and know that it is the
+    one action that reopens the window 32 closes. A crashed attempt's container is the only proof that its sample already ran, so
     collecting it would let a run resumed later execute that sample again and report an
     ordinary verdict. An exited container costs kilobytes; images are what fill a disk
     and were never evidence. The cost is that a machine running many crashed runs

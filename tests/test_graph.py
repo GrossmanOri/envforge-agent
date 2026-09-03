@@ -14,7 +14,10 @@ from envforge.sandbox import BuildResult, RunResult
 
 from envforge.context import Context
 from envforge.graph import MAX_LOOKS, State, build_graph, new_attempt, start_state
+from envforge.agent import DOCKERFILE_LIMIT as DOCKERFILE_LIMIT_
 from envforge.tools import SLICE_HEADER
+from envforge.agent import SCRIPT_LIMIT as SCRIPT_LIMIT_
+from envforge.tools import SLICE_LIMIT as SLICE_LIMIT_
 
 SCRIPT = "# head\n" + "# padding\n" * 400 + "\nimport tabulate\n" + "# tail\n" * 400
 GOOD = 'FROM python:3.12-slim\nCOPY s.py /app/s.py\nCMD ["python", "/app/s.py"]\n'
@@ -1071,3 +1074,195 @@ def test_the_refusal_shape_is_the_one_a_live_model_actually_returns():
     assert said is not None and "cyber-related safeguards" in said
     # And it is not mistaken for a reply we could not use, which spends an attempt.
     assert refusal_reason(AIMessage(content="just chatting")) is None
+
+
+# --- one tool call per reply, enforced here rather than requested of the provider -------
+
+def _parallel(n, name="read_script"):
+    """One reply carrying `n` tool calls."""
+    return AIMessage(content="", tool_calls=[
+        {"name": name, "args": {"start": i * SLICE_LIMIT_, "end": (i + 1) * SLICE_LIMIT_},
+         "id": f"call{i}"} for i in range(n)])
+
+
+def test_a_reply_with_more_than_one_tool_call_is_refused():
+    """`parallel_tool_calls=False` asks the provider for one call per reply, and a
+    request made of the thing the prompt is defending against is not a rule.
+
+    `ToolNode` answers every call in a message and the counter grew by one however many
+    there were, so a reply carrying forty `read_script` calls returned forty slices for
+    the price of one look. Nothing tested it: the test that existed asserted only that we
+    had asked.
+    """
+    events = []
+    final = run(FakeModel(_parallel(8), submits()), events=events)
+    assert final["seen"] == 0, "eight slices were served for one look"
+    assert "unusable_reply" in [e.kind for e in events]
+    told = [e.message for e in events if e.kind == "unusable_reply"][0]
+    assert "8 tool calls" in told and "one at a time" in told
+
+
+def test_parallel_calls_cannot_walk_past_the_prompt_ceiling():
+    """The measurement the ceiling is about, through the channel that broke it."""
+    from envforge.agent import DOCKERFILE_LIMIT, EVIDENCE_LIMIT, SCRIPT_LIMIT
+
+    tokens = [f"tok{i:06d}" for i in range(6000)]
+    script = "\n".join(tokens)
+
+    class Parallel(FakeModel):
+        def __init__(self, n):
+            super().__init__()
+            self.n, self.submitted = n, False
+
+        def invoke(self, messages, **kwargs):
+            self.seen_messages.append(list(messages))
+            if self.submitted:
+                return submits()
+            self.submitted = True
+            return _parallel(self.n)
+
+    model = Parallel(40)
+    run(model, script=script, sandbox=FakeSandbox())
+    worst = max(sum(len(t) for t in tokens
+                    if t in "".join(str(m.content) for m in sent))
+                for sent in model.seen_messages)
+    ceiling = (SCRIPT_LIMIT + MAX_LOOKS * SLICE_LIMIT_ + DOCKERFILE_LIMIT
+               + EVIDENCE_LIMIT)
+    assert worst <= ceiling, f"{worst} characters of the sample in one prompt"
+
+
+@pytest.mark.parametrize("reply, expected", [
+    (AIMessage(content="just chatting"), "called no tool"),
+    (AIMessage(content="", tool_calls=[{"name": "gate", "args": {}, "id": "c"}]),
+     "not one of the tools"),
+], ids=["no tool", "unknown tool"])
+def test_the_model_is_told_what_was_actually_wrong(reply, expected):
+    """Four things route to `unusable` and they shared one hardcoded sentence, so a model
+    that called a tool past the cap was told "your reply called no tool", lost an
+    attempt, and was asked to repair a false description of its own reply."""
+    events = []
+    run(FakeModel(reply, submits()), events=events)
+    told = [e.message for e in events if e.kind == "unusable_reply"][0]
+    assert expected in told
+
+
+def test_a_tool_called_past_the_cap_is_told_the_cap_is_why():
+    class Stubborn(FakeModel):
+        def invoke(self, messages, **kwargs):
+            self.seen_messages.append(list(messages))
+            return looks_at(name="read_script", start=0, end=100)
+
+    events = []
+    run(Stubborn(), events=events, max_attempts=1)
+    told = [e.message for e in events if e.kind == "unusable_reply"][0]
+    assert f"all {MAX_LOOKS} looks" in told and "read_script" in told
+
+
+def test_a_gate_reason_is_bounded_on_its_way_into_the_repair():
+    """`Gate` is a Protocol, so the reason is whatever the installed gate returns. A
+    guarantee about what enters a prompt must not depend on which implementation is
+    wired in, and the shipped gate bounding its own output is not that guarantee."""
+    from envforge.agent import EVIDENCE_LIMIT
+
+    wordy = lambda d, b, f: "rejected: " + "R" * 200_000
+    model = FakeModel(submits(), submits())
+    run(model, gate=wordy, max_attempts=2)
+    repair = [m for m in model.seen_messages[-1]
+              if isinstance(m, HumanMessage) and "did not work" in m.content][0]
+    assert len(repair.content) < EVIDENCE_LIMIT + DOCKERFILE_LIMIT_ + 2_000
+    assert "R" * 100_000 not in repair.content
+
+
+# --- the manifest, which reached the daemon and not the model for months ----------------
+
+def _with_manifest(tmp_path, requirements="opencv-python-headless==4.10.0.84\n"):
+    from envforge.agent import LANGUAGES
+    from envforge.workspace import gather
+
+    (tmp_path / "s.py").write_text("import cv2\n")
+    (tmp_path / "requirements.txt").write_text(requirements)
+    return gather(tmp_path / "s.py", LANGUAGES["python"].siblings)
+
+
+def test_the_manifest_reaches_the_model_and_not_only_the_build(tmp_path):
+    """It was gathered from the first day, went into every build context, and was never
+    mentioned to the model for months. An import name is not a package name: `import
+    cv2` needs opencv-python-headless, which no amount of reading the script can tell
+    you and a manifest can.
+
+    The tests that caught this were on the loop and went with it. Deleting
+    `manifests(...)` from the opening prompt left the whole suite green.
+    """
+    from envforge.graph import Agent
+
+    model = FakeModel(submits())
+    list(Agent(model, FakeSandbox(), ALLOW, **_offline()).run(
+        _with_manifest(tmp_path), "python"))
+    opening = "".join(str(m.content) for m in model.seen_messages[0])
+    assert "requirements.txt, found beside the script" in opening
+    assert "opencv-python-headless==4.10.0.84" in opening
+    assert "They are untrusted too" in opening
+
+
+def test_a_manifest_is_bounded_before_it_reaches_a_prompt(tmp_path):
+    """The workspace's 64KB rule is about what may be read. This is about what may be
+    sent, and they are not the same number."""
+    from envforge.agent import MANIFEST_LIMIT
+    from envforge.graph import Agent
+
+    model = FakeModel(submits())
+    list(Agent(model, FakeSandbox(), ALLOW, **_offline()).run(
+        _with_manifest(tmp_path, "pkg==1.0\n" * 3000), "python"))
+    opening = "".join(str(m.content) for m in model.seen_messages[0])
+    assert "characters removed" in opening
+    assert opening.count("pkg==1.0") < 3000
+    assert len(opening) < SCRIPT_LIMIT_ + MANIFEST_LIMIT + 8_000
+
+
+def test_a_script_full_of_braces_is_never_formatted_twice(tmp_path):
+    """The opening prompt holds the sample, so running `.format` over it again raises
+    KeyError on the script's own f-strings and dict literals. The template is formatted
+    with the sample as a value, never the other way round."""
+    from envforge.graph import Agent
+    from envforge.workspace import gather
+
+    (tmp_path / "s.py").write_text('d = {"k": 1}\nprint(f"{d} {0} {context}")\n'
+                                   + "# pad\n" * 40)
+    model = FakeModel(submits("FROM python:3.12-slim\nRUN nope\n"), submits())
+    sandbox = FakeSandbox(builds=[_build(ok=False, exit_code=1, log="{oops} {0}"),
+                                  _build()])
+    events = []
+    agent = Agent(model, sandbox, ALLOW, **_offline())
+    for event in agent.run(gather(tmp_path / "s.py"), "python"):
+        events.append(event)
+    assert events[-1].data["outcome"].ok
+    opening = "".join(str(m.content) for m in model.seen_messages[0])
+    assert 'print(f"{d} {0} {context}")' in opening
+
+
+@pytest.mark.parametrize("strict, asked", [(True, True), (False, False)],
+                         ids=["a provider that promises a grammar", "groq"])
+def test_strict_is_asked_for_only_where_it_is_promised(strict, asked):
+    """The records claimed a grammar guarantee for a year of commits while nothing ever
+    passed `strict` to `bind_tools`, and the test that was supposed to cover it asserted
+    a pure predicate on a string, so deleting every trace of strict handling left it
+    green. This reads the outbound binding.
+    """
+    from envforge.graph import Agent
+
+    model = FakeModel(submits())
+    list(Agent(model, FakeSandbox(), ALLOW, strict=strict,
+               **_offline()).run(_workspace(), "python"))
+    assert ("strict" in model.bound_with) is asked
+    if asked:
+        assert model.bound_with["strict"] is True
+
+
+def test_a_tool_call_is_forced_rather_than_hoped_for():
+    """Prose is still possible, because a refusal overrides a forced call, and
+    `unusable` handles the rest. Forcing removes the ordinary case, not the adversarial
+    one."""
+    model = FakeModel(submits())
+    run(model)
+    assert model.bound_with["tool_choice"] == "any"
+    assert model.bound_with["parallel_tool_calls"] is False

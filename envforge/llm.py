@@ -1,19 +1,19 @@
-"""The model layer: one forced tool call, validated arguments, nothing hidden.
+"""The model layer: a chat model per provider, and what a framework does not do.
 
-Every provider is asked for exactly one tool call and nothing else. The Dockerfile
-arrives as a schema-constrained argument rather than as prose we have to extract,
-because an extraction heuristic would sit between a model that just read
-attacker-controlled text and the gate that has to check it.
+`make_llm("provider:model")` returns a LangChain chat model. `ChatAnthropic` for
+Anthropic, `ChatOpenAI` for OpenAI and for Groq through its own base url. The graph binds
+tools to whichever it gets, in one place, and nothing here assembles a request or parses
+a response any more: that layer was hand-written until 2026-09-03 and ADR-006 records why
+it went.
 
-Forced, still, once there is more than one tool. The choice widened from "call this
-tool" to "call one of these tools" so the model can look at the script before writing
-about it; what did not widen is the model's option to answer in prose instead. There
-is no path here that returns free text, so nothing downstream ever has to parse any.
-
-Conversations rather than single questions, for the same reason: a tool result has to
-go back to the model that asked for it. The transcript is `Answered` values, and each
-provider renders them into its own message shape. Nothing above this module has ever
-seen a provider's JSON and that does not change here.
+What is left is the part LangChain does not do. Which environment variable a provider
+reads, so a missing key is its own failure rather than a malformed spec. Whether a
+provider promises a grammar for tool arguments, since Groq documents its schema guarantee
+as not covering tool use and asking for one would be claiming something it does not give.
+And the classification of an HTTP status: an empty account, a dead key, a rate limit and
+our own malformed request need different actions from whoever reads the exit code, and
+that took several rounds and several real incidents to get right. LangChain passes the
+SDK exception through untouched, so it applies unchanged.
 """
 
 from __future__ import annotations
@@ -23,22 +23,6 @@ import os
 MAX_TOKENS = 16000
 PROVIDERS = ("anthropic", "openai", "groq")
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-
-class LLMError(Exception):
-    """The call did not produce usable arguments.
-
-    It still cost tokens, and the tokens are carried here so the run's ledger can
-    charge for them. A truncated reply burned the whole output ceiling, which is what
-    truncation means, so a budget that only counted successes could be walked past by
-    a loop that never succeeds. Zero is the honest default: it means no reply reached
-    us to read a usage off, not that the call was free.
-    """
-
-    def __init__(self, message: str, input_tokens: int = 0, output_tokens: int = 0):
-        super().__init__(message)
-        self.input_tokens = input_tokens
-        self.output_tokens = output_tokens
-
 
 class ProviderUnavailable(Exception):
     """We could not reach the model at all: a dead key, an empty account, a rate limit,
@@ -79,29 +63,6 @@ class MissingKey(ProviderUnavailable):
     def __init__(self, variable: str):
         super().__init__(f"{variable} is not set", kind="no_key")
         self.variable = variable
-
-
-class InvalidArguments(LLMError):
-    """Arguments came back but do not satisfy the schema. Repairable."""
-
-
-class Refused(LLMError):
-    """The model declined. Rewriting the Dockerfile will not help.
-
-    `reason` is whatever the provider said, kept as a structure rather than
-    flattened into the message. It is worth recording and worth showing the
-    user next to the observed behaviour, and it is never the verdict: the
-    script being judged also wrote part of the text the judge read.
-    """
-
-    def __init__(self, message: str, reason: Any = None,
-                 input_tokens: int = 0, output_tokens: int = 0):
-        super().__init__(message, input_tokens, output_tokens)
-        self.reason = reason
-
-
-class Truncated(LLMError):
-    """The response hit the token ceiling, so the arguments are incomplete."""
 
 
 def kind_for_status(status: int, reported: str = "") -> str:

@@ -25,7 +25,7 @@ model and the graph binds tools to it in one place.
 Not built: the verdict and the trace. The command line reports what a script did and what
 it cost; nothing yet decides what that behaviour means.
 
-352 tests, 335 of which need neither Docker nor an API key. The rest skip
+365 tests, 347 of which need neither Docker nor an API key. The rest skip
 automatically when no daemon is present. Both suites run on every push
 and every pull request.
 
@@ -1707,3 +1707,52 @@ prove a real running container is stopped but stays.
 The limitation that remains, stated rather than implied: this needs a durable
 checkpointer, and `docker container prune` between a crash and a resume removes the
 evidence.
+
+### The review that found the ceiling was a request, not a rule
+
+Blocked, and the finding is the sharpest one this project has had.
+
+`parallel_tool_calls=False` was the only thing stopping a reply from carrying several
+tool calls, and nothing in the graph checked. `ToolNode` answers every call in a message,
+the routing read `calls[0]`, and the look counter grew by one however many there were. So
+forty `read_script` calls in one reply returned forty slices for the price of one look:
+**52,641 characters of a 60,000 character sample in a single prompt**, against a ceiling
+this repository documents as 18,432.
+
+The argument against it was already written, eight lines away, about a different channel:
+a rule enforced by what the request contains is a request made of the thing the prompt is
+defending against. It was applied to the withdrawn tool and not to the parallel call. The
+test that existed asserted only that we had asked the provider nicely.
+
+Invariant 27's stated reason was also false. It said a second call in one reply never
+receives a result, and `ToolNode` answers all of them.
+
+**Three records claimed a grammar guarantee the code never asked for.** Nothing passed
+`strict` to `bind_tools`, `supports_strict` had no production caller at all, and no tool
+choice was forced anywhere, while README, ADR-006 and `make_llm`'s own docstring all
+described a strict, forced call. The test meant to cover it asserted a pure predicate on
+a string, so deleting every trace of strict handling left it green. Fixed by implementing
+what was claimed rather than retiring the claim, and verified against the live API: both
+are accepted and the run still works.
+
+**Containers were accumulating without bound.** `DockerSandbox.run` stopped removing them
+when the evidence rule landed, and the rule only ever needed to protect a container whose
+name a caller chose, because that caller means to find it again. A generated name is
+known to nobody, so keeping it is not evidence, it is litter: 353 containers on this
+machine and nine per run of the Docker suite. Three records said the opposite.
+
+**Three mutants survived that had tests on `main`.** Deleting the manifest from the
+opening prompt left the whole suite green, which is the exact regression `manifests()`
+was written for and which its own docstring records as having lasted months. So did
+deleting its bound, and so did formatting the prompt twice. Their tests went with the
+loop and nothing replaced them.
+
+**And the false-message pattern again.** Four different situations routed to `unusable`
+and shared one hardcoded sentence, so a model that called a tool after the cap was told
+"your reply called no tool", lost an attempt, and was asked to repair a description of
+its own reply that was not true.
+
+Everything above is fixed and mutation tested: eleven mutations, all killed by the test
+that names them. `AGENTS.md` is now a pointer to `CLAUDE.md` rather than a second copy,
+because the review found the copy still describing the deleted provider layer and two
+engines behind one interface.

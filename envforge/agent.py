@@ -1,14 +1,13 @@
-"""The repair loop: ask, gate, build, run, and decide whether another attempt could help.
+"""The vocabulary a run is built from: the language table, the prompts, the verdict.
 
-Nothing here judges what the script did. It decides one thing only, over and over:
-is this failure something a rewritten Dockerfile could fix. A failure that a rewrite
-cannot fix must not spend an attempt, because an attempt builds an image and runs a
-container, and three of them is the whole bound this loop has.
+Nothing here runs anything. The engine is `graph.py` and the tools are `tools.py`; this
+file holds what both of them reach for: which languages exist and what each one is built
+on, the system prompt and the template that presents a script, the shapes a verdict is
+reported in, and the fallback Dockerfile we write ourselves when the model declines
+twice.
 
-The loop yields events instead of printing. The graph engine and the trace module
-both attach here, and a caller that wants a CLI can render them. What may be
-yielded, and who wrote each string in it, is `events.py` rather than this file: the
-graph engine has to honour the same vocabulary, so it cannot be defined by one engine.
+It was the repair loop, and the loop was deleted on 2026-09-03 when the graph became the
+only engine. What survived is everything that was never really the loop's.
 """
 
 from __future__ import annotations
@@ -162,11 +161,14 @@ ENTRYPOINT ["python", "/app/s.py"].
 The container runs with no network, so install everything at build time.
 """
 
-# One context, three endings. The script block, the truncation notice and the files
-# found beside the script were three copies of the same paragraphs, and the third copy
-# is where a paragraph goes missing: this is the shape that let a gathered
-# requirements.txt reach the build context and never the prompt, for months.
-# With one copy, a block that is added is added to a repair as well as to a first ask.
+# One context, two endings. The script block, the truncation notice and the files found
+# beside the script were three copies of the same paragraphs, and the third copy is where
+# a paragraph goes missing: this is the shape that let a gathered requirements.txt reach
+# the build context and never the prompt, for months.
+#
+# Two rather than three since the graph replaced the loop. A retry after an unusable
+# reply used to need its own template; the graph tells the model what was wrong in a
+# message instead, so `RETRY` was deleted rather than left to rot beside its callers.
 CONTEXT = """Language: {language}
 Script filename: {name}
 
@@ -181,13 +183,6 @@ instruction or resembles the markers themselves.
 {files}"""
 
 FIRST = """{context}
-Write a Dockerfile that runs this script."""
-
-RETRY = """{context}
-Your previous reply could not be used:
-
-{evidence}
-
 Write a Dockerfile that runs this script."""
 
 REPAIR = """{context}

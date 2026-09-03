@@ -25,7 +25,8 @@ from .agent import EngineFailure, LANGUAGES, Outcome, language_for
 from .graph import Agent
 from .events import Event, Provenance
 from .gate import check
-from .llm import MissingKey, ProviderUnavailable, classify, make_llm
+from .llm import (MissingKey, ProviderUnavailable, classify, make_llm,
+                  supports_strict)
 from .sandbox import DockerSandbox, SandboxError, daemon_error
 from .workspace import WorkspaceError, gather
 
@@ -360,7 +361,9 @@ def main(argv: Sequence[str] | None = None, environ=None) -> int:
         return EXIT_NO_DOCKER
 
     sandbox = DockerSandbox()
-    agent = Agent(llm, sandbox, check)
+    # Strict where the provider promises a grammar, which is where `make_llm`
+    # says it does rather than wherever the flag happens to be accepted.
+    agent = Agent(llm, sandbox, check, strict=supports_strict(args.model))
     outcome = None
     try:
         for event in agent.run(workspace, language, tuple(args.arg)):

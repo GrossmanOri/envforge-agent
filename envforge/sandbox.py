@@ -476,10 +476,11 @@ class DockerSandbox:
     def run(self, image: str, args: Sequence[str] = (), name: str | None = None,
             labels: Mapping[str, str] = MappingProxyType({})) -> RunResult:
         # A caller may supply the name so it can find this container again after a
-        # crash. This method stops the container and deliberately leaves it in place,
-        # so the container is durable evidence that the sample already ran, and
-        # `remove_container` is called later by whoever knows the result is safe.
-        # Random by default, because a caller that does not care must not invent one.
+        # crash. That is what decides whether the container is kept: a named one is
+        # durable evidence that the sample already ran and is removed later by whoever
+        # knows the result is safe, while a generated name is known to nobody and is
+        # removed here, because a container nothing can look for is not evidence.
+        named = name is not None
         name = name or f"envforge-{uuid.uuid4().hex[:12]}"
         started = time.monotonic()
         with tempfile.TemporaryDirectory(prefix="envforge-cid-") as tmp:
@@ -493,12 +494,19 @@ class DockerSandbox:
                 )
             finally:
                 # Order matters and stopping must still be unconditional: read the
-                # witness first, then stop whatever was running while we read it. The
-                # container is left in place on purpose; see `force_stop`.
+                # witness first, then stop whatever was running while we read it.
                 try:
                     start_error = _start_error(name)
                 finally:
                     force_stop(name)
+                    if not named:
+                        # Nobody can look for this one. A caller that supplied a name
+                        # means to find the container again after a crash, so it is left
+                        # as evidence; a generated name is known to nobody, so keeping it
+                        # is not evidence, it is litter. Leaving both behind put 295
+                        # containers on one developer's machine and nine per run of the
+                        # Docker suite before anyone counted.
+                        remove_container(name)
             created = cidfile.exists()
 
         stdout, cut_out = _bound(out)

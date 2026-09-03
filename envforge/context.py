@@ -34,6 +34,11 @@ class Context:
 
     model: Any
     gate: Callable[[str, str, frozenset[str]], str | None]
+    # Whether this provider grammar-constrains tool arguments. Anthropic and OpenAI do;
+    # Groq documents its schema guarantee as not covering tool use, so it is not asked
+    # for one and the local validation of a submission is the only check it has.
+    # Defaults to off, because assuming a guarantee nobody made is the wrong way round.
+    strict: bool = False
     sandbox: Any = None
     emit: Callable[[Event], None] = field(default=_discard)
     # Whether a container of this name is still on the host. The replay guard: `run`
