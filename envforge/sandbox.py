@@ -1,7 +1,11 @@
 """Build an image from an untrusted Dockerfile and run it in a hardened container.
 
 Nothing here decides anything. It builds argv, spawns the docker client, bounds what
-comes back, and always removes the container. Judgement lives in gate.py and verdict.py.
+comes back, and stops the container unconditionally. Whether it then *removes* it depends
+on who named it: a caller that chose the name means to find the container again after a
+crash, so that one is left as evidence and removed later by whoever knows the result is
+safe; a generated name is known to nobody, so that one is removed here. Judgement lives
+in gate.py, and the verdict does not exist yet.
 """
 
 from __future__ import annotations

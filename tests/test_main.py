@@ -644,6 +644,37 @@ def test_the_command_line_builds_the_graph_agent_and_nothing_else(monkeypatch, t
     assert module.Agent.__mro__[1] is real
 
 
+@pytest.mark.parametrize("spec, strict", [
+    ("anthropic:claude-sonnet-5", True),
+    ("openai:gpt-5", True),
+    ("groq:llama-3.3-70b", False),
+], ids=["anthropic", "openai", "groq"])
+def test_the_command_line_asks_for_strict_only_where_it_is_promised(monkeypatch, tmp_path,
+                                                                    spec, strict):
+    """The one line the whole strict decision turns on, and nothing read it.
+
+    A test passing `strict=` to `Agent` directly pins the graph, not the choice. Changing
+    this call site to `strict=True` asks Groq for a schema guarantee it documents as not
+    covering tool use, and left all 365 tests green. That is the same shape as the
+    finding it came from: a claim about providers with no test where the choice is made.
+    """
+    import envforge.__main__ as module
+    from tests.test_graph import FakeModel, FakeSandbox, submits
+
+    asked = {}
+    real = module.Agent
+
+    class Watching(real):
+        def __init__(self, *args, **kwargs):
+            asked.update(kwargs)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(module, "Agent", Watching)
+    _drive_main(monkeypatch, tmp_path, FakeSandbox(), FakeModel(submits()),
+                argv_extra=("--model", spec))
+    assert asked["strict"] is strict
+
+
 def test_check_sends_one_token_rather_than_listing_models(monkeypatch, capsys):
     """It asks what a run asks. Listing models answered a different question, whether a
     key may list them, and a chat model does not expose the client that could."""

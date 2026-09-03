@@ -799,7 +799,7 @@ def first_prompt(language: str, script: str, full: str,
 
 
 class Agent:
-    """One script in, a stream of events out, and nothing of ours left on the machine.
+    """One script in, a stream of events out, and the images it built removed after.
 
     Owns the run, which is what makes it the right place for cleanup: the images an
     attempt built are this object's to remove, and removing them belongs in a `finally`

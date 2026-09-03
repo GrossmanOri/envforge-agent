@@ -28,9 +28,10 @@ class ProviderUnavailable(Exception):
     """We could not reach the model at all: a dead key, an empty account, a rate limit,
     a network failure.
 
-    Deliberately not an `LLMError`. The loop catches the three `LLMError` types as
-    repairable, meaning the reply was unusable and a rewritten prompt might do better.
-    Nothing about this is repairable, and asking again spends money to fail identically.
+    Its own type, because nothing about it is repairable and asking again spends money
+    to fail identically. There were three `LLMError` subclasses beside this for the
+    unusable replies a rewritten prompt might fix; they belonged to the loop and went with
+    it, and the graph handles an unusable reply by telling the model what was wrong.
 
     The distinction that matters is not the retry policy though, it is what the run is
     allowed to conclude. A refusal is a successful HTTP 200 with `stop_reason` set to

@@ -115,7 +115,7 @@ What the model does not get is any influence over the run. It chooses what to re
 does not choose whether an attempt is spent, whether the gate runs, or whether anything is
 built.
 
-365 tests, 347 of which need neither Docker nor an API key. The rest skip
+368 tests, 350 of which need neither Docker nor an API key. The rest skip
 automatically when no daemon is present. Both suites run on every push
 and every pull request.
 

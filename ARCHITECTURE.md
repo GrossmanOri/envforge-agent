@@ -94,7 +94,9 @@ nothing yet decides what that behaviour means.
     twelve slices of the sample in one context.
 
     The manifests are bounded separately, at `MANIFEST_LIMIT` each, and are a different
-    file rather than the script. They are untrusted by the same argument and are not
+    file rather than the script. Per file is not the whole story and the total is worth
+    stating: Python's sibling menu is three files, so up to 12,288 characters of
+    untrusted text, and a language with a longer menu would carry more. They are untrusted by the same argument and are not
     covered by the arithmetic above, which is about reassembling the sample. This
     sentence was on `main`, was dropped when the invariants were deduped, and a review
     caught it: a separate bound on untrusted text entering a prompt went from stated to
@@ -109,16 +111,20 @@ nothing yet decides what that behaviour means.
     sandbox.
 27. Every reply is exactly one tool call, and the graph refuses one that is not.
     `parallel_tool_calls=False` asks the provider, and a request made of the thing the
-    prompt is defending against is not a rule, which is the argument invariant 23 already
-    makes about a withdrawn tool. A reply arriving with more than one call is routed to
-    `unusable` and spends an attempt.
+    prompt is defending against is not a rule. That is the same argument the look cap in
+    invariant 24 rests on, where the tools are withdrawn from the request rather than the
+    model asked to stop; it was written in `route_model`'s comment and not here, and
+    applying it to one channel and not the other is how this happened. A reply arriving
+    with more than one call is routed to `unusable` and spends an attempt.
 
     The reason first written here was that a second call never receives a result. That is
     false: `ToolNode` answers every call in a message. What actually happened is that the
     look counter grew by one however many calls a reply held, so forty `read_script`
     calls in one reply returned forty slices for the price of one look and put 52,641
     characters of a 60,000 character sample into a single prompt. Measured by a review
-    that drove the compiled graph rather than reading the flag.
+    that drove the compiled graph rather than reading the flag. Against a ceiling of
+    18,432 at the time; the same review added the bounded evidence term, so invariant
+    24's terms now sum to 22,528, which is what the suite asserts.
 28. A gate rejection is repair evidence, so its size is a security property and not a
     formatting one. The gate refuses a Dockerfile over `MAX_DOCKERFILE`, and a rejection
     quotes at most `QUOTED_LINE` characters of the offending line. Both are the same rule
@@ -153,7 +159,15 @@ nothing yet decides what that behaviour means.
 
     That distinction was missing and it leaked: 353 containers on one machine and nine
     per run of the Docker suite, all from the generated-name path, before anybody
-    counted. A sweep at startup removes
+    counted.
+
+    "Removed immediately" is a shade stronger than the code, and the gap is worth naming:
+    removal happens in a `finally` inside our own process, so a hard kill leaves even a
+    generated-name container behind. The sweep will stop it and will never remove it,
+    because a label cannot say whether a name was chosen or generated and removing the
+    wrong one destroys the evidence invariant 32 rests on. So the residue is real, is
+    bounded by how often a run is killed outright, and is what `docker container prune`
+    is for. A sweep at startup removes
     labelled **images** from other runs older than an hour, and both guards matter: the
     ownership check stops a run deleting the image it is about to execute, and the age
     check stops it deleting the work of a second envforge running right now, which labels

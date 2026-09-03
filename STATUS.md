@@ -25,7 +25,7 @@ model and the graph binds tools to it in one place.
 Not built: the verdict and the trace. The command line reports what a script did and what
 it cost; nothing yet decides what that behaviour means.
 
-365 tests, 347 of which need neither Docker nor an API key. The rest skip
+368 tests, 350 of which need neither Docker nor an API key. The rest skip
 automatically when no daemon is present. Both suites run on every push
 and every pull request.
 
@@ -1756,3 +1756,45 @@ Everything above is fixed and mutation tested: eleven mutations, all killed by t
 that names them. `AGENTS.md` is now a pointer to `CLAUDE.md` rather than a second copy,
 because the review found the copy still describing the deleted provider layer and two
 engines behind one interface.
+
+### The second pass: signed off, and one mutant that mattered
+
+Every fix held. The reviewer rebuilt the ceiling attack at 2, 8, 40 and 200 parallel
+calls, then tried five more channels: a gate returning the whole sample, a tool call whose
+name is the whole sample, a `base_image` that is the whole sample, a build log, a docker
+start error, and all of them at once at fifty attempts. Worst prompt 16,170 against 22,528,
+and flat.
+
+One channel deserves recording because the first measurement of it was wrong in our
+favour and the reviewer said so. Prose beside a tool call survives every call within an
+attempt, and a fake model with Python-side memory pushed the total to 32,140. Rewritten as
+a stateless model, allowed to copy only what it can see in the messages it was handed,
+which is what a real chat model is, it dropped back to 16,170. An attacker that can
+remember things the protocol does not carry is not the attacker we have.
+
+**The surviving mutant is the one worth keeping.** Changing `__main__.py` from
+`strict=supports_strict(args.model)` to `strict=True`, which asks Groq for a guarantee it
+documents as not giving, left all 365 tests green. The test written for this passed
+`strict=` to `Agent` directly, so it pinned the graph and not the decision, and the one
+line the whole fix turns on had nothing reading it.
+
+That is the same shape as the finding it came from: a claim about providers with no test
+at the point where the choice is made. It now has one, parametrised over all three, and it
+dies in both directions.
+
+**A third slice-edit casualty.** `CLAUDE.md` carried a sentence that ended "never
+described as having a grammar failure rather than a crash", an orphan clause left when one
+line was replaced and its continuation was not. Twice before this was deleted tests; this
+time it was a sentence that reads as a claim and means nothing. The habit is the finding,
+not the instance.
+
+Four more sentences the last commit made false, all in code rather than records:
+`sandbox.py` still said it "always removes the container" and referred to a `verdict.py`
+that has never existed, `llm.py` described three `LLMError` subclasses deleted in that same
+commit, `graph.py` promised "nothing of ours left on the machine" while invariant 31 says
+the BuildKit cache stays, and `CLAUDE.md` described a result object carrying raw request
+and response JSON that ADR-013 had already retired.
+
+Invariant 27 also credited its own argument to invariant 23, which does not make it. The
+argument lives in `route_model`'s comment, which is exactly why it was applied to one
+channel and not the other.

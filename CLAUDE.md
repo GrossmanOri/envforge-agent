@@ -51,12 +51,14 @@ HTTP status into an empty account, a dead key, a rate limit or our own malformed
 
 Anthropic and OpenAI give grammar-constrained arguments and are asked for them. Groq
 accepts the forced call but its schema guarantee is documented as incompatible with tool
-use, so Groq is forced-call-plus-validation, and never described as having a grammar
-failure rather than a crash. Every provider validates the returned arguments anyway.
+use, so Groq is forced-call-plus-validation and is never described as having a grammar.
+A submitted Dockerfile is validated locally on every provider, because that is the only
+check Groq has.
 
-The result carries the parsed arguments, the model taken from the response rather than
-the request, token counts, and the raw request and response JSON for the trace module.
-Nothing in the middle hides usage or cost.
+Token counts come off the reply's `usage_metadata`, which is the same shape on every
+provider. Raw request and response bodies are not preserved anywhere: they used to ride
+the event stream for a trace module that was never built, and ADR-013 records why losing
+them is acceptable and where a trace would read a conversation from instead.
 
 ## How the Dockerfile is produced
 A forced strict tool call with a single `dockerfile` string field, plus `base_image`
