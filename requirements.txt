@@ -1,3 +1,10 @@
 anthropic>=1.0,<2
 openai>=3.0,<4
 python-dotenv>=1.0,<2
+# The engine. Not optional: there is one agent and it is a graph.
+langgraph>=1.0,<2
+# The chat models. Anthropic is the default provider; OpenAI and Groq both go through
+# `langchain-openai`, Groq by pointing it at its own base url, which is how they were
+# reached before and is why the third provider costs one branch rather than a client.
+langchain-anthropic>=1.0,<2
+langchain-openai>=1.0,<2

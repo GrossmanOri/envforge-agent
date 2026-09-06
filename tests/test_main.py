@@ -66,12 +66,13 @@ def test_a_filename_cannot_steer_the_exit_code(tmp_path):
 
 def test_the_kind_comes_from_the_agent_and_not_from_a_literal_in_this_file():
     """The other half of the same finding. Hand-written `Outcome` literals test the
-    mapping and not the wiring, so rewording a sentence in `agent.py` could change what
-    the shell learns while every test still passed. This drives the real loop to each
-    terminal state and asserts the code the shell would actually get."""
-    from envforge.agent import Agent
-    from envforge.llm import ProviderUnavailable
-    from tests.test_agent import ALLOW, FakeLLM, FakeSandbox, _call
+    mapping and not the wiring, so rewording a sentence could change what the shell
+    learns while every test still passed. This drives the real graph to each terminal
+    state and asserts the code the shell would actually get."""
+
+    from tests.test_llm import Sdk
+    from envforge.graph import Agent
+    from tests.test_graph import ALLOW, FakeModel, FakeSandbox, _offline, submits
 
     import envforge.workspace as workspace_module
     import tempfile
@@ -83,9 +84,12 @@ def test_the_kind_comes_from_the_agent_and_not_from_a_literal_in_this_file():
         def last(agent):
             return list(agent.run(workspace, "python"))[-1].data["outcome"]
 
-        gone = last(Agent(FakeLLM(ProviderUnavailable("401", kind="auth")),
-                          FakeSandbox(), ALLOW))
-        ran = last(Agent(FakeLLM(_call()), FakeSandbox(), ALLOW))
+        class Dead(FakeModel):
+            def invoke(self, messages):
+                raise Sdk("dead key", 401)
+
+        gone = last(Agent(Dead(), FakeSandbox(), ALLOW, **_offline()))
+        ran = last(Agent(FakeModel(submits()), FakeSandbox(), ALLOW, **_offline()))
 
     assert exit_code_for(gone) == EXIT_UNAVAILABLE and gone.kind == "unavailable"
     assert exit_code_for(ran) == EXIT_OK and ran.kind == "ran"
@@ -259,13 +263,22 @@ def _drive_main(monkeypatch, tmp_path, sandbox, llm, argv_extra=()):
     monkeypatch.setattr(module, "daemon_error", lambda: None)
     monkeypatch.setattr(module, "make_llm", lambda spec: llm)
     monkeypatch.setattr(module, "DockerSandbox", lambda *a, **k: sandbox)
+    # The three host lookups, answered without a daemon. The engine asks the real ones by
+    # default and they now fail closed, so an unpatched `container_exists` reports that
+    # this attempt already ran and the CLI refuses to execute anything.
+    import envforge.graph as graph_module
+    monkeypatch.setattr(graph_module, "container_exists", lambda name: False)
+    monkeypatch.setattr(graph_module, "container_running", lambda name: False)
+    monkeypatch.setattr(graph_module, "force_stop", lambda name: None)
+    monkeypatch.setattr(graph_module, "remove_container", lambda name: None)
+    monkeypatch.setattr(graph_module, "sweep", lambda keep="", older_than=3600.0: [])
     return module.main([str(script), *argv_extra])
 
 
 def test_main_runs_the_loop_reports_and_cleans_up(monkeypatch, tmp_path, capsys):
-    from tests.test_agent import FakeLLM, FakeSandbox, _call
+    from tests.test_graph import FakeModel, FakeSandbox, _offline, submits
     sandbox = FakeSandbox()
-    assert _drive_main(monkeypatch, tmp_path, sandbox, FakeLLM(_call())) == EXIT_OK
+    assert _drive_main(monkeypatch, tmp_path, sandbox, FakeModel(submits())) == EXIT_OK
     out = capsys.readouterr().out
     assert "what the script did" in out
     # The images this run created are removed, which nothing asserted before.
@@ -274,17 +287,17 @@ def test_main_runs_the_loop_reports_and_cleans_up(monkeypatch, tmp_path, capsys)
 
 def test_main_returns_one_when_the_script_itself_fails(monkeypatch, tmp_path):
     """The end-to-end version of the bug that made a failing script exit 0."""
-    from tests.test_agent import FakeLLM, FakeSandbox, _call, _run
-    sandbox = FakeSandbox(runs=[_run(exit_code=3, stdout="nope\n")])
-    assert _drive_main(monkeypatch, tmp_path, sandbox, FakeLLM(_call())) == EXIT_RUN_FAILED
+    from tests.test_graph import FakeModel, FakeSandbox, _offline, _ran, submits
+    sandbox = FakeSandbox(runs=[_ran(exit_code=3, stdout="nope\n")])
+    assert _drive_main(monkeypatch, tmp_path, sandbox, FakeModel(submits())) == EXIT_RUN_FAILED
 
 
 def test_main_cleans_up_even_when_the_run_ends_badly(monkeypatch, tmp_path):
     """Cleanup lives in a `finally`, so it has to survive the unhappy paths too."""
-    from tests.test_agent import FakeLLM, FakeSandbox, _build, _call
+    from tests.test_graph import FakeModel, FakeSandbox, _build, _offline, submits
     sandbox = FakeSandbox(builds=[_build(ok=False, exit_code=1, log="boom")] * 3)
     code = _drive_main(monkeypatch, tmp_path, sandbox,
-                       FakeLLM(_call(), _call(), _call()))
+                       FakeModel(submits(), submits(), submits()))
     assert code == EXIT_NO_IMAGE
     assert sandbox.removed == sandbox.built_tags != []
 
@@ -295,9 +308,9 @@ def test_main_stops_paying_the_model_when_docker_dies_mid_run(monkeypatch, tmp_p
     repairable Dockerfile problem: three paid calls to fix a correct file, then a
     verdict blaming the script. Verified as three calls before the re-probe existed."""
     import envforge.__main__ as module
-    from tests.test_agent import FakeLLM, FakeSandbox, _build, _call
+    from tests.test_graph import FakeModel, FakeSandbox, _build, _offline, submits
     sandbox = FakeSandbox(builds=[_build(ok=False, exit_code=1, log="daemon gone")] * 3)
-    llm = FakeLLM(_call(), _call(), _call())
+    llm = FakeModel(submits(), submits(), submits())
     states = iter([None, "Cannot connect to the Docker daemon"])
     monkeypatch.setattr(module, "daemon_error", lambda: next(states, "gone"))
     script = tmp_path / "s.py"
@@ -307,7 +320,7 @@ def test_main_stops_paying_the_model_when_docker_dies_mid_run(monkeypatch, tmp_p
     monkeypatch.setattr(module, "DockerSandbox", lambda *a, **k: sandbox)
 
     assert module.main([str(script)]) == EXIT_NO_DOCKER
-    assert len(llm.prompts) == 1                 # one call, not three
+    assert len(llm.seen_messages) == 1           # one call, not three
 
 
 def test_every_kind_has_a_headline_too():
@@ -333,9 +346,9 @@ def test_the_daemon_is_re_probed_on_every_build_failure_not_only_the_first(monke
     This puts the failure on the SECOND build, where a first-only probe cannot see it.
     """
     import envforge.__main__ as module
-    from tests.test_agent import FakeLLM, FakeSandbox, _build, _call
+    from tests.test_graph import FakeModel, FakeSandbox, _build, _offline, submits
     sandbox = FakeSandbox(builds=[_build(ok=False, exit_code=1, log="boom")] * 3)
-    llm = FakeLLM(_call(), _call(), _call())
+    llm = FakeModel(submits(), submits(), submits())
     # Healthy on the pre-flight and on the first failure; gone by the second.
     states = iter([None, None, "Cannot connect to the Docker daemon"])
     monkeypatch.setattr(module, "daemon_error", lambda: next(states, "gone"))
@@ -346,7 +359,7 @@ def test_the_daemon_is_re_probed_on_every_build_failure_not_only_the_first(monke
     monkeypatch.setattr(module, "DockerSandbox", lambda *a, **k: sandbox)
 
     assert module.main([str(script)]) == EXIT_NO_DOCKER
-    assert len(llm.prompts) == 2          # stopped at the second, not after three
+    assert len(llm.seen_messages) == 2    # stopped at the second, not after three
 
 
 def test_our_own_precondition_is_not_reported_as_a_broken_daemon(tmp_path, monkeypatch, capsys):
@@ -361,7 +374,7 @@ def test_our_own_precondition_is_not_reported_as_a_broken_daemon(tmp_path, monke
     """
     import envforge.__main__ as module
     from envforge.sandbox import SandboxError
-    from tests.test_agent import FakeLLM, _call
+    from tests.test_graph import FakeModel, _offline, submits
 
     class Rejecting:
         built_tags: list = []
@@ -375,7 +388,7 @@ def test_our_own_precondition_is_not_reported_as_a_broken_daemon(tmp_path, monke
     script.write_text("print(1)\n")
     monkeypatch.setattr(module, "load_env", lambda *a, **k: [])
     monkeypatch.setattr(module, "daemon_error", lambda: None)
-    monkeypatch.setattr(module, "make_llm", lambda spec: FakeLLM(_call()))
+    monkeypatch.setattr(module, "make_llm", lambda spec: FakeModel(submits()))
     monkeypatch.setattr(module, "DockerSandbox", lambda *a, **k: Rejecting())
 
     assert module.main([str(script)]) == EXIT_BAD_REQUEST
@@ -433,10 +446,10 @@ def test_a_rejected_request_reaches_the_shell_as_seven(tmp_path, monkeypatch):
     earlier round."""
     import envforge.__main__ as module
     from envforge.llm import ProviderUnavailable
-    from tests.test_agent import FakeLLM, FakeSandbox
+    from tests.test_graph import FakeModel, FakeSandbox
 
     sandbox = FakeSandbox()
-    llm = FakeLLM(ProviderUnavailable("rejected: 400 prompt is too long", kind="rejected"))
+    llm = FakeModel(ProviderUnavailable("rejected: 400 prompt is too long", kind="rejected"))
     script = tmp_path / "s.py"
     script.write_text("print(1)\n")
     monkeypatch.setattr(module, "load_env", lambda *a, **k: [])
@@ -461,7 +474,7 @@ def test_every_status_the_provider_can_return_is_typed():
     tracebacks. Enumerating statuses always misses the next one, so anything unmapped
     now falls to a side rather than to the floor."""
     import anthropic, httpx2 as httpx
-    from envforge.llm import ProviderUnavailable, reachable
+    from envforge.llm import ProviderUnavailable, classify
     request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
     expectations = {400: "rejected", 402: "billing", 409: "rejected", 413: "rejected",
                     422: "rejected", 451: "rejected", 500: "server", 502: "server",
@@ -471,7 +484,8 @@ def test_every_status_the_provider_can_return_is_typed():
                                   json={"error": {"type": "x", "message": "m"}})
         exc = anthropic.APIStatusError("e", response=response, body=None)
         with pytest.raises(ProviderUnavailable) as caught:
-            reachable(lambda: (_ for _ in ()).throw(exc))
+            named = classify(exc)
+            raise named if named is not None else exc
         # `in (expected, "unavailable")` accepted every answer, so this test could not
         # fail and the mutation it was written to kill survived: flattening the mapping
         # to "unavailable" left the whole suite green. An assertion with an escape hatch
@@ -487,7 +501,7 @@ def test_check_and_a_run_agree_about_every_status():
     trusting that they do."""
     import anthropic, httpx2 as httpx
     import envforge.__main__ as module
-    from tests.test_agent import FakeSandbox
+    from tests.test_graph import FakeSandbox
 
     request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
 
@@ -496,20 +510,22 @@ def test_check_and_a_run_agree_about_every_status():
                                   json={"error": {"type": "x", "message": "m"}})
         return anthropic.APIStatusError("e", response=response, body=None)
 
-    class Listing:
-        """A client whose model listing raises, which is `--check`'s failure path."""
-        def __init__(self, exc): self._exc = exc
-        @property
-        def models(self):
-            exc = self._exc
-            return type("_M", (), {"list": lambda _s, *a, **k: (_ for _ in ()).throw(exc)})()
-
     class Raising:
-        model = "fake"
-        def __init__(self, exc): self._client, self._exc = Listing(exc), exc
-        def call(self, *a, **k):
-            from envforge.llm import reachable
-            return reachable(lambda: (_ for _ in ()).throw(self._exc))
+        """A chat model that always fails the same way, whichever entry point calls it.
+
+        One object rather than a client with a model listing plus a call path: `--check`
+        now sends a one-token completion, which is the same method a run uses, so both
+        entry points genuinely go through the same code.
+        """
+
+        def __init__(self, exc):
+            self._exc = exc
+
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+        def invoke(self, messages, **kwargs):
+            raise self._exc
 
     import tempfile
     with tempfile.TemporaryDirectory() as directory:
@@ -603,3 +619,107 @@ def test_an_unreadable_or_undecodable_dotenv_does_not_crash(tmp_path, capsys):
     target.write_bytes("ANTHROPIC_API_KEY=x\n".encode("utf-16"))
     assert load_env(tmp_path, environ={}) == []
     assert "ignoring" in capsys.readouterr().err
+
+
+# --- the entry point, now that it drives the graph ---------------------------------------
+
+def test_the_command_line_builds_the_graph_agent_and_nothing_else(monkeypatch, tmp_path):
+    """There is one engine, and this is where it is chosen. The loop it replaced is
+    deleted, so there is no flag and no second class to pick."""
+    import envforge.__main__ as module
+    import envforge.graph as graph_module
+    from tests.test_graph import FakeModel, FakeSandbox, submits
+
+    built = []
+    real = graph_module.Agent
+
+    class Watching(real):
+        def __init__(self, *args, **kwargs):
+            built.append(type(self).__mro__[1].__name__)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(module, "Agent", Watching)
+    _drive_main(monkeypatch, tmp_path, FakeSandbox(), FakeModel(submits()))
+    assert built == ["Agent"]
+    assert module.Agent.__mro__[1] is real
+
+
+@pytest.mark.parametrize("spec, strict", [
+    ("anthropic:claude-sonnet-5", True),
+    ("openai:gpt-5", True),
+    ("groq:llama-3.3-70b", False),
+], ids=["anthropic", "openai", "groq"])
+def test_the_command_line_asks_for_strict_only_where_it_is_promised(monkeypatch, tmp_path,
+                                                                    spec, strict):
+    """The one line the whole strict decision turns on, and nothing read it.
+
+    A test passing `strict=` to `Agent` directly pins the graph, not the choice. Changing
+    this call site to `strict=True` asks Groq for a schema guarantee it documents as not
+    covering tool use, and left all 365 tests green. That is the same shape as the
+    finding it came from: a claim about providers with no test where the choice is made.
+    """
+    import envforge.__main__ as module
+    from tests.test_graph import FakeModel, FakeSandbox, submits
+
+    asked = {}
+    real = module.Agent
+
+    class Watching(real):
+        def __init__(self, *args, **kwargs):
+            asked.update(kwargs)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(module, "Agent", Watching)
+    _drive_main(monkeypatch, tmp_path, FakeSandbox(), FakeModel(submits()),
+                argv_extra=("--model", spec))
+    assert asked["strict"] is strict
+
+
+def test_check_sends_one_token_rather_than_listing_models(monkeypatch, capsys):
+    """It asks what a run asks. Listing models answered a different question, whether a
+    key may list them, and a chat model does not expose the client that could."""
+    import envforge.__main__ as module
+
+    asked = []
+
+    class Model:
+        def invoke(self, messages, **kwargs):
+            asked.append(messages)
+            return "ok"
+
+    monkeypatch.setattr(module, "load_env", lambda *a, **k: [])
+    monkeypatch.setattr(module, "make_llm", lambda spec: Model())
+    assert module.check_key("anthropic:claude-sonnet-5") == EXIT_OK
+    assert asked == ["hi"]
+    assert "the key works" in capsys.readouterr().out
+
+
+def test_check_reports_a_bug_of_ours_rather_than_swallowing_it(monkeypatch):
+    """Anything without a status is not the provider failing, and turning it into a
+    tidy exit code would hide our own crash behind a report about the key."""
+    import envforge.__main__ as module
+
+    class Broken:
+        def invoke(self, messages, **kwargs):
+            raise ValueError("a bug in our own code")
+
+    monkeypatch.setattr(module, "load_env", lambda *a, **k: [])
+    monkeypatch.setattr(module, "make_llm", lambda spec: Broken())
+    with pytest.raises(ValueError, match="a bug in our own code"):
+        module.check_key("anthropic:claude-sonnet-5")
+
+
+def test_the_command_line_no_longer_removes_images_itself(monkeypatch, tmp_path):
+    """Cleanup belongs to the object that owns the run. It was here, which is exactly
+    why every run driven by anything other than this file leaked an image per attempt.
+
+    Asserted by counting: one removal per built tag, not two. The engine's `finally` and
+    a second copy here would both fire and the second would be a no-op that hid the
+    duplication.
+    """
+    from tests.test_graph import FakeModel, FakeSandbox, submits
+
+    sandbox = FakeSandbox()
+    _drive_main(monkeypatch, tmp_path, sandbox, FakeModel(submits()))
+    assert sandbox.removed == sandbox.built_tags
+    assert len(sandbox.removed) == len(set(sandbox.removed))

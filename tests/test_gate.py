@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from envforge.agent import Agent, default_dockerfile
+from envforge.agent import default_dockerfile
 from envforge.gate import MAX_DOCKERFILE, QUOTED_LINE, RUN_COMMANDS, check
 
 FILES = frozenset({"s.py"})
@@ -282,32 +282,39 @@ def test_parser_directives_are_refused(directive):
     assert "no parser directives" in gate(body(directive, 'CMD ["x"]'))
 
 
-# --- wired into the loop, not just called directly ----------------------------------------------
+# --- wired into a run, not just called directly ------------------------------------------------
 
-def test_the_loop_runs_against_the_real_gate(tmp_path):
-    """Everything in test_agent.py stubs the gate open. This is the one place the real
-    one is wired in, and it proves the fallback survives a refusal for real."""
+def test_the_graph_runs_against_the_real_gate(tmp_path):
+    """Everywhere else stubs the gate open. This is the one place the real one is wired
+    into a run, and it proves the fallback survives a refusal for real.
+
+    Rewritten when the loop was replaced by the graph. What it asserts is unchanged: a
+    legal Dockerfile passes, two refusals reach our own fallback and that fallback is
+    itself gated, and an unpinned FROM is refused before anything is built.
+    """
     import sys
+
     sys.path.insert(0, "tests")
-    from test_agent import FakeLLM, FakeSandbox, _call
-    from envforge.llm import Refused
+    from test_graph import (ALLOW, FakeModel, FakeSandbox, _offline, declines, submits)
+
+    from envforge.graph import Agent
     from envforge.workspace import gather
 
     path = tmp_path / "s.py"
     path.write_text("print(1)\n")
     script = gather(path)
+    legal = default_dockerfile("python", "s.py")
 
-    good = Agent(FakeLLM(_call(default_dockerfile("python", "s.py"))), FakeSandbox(), check)
+    good = Agent(FakeModel(submits(legal)), FakeSandbox(), check, **_offline())
     assert list(good.run(script, "python"))[-1].data["outcome"].ok
 
-    refused = Agent(FakeLLM(Refused("no", reason="a"), Refused("no", reason="b")),
-                    FakeSandbox(), check)
+    refused = Agent(FakeModel(declines(), declines()), FakeSandbox(), check, **_offline())
     outcome = list(refused.run(script, "python"))[-1].data["outcome"]
     assert outcome.ok and outcome.used_fallback
 
-    bad = Agent(FakeLLM(_call('FROM python:latest\nCMD ["x"]\n', base="python:latest"),
-                        _call(default_dockerfile("python", "s.py"))),
-                FakeSandbox(), check)
+    bad = Agent(FakeModel(submits('FROM python:latest\nCMD ["x"]\n', "python:latest"),
+                          submits(legal)),
+                FakeSandbox(), check, **_offline())
     kinds = [e.kind for e in bad.run(script, "python")]
     assert "gate_rejected" in kinds
 

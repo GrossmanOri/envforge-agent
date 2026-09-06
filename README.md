@@ -18,16 +18,26 @@ read-only root with a tmpfs, every capability dropped, `no-new-privileges`, and 
 user. No Docker socket is mounted anywhere, and the agent is never itself containerised,
 because that would put the socket back.
 
-Every container is named before it spawns and force-removed in a `finally`. Killing the
-docker client does not kill the container, which is measured behaviour rather than a
-precaution. Two ambiguous outcomes are separated by evidence rather than by an exit code:
+Every container is named before it spawns and killed in a `finally`. Killing the docker
+client does not kill the container, which is measured behaviour rather than a precaution.
+Removal comes later on purpose: the container is the only durable proof that an untrusted
+sample already ran, so it is removed once the result is written down, and a run that finds
+one of its own refuses to execute the sample a second time. Two ambiguous outcomes are separated by evidence rather than by an exit code:
 `--cidfile` tells our own malformed command apart from a script that exited 125 on purpose,
 and the daemon's `State.Error` tells an image that could not start its command apart from a
 script that chose 126 to look like one.
 
-**The model layer**, `envforge/llm.py`. One forced, schema-constrained tool call to
-Anthropic, OpenAI or Groq, so the Dockerfile arrives as validated arguments rather than
-prose we have to extract.
+**The model layer**, `envforge/llm.py`, 200 lines of what a framework does not do.
+`make_llm("provider:model")` returns a LangChain chat model: `ChatAnthropic` for
+Anthropic, `ChatOpenAI` for OpenAI and for Groq through its own base url. What stays ours
+is the failure classification, which says whether an HTTP status means an empty account, a
+dead key, a rate limit, or our own malformed request, because those need different actions
+from whoever reads the exit code.
+
+Strict tool schemas go to the two providers that promise one. Groq documents its schema
+guarantee as not covering tool use, so it is not asked for one and this README does not
+claim it has one; a submitted Dockerfile is validated locally on every provider, which is
+the only check Groq actually has.
 
 **The gate**, `envforge/gate.py`. An allowlist of six instructions and nothing else, run
 before every build including the fallback we write ourselves. `RUN` is exec form, so its
@@ -36,9 +46,19 @@ does not do is stated plainly: `pip install <name>` runs that package's own code
 time, and no instruction allowlist can prevent that, because installing packages is the
 product.
 
-**The repair loop**, `envforge/agent.py`. It asks, gates, builds, runs, and decides one
-thing repeatedly: could a different Dockerfile have changed this. A failed build could. A
-script exiting 1 could not, because the script ran, and watching it run is the point.
+**The agent**, `envforge/graph.py`. A LangGraph `StateGraph`, and the only engine there
+is: the `while` loop it replaced is deleted, not deprecated, and `python -m envforge`
+builds this and nothing else. Nodes ask the model, answer its questions about the script, gate the Dockerfile, build
+it and run it. Each node reads the state, does one thing, and returns the fields it
+changed, so what a node did to a run is exactly the dict it returned.
+
+The split between them is the security story. The model's tools read the script and
+nothing else. Submitting a Dockerfile is a tool the graph *routes on* rather than executes,
+so the gate, the build and the run are deterministic nodes that no tool call can reach.
+
+It decides one thing repeatedly: could a different Dockerfile have changed this. A failed
+build could. A script exiting 1 could not, because the script ran, and watching it run is
+the point.
 
 **The workspace**, `envforge/workspace.py`. The only code here that handles a path.
 Symlinks are resolved and then checked for containment, in that order.
@@ -58,7 +78,7 @@ unavailable, no Dockerfile that would build, or the provider refusing the reques
 which is our bug rather than theirs. Those say nothing about the
 script and a caller should fix its setup rather than read a verdict into them.
 
-**The looking tools**, in `envforge/agent.py` and `envforge/llm.py`. A script is bounded
+**The looking tools**, in `envforge/tools.py`, wired up in `envforge/graph.py`. A script is bounded
 to 8,192 characters before it reaches a prompt, because it is untrusted text and it is
 resent on every repair. Most real scripts are longer than that, so the model was deciding
 what to install from the first and last quarter of a file with the middle replaced by a
@@ -83,21 +103,46 @@ budget: a model that asks for region after region has reassembled the whole file
 at a time. Every slice is labelled as the sample's own words on the way back, because a
 tool result arrives in the one position a model is trained to trust.
 
-The bound that follows from those numbers is written out in full as invariant 24, and it
-is written in full because the short version of it was wrong. Bounding the direct path is
+The bound that follows from those numbers is invariant 24, and it is worth reading there
+rather than trusting a summary, because a short version of it has been wrong twice. Bounding the direct path is
 not the same as bounding the sample: the model's previous Dockerfile is replayed into every
 repair and survives across attempts, so a model that copied what it read into comment lines
 carried its slices forward and collected a fresh look budget on top. A review found it by
 building the attack rather than by reading the rule, and it put 25,326 characters of a
 40,000 character sample into a single prompt before the previous Dockerfile was bounded too.
 
-What the model does not get is any influence over the loop. It chooses what to read. It
+What the model does not get is any influence over the run. It chooses what to read. It
 does not choose whether an attempt is spent, whether the gate runs, or whether anything is
 built.
 
-334 tests, 321 of which need neither Docker nor an API key. The rest skip
+368 tests, 350 of which need neither Docker nor an API key. The rest skip
 automatically when no daemon is present. Both suites run on every push
 and every pull request.
+
+**Running a sample twice, which must never happen.** A checkpoint is written after a node
+returns, so a crash between a container exiting and that checkpoint means the run node is
+replayed. The container is the evidence: it is named from the run and the attempt, killed
+rather than removed when the node finishes, and removed only once the result is durable.
+A resumed run that finds one stops it if it is still executing, leaves it where it is, and
+reports the attempt as interrupted rather than running the sample again or inventing a
+verdict.
+
+Stopping and deleting are different everywhere in this codebase, and that is the reason.
+The sweep below may stop a container a dead process left running; it never deletes one.
+
+The limit is worth stating: this needs a durable checkpointer, since an in-memory one
+loses the state with the process, and `docker container prune` between a crash and a
+resume throws the evidence away.
+
+**What a run leaves behind.** Every image and container carries a label naming the run
+that made it. The run removes its own when it finishes, whatever it finished with, and a
+sweep at startup collects what a crashed run left, skipping anything younger than an hour
+so a second envforge running right now is never touched.
+
+One thing is deliberately not cleaned up, and saying so is the point: the BuildKit layer
+cache grows without bound. Pruning it is what would make every repair attempt pay full
+price, so `docker builder prune` is yours to run. A finished run does not leave the machine
+exactly as it found it.
 
 ## What is designed and not built
 
