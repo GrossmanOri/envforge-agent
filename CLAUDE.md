@@ -5,8 +5,8 @@ Read STATUS.md first. It says where the build is and what is next.
 ## What this is
 An agent that takes a script it does not trust, has an LLM write a Dockerfile for it,
 builds and runs it in a hardened container, repairs on failure in a capped loop with
-bounded evidence, and reports what the script tried to do. Python and Bash only, claimed
-honestly.
+bounded evidence, and reports the exit code and the bounded output of that run. Python and
+Bash only, claimed honestly.
 
 There is no line budget. Write what the module needs to be correct and clear, and do
 not compress to hit a number: a shorter file that hides its reasoning is worse than a
@@ -22,8 +22,11 @@ containerised, because that would reintroduce the socket.
 
 Build has network, since apt and pip need it. Run has none, plus a memory cap, a pids
 cap, a cpu cap, read-only root with a tmpfs, cap-drop ALL, no-new-privileges, and a
-non-root user. Every container is named and force-removed in a `finally`: killing the
-docker client does not kill the container, which is verified behaviour, not theory.
+non-root user. Every container is named and killed in a `finally`: killing the docker
+client does not kill the container, which is verified behaviour, not theory. Killed and not
+removed, because the exited container is the only evidence that an attempt already ran, and
+a resumed run that finds one must refuse rather than execute the sample twice. Removal is a
+later node's job, once the result is durable.
 
 Every LLM-written Dockerfile passes a deterministic gate before build, repaired ones
 included. The gate is an allowlist of permitted instructions (pinned FROM, COPY, a
@@ -35,8 +38,10 @@ receives them as argv and never as docker flags.
 All container output is attacker-controlled text. Repair evidence is bounded before it
 reaches a prompt.
 
-The verdict is produced after the sandboxed run, from observed behaviour. The model's
-opinion is one input, labelled advisory, never the gate.
+The verdict is not built. When it is, it is produced after the sandboxed run and from
+observed behaviour, and the model's opinion is one input, labelled advisory, never the
+gate. Until then the run reports the exit code and the bounded output and decides nothing
+about what they mean.
 
 ## The LLM layer
 One file, `envforge/llm.py`, about 200 lines. `make_llm("provider:model")` returns a
