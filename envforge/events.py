@@ -1,11 +1,8 @@
 """What can happen during a run, and who wrote each string when it does.
 
-This module is the seam between engines. The plain loop yields these events and the
-LangGraph port will yield the same ones, because a topology-shaped interface cannot be
-honoured by a plain loop while a vocabulary can be honoured by both. Making the set
-closed is what turns that from an intention into a check: an engine that invents
-`node_entered` fails at construction rather than producing a trace with a kind nobody
-can label.
+The graph emits this closed vocabulary. The CLI renders it and the opt-in JSONL
+trace records it. An invented kind fails at construction instead of reaching a
+consumer without a provenance label.
 
 The labels are the part that cannot be added later. A reader of the finished trace
 cannot tell whether a string was written by us, by the model, by a container or by the
@@ -13,8 +10,7 @@ files the run was handed, and neither can the trace module: only the code that e
 the event knows. The trace module renders these records, and a renderer that guesses wrong
 about which text is attacker-controlled guesses wrong in a browser.
 
-Nothing consumes the labels yet. They are written now because emission is the only
-place the answer exists.
+The CLI and trace consume these conservative, per-kind labels.
 """
 
 from __future__ import annotations
@@ -102,15 +98,14 @@ VOCABULARY: dict[str, Kind] = {kind.name: kind for kind in (
     _kind("unusable_reply", (US, MODEL)),
     _kind("wrote", (US,),                  # a character count and nothing else
           base_image=(MODEL,),
-          # The request carries our system prompt and the script; the response is the
-          # model's. One value could not say that, which is why these are sets.
+          # Legacy field, currently None. No raw provider bodies are retained.
           call=(US, INPUT, MODEL),
           run_id=(US,)),
     # The model asked to look at part of the script, and did.
     _kind("looked", (US, MODEL),           # our sentence quoting the offsets or the
                                            # pattern the model chose
           tool=(MODEL,),                   # which of the two it called
-          call=(US, INPUT, MODEL),         # the wire bodies, as on `wrote`
+          call=(US, INPUT, MODEL),         # legacy field, currently None
           # The slice itself. TOOL because this program produced it by running a tool,
           # INPUT because every character inside our frame is the sample's own. The
           # pair is the honest answer and one value could not give it: labelling this
@@ -134,10 +129,10 @@ VOCABULARY: dict[str, Kind] = {kind.name: kind for kind in (
     # Docker's own words, but the part that varies is the model's ENTRYPOINT being
     # reported back. The daemon is not a fifth author; it is quoting the model.
     _kind("exec_failed", (US, MODEL)),
-    _kind("finished", (US, INPUT),         # one path names the language it was asked for
+    _kind("finished", (US, INPUT, PROVIDER),  # language or provider failure reason
           # Dockerfile and refusals from the model, build log and output from the
           # container, and the reason from us.
-          outcome=(US, INPUT, MODEL, CONTAINER)),
+          outcome=(US, INPUT, MODEL, PROVIDER, CONTAINER)),
 )}
 
 

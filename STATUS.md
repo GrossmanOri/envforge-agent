@@ -22,14 +22,46 @@ Everything runs through the graph. The command line builds it, the `while` loop 
 deleted, and the hand-written provider path is gone: `make_llm` returns a LangChain chat
 model and the graph binds tools to it in one place.
 
-Not built: the verdict and the trace. The command line reports what a script did and what
-it cost; nothing yet decides what that behaviour means.
+The opt-in JSONL trace is implemented. Behavioral observation and the verdict are
+not built. The command line reports exit code, bounded output and reported token usage.
 
-385 tests, 367 of which need neither Docker nor an API key. The rest skip
+405 tests, 387 of which need neither Docker nor an API key. The rest skip
 automatically when no daemon is present. Both suites run on every push
 and every pull request.
 
+## An explicit, bounded run record, 2026-09-06
+
+`--trace PATH` writes JSONL only when
+requested, with exclusive owner-only creation, one run UUID, recording times, sequence
+numbers, structured event data and conservative possible-source labels. It captures
+events rather than model clients, environment variables or a full conversation.
+
+The synchronous sink writes before the emitting node continues. A write failure stops
+execution and reaches existing cleanup; a valid final record distinguishes an outcome
+from a stopped or interrupted invocation. An outcome can be a failed script. Recording
+errors exit 8, engine failures exit 4, and keyboard interruption exits 130. A close error
+can invalidate recording after an end row was written, so callers must check the exit
+code. No durable checkpoint or power-loss guarantee was added.
+
+Failed provider requests now count in the outcome, with `unreported_calls` exposing
+missing token usage. Container lookup failures remain fail-closed but no longer claim
+that execution was observed. The source table explicitly includes provider text on the
+finished event, and `possible_authors` states the per-kind union rather than claiming
+exact attribution for a particular occurrence.
+
+Verification: 387 offline tests passed, 18 Docker tests deselected. Eighteen focused
+trace cases drive the CLI and real graph with offline adapters. Forty isolated in-memory
+mutations were caught by assertions or expected-exception checks; production files were
+not changed by mutation runs. Cold review approved after correcting two misleading
+descriptions of provenance and source retention. No live-provider or Docker integration
+run was performed locally for this change. The human reviewer also ran all 18 focused
+trace tests successfully and approved publication and merge.
+
 ## A look carries the text the tool returned, 2026-09-06
+
+Merged as PR #29 at `40bb7fc`. Its CI passed 367 non-Docker tests and 18 tests against
+real Docker. At that point the trace, behavioral observation layer and advisory verdict
+were unfinished. The trace implementation is recorded above.
 
 `looked.result` was always empty even though the model received the tool's answer. A
 consumer could learn which tool was called but not what it returned. The event now carries
@@ -44,8 +76,8 @@ the first answer, opening-prompt text instead of the answer, removal of the untr
 label, and loss of INPUT provenance. The non-Docker suite passed 367 tests; 18 Docker
 tests were deselected. No new Docker or live-provider run was performed for this change.
 
-This prepares the event stream for a trace; no trace writer, CLI flag or durable resume
-has been implemented.
+That change prepared the event stream for a trace; it did not add a trace writer, CLI
+flag or durable resume.
 
 ## A failed lookup is not an absent container, 2026-09-06
 

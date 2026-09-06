@@ -97,6 +97,7 @@ class State(MessagesState):
     used_fallback: bool          # the Dockerfile is ours, so it gets no repairs
     input_tokens: int
     output_tokens: int
+    unreported_calls: int
     # Run-scoped, not attempt-scoped: the free rebuild after a timeout is offered once
     # per run, so a Dockerfile that always times out cannot buy a fresh retry every
     # attempt.
@@ -148,8 +149,8 @@ def _emit(runtime: Runtime[Context], event: Event) -> None:
     rather than through `Agent` has no stream to read, and every test here does exactly
     that. Two sinks and one call site, so neither can be forgotten separately.
     """
-    get_stream_writer()(event)
     runtime.context.emit(event)
+    get_stream_writer()(event)
 
 
 def model_node(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
@@ -199,16 +200,20 @@ def model_node(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
         else:
             reason = f"the model could not be reached ({failure.kind}): {failure}"
         _emit(runtime, Event("provider_unavailable", reason, {"kind": failure.kind}))
-        _emit(runtime, finished_event(state, reason, ok=False,
+        charged = {"calls": state["calls"] + 1,
+                   "unreported_calls": state["unreported_calls"] + 1}
+        _emit(runtime, finished_event({**state, **charged}, reason, ok=False,
                                       kind="rejected" if failure.kind == "rejected"
                                       else "unavailable"))
-        return {"stopped": True, "calls": state["calls"] + 1}
+        return {"stopped": True, **charged}
     # Charged from the reply rather than estimated. `usage_metadata` is LangChain's
     # normalised shape, so this is the same arithmetic on every provider.
     used = getattr(reply, "usage_metadata", None) or {}
     charged = {"calls": state["calls"] + 1,
                "input_tokens": state["input_tokens"] + used.get("input_tokens", 0),
-               "output_tokens": state["output_tokens"] + used.get("output_tokens", 0)}
+               "output_tokens": state["output_tokens"] + used.get("output_tokens", 0),
+               "unreported_calls": state["unreported_calls"] + int(
+                   "input_tokens" not in used or "output_tokens" not in used)}
 
     said = refusal_reason(reply)
     if said is None:
@@ -457,7 +462,8 @@ def finished_event(state: State, reason: str, /, message: str | None = None,
                  {"outcome": Outcome(
                      reason=reason, attempts=state["attempt"], run_id=state["run_id"],
                      usage=Usage(state["calls"], state["input_tokens"],
-                                 state["output_tokens"], state["looks"]),
+                                 state["output_tokens"], state["looks"],
+                                 state["unreported_calls"]),
                      refusals=list(state["refusals"]),
                      build=BuildResult(**state["build"]) if state["build"] else None,
                      run=RunResult(**state["result"]) if state["result"] else None,
@@ -570,9 +576,8 @@ def run_node(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
         # no evidence and run the sample again.
         if runtime.context.running(name):
             runtime.context.stop_container(name)
-        reason = ("this attempt already started a container and the run was interrupted "
-                  "before its result was recorded. Refusing to run the sample a second "
-                  "time")
+        reason = ("a container exists or its absence could not be verified. "
+                  "Refusing execution because this attempt may already have run")
         _emit(runtime, Event("exec_failed", reason))
         _emit(runtime, finished_event(state, reason, ok=False, kind="failed",
                                       dockerfile=state["candidate"]))
@@ -754,7 +759,7 @@ def start_state(run_id: str, language: str, script: str, full: str,
         candidate=None, base_image="", evidence=None, rejection=None,
         stopped=False, interrupted=False,
         max_attempts=max_attempts, max_refusals=max_refusals, refusals=[],
-        used_fallback=False, input_tokens=0, output_tokens=0,
+        used_fallback=False, input_tokens=0, output_tokens=0, unreported_calls=0,
         rebuilt_after_timeout=False, retry_to="model", build=None, result=None,
     )
 
@@ -819,7 +824,7 @@ class Agent:
 
     def __init__(self, llm: Any, sandbox: Any, gate: Gate, max_attempts: int = 3,
                  max_refusals: int = 1, strict: bool = False, exists=None, remove=None,
-                 sweeper=None, running=None, stop=None) -> None:
+                 sweeper=None, running=None, stop=None, event_sink=None) -> None:
         self.llm, self.sandbox, self.gate = llm, sandbox, gate
         self.max_attempts, self.max_refusals = max_attempts, max_refusals
         self.strict = strict
@@ -835,16 +840,17 @@ class Agent:
         self.sweeper = sweeper or sweep
         self.running = running or container_running
         self.stop = stop or force_stop
+        self.event_sink = event_sink or (lambda event: None)
 
     def run(self, workspace: Workspace, language: str, args: Sequence[str] = (),
             checkpointer=None,
-            config: dict[str, Any] | None = None) -> Iterator[Event]:
+            config: dict[str, Any] | None = None, run_id: str | None = None) -> Iterator[Event]:
         """Stream the events the nodes produce, as they produce them.
 
         `stream_mode="custom"` is what a node writes while it works, so an event arrives
         here the moment it is made rather than when its node returns.
         """
-        run_id = uuid.uuid4().hex
+        run_id = run_id or uuid.uuid4().hex
         # Collect the images earlier runs left behind, before making anything of our
         # own. Not a background chore: a crashed run leaves a tagged image that nothing
         # else removes, and the alternative is that they accumulate until somebody
@@ -858,8 +864,9 @@ class Agent:
         # part of it is worth refusing to start a run over.
         try:
             for gone in self.sweeper(keep=run_id):
-                yield Event("swept",
-                            f"removed {gone}, left by a run that did not finish")
+                event = Event("swept", f"removed {gone}, left by a run that did not finish")
+                self.event_sink(event)
+                yield event
         except OSError:
             pass
         script = workspace.script
@@ -876,7 +883,8 @@ class Agent:
         context = Context(model=self.llm, strict=self.strict, gate=self.gate,
                           sandbox=self.sandbox,
                           exists=self.exists, remove_container=self.remove,
-                          running=self.running, stop_container=self.stop)
+                          running=self.running, stop_container=self.stop,
+                          emit=self.event_sink)
         limit = step_ceiling(self.max_attempts, self.max_refusals)
         try:
             yield from graph.stream(state, {**(config or {}),
