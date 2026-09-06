@@ -1074,6 +1074,30 @@ def test_a_look_says_which_tool_was_called_and_with_what():
     assert looked.data["tool"] == "read_script"
 
 
+def test_look_events_preserve_the_result_of_each_tool_call():
+    """An event must carry this call's answer, not an empty or earlier result."""
+    from envforge.events import INPUT, TOOL
+
+    replies = [
+        AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": call_id}])
+        for name, args, call_id in [
+            ("read_script", {"start": 0, "end": 5}, "first-region"),
+            ("search_script", {"pattern": "BETA"}, "search-beta"),
+            ("read_script", {"start": 6, "end": 10}, "second-region"),
+        ]
+    ]
+    events = []
+    run(FakeModel(*replies, submits()), script="ALPHA\nBETA\n", events=events)
+    looked = [e for e in events if e.kind == "looked"]
+    assert [e.data["result"] for e in looked] == [
+        SLICE_HEADER + "\n\ncharacters 0 to 5 of 11:\nALPHA",
+        SLICE_HEADER + "\n\n'BETA' occurs 1 time(s) in 11 characters\n"
+                       "every offset: 6\n\nat character 6:\nALPHA\nBETA\n",
+        SLICE_HEADER + "\n\ncharacters 6 to 10 of 11:\nBETA",
+    ]
+    assert [e.authors("result") for e in looked] == [{INPUT, TOOL}] * 3
+
+
 def test_a_search_look_names_the_pattern_it_searched_for():
     events = []
     run(FakeModel(looks_at(name="search_script", pattern="tabulate"), submits()),
