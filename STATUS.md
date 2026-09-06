@@ -25,9 +25,38 @@ model and the graph binds tools to it in one place.
 Not built: the verdict and the trace. The command line reports what a script did and what
 it cost; nothing yet decides what that behaviour means.
 
-368 tests, 350 of which need neither Docker nor an API key. The rest skip
+384 tests, 366 of which need neither Docker nor an API key. The rest skip
 automatically when no daemon is present. Both suites run on every push
 and every pull request.
+
+## A failed lookup is not an absent container, 2026-09-06
+
+`container_exists` and `container_running` already returned True on a timeout or an OS
+error. A Docker command that returned a nonzero status was different: both functions
+read its stdout without checking the status. Empty output became False. In the graph,
+that either allowed the run node to execute or skipped an attempt to stop a possibly
+running container.
+
+Both functions now treat a nonzero status as unknown and fail closed. A successful
+listing still distinguishes the exact container name from absence and similarly named
+containers. The graph interface is unchanged. A fresh attempt can now be refused when
+the daemon cannot answer, which is preferable to executing on an unanswered lookup.
+
+Sixteen new test cases cover the two lookups and their graph consumers. Before the fix,
+four adapter cases and both graph cases failed on the intended assertions. After it,
+all sixteen pass. Thirteen separate mutations of production functions in isolated Python
+processes were caught by assertions, including ignored status, substring matching,
+skipped stopping, deleted evidence and fabricated outcomes. No mutation changed a file.
+
+Validation: 366 non-Docker tests passed, 18 Docker tests deselected. No live provider or
+Docker integration run was performed. The 13 LangSmith deprecation warnings are unchanged.
+Durable production resume remains unconfigured. The existing replay message also does
+not distinguish a found container from an unanswered lookup; no claim of observed repeat
+execution or successful stopping follows from these tests.
+
+Cold review verified the lookup and graph behavior with the sixteen focused cases.
+The records review found conflicting descriptions of the sweep: it attempts to stop old
+containers and never removes them. Both statements in the invariants now say that.
 
 ## The default provider, decided 2026-08-22
 `anthropic:claude-sonnet-5`. The native SDK with strict tool use, which is the only path

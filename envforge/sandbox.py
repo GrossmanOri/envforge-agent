@@ -263,7 +263,8 @@ def container_running(name: str) -> bool:
         # not be read as "nothing is running", because the response to running is to
         # stop it and stopping something already stopped costs nothing.
         return True
-    return name in finished.stdout.split()
+    # A failed command cannot establish that nothing is running, even with empty stdout.
+    return finished.returncode != 0 or name in finished.stdout.split()
 
 
 def container_exists(name: str) -> bool:
@@ -283,7 +284,8 @@ def container_exists(name: str) -> bool:
         # resumed run execute the sample again on the strength of a failed lookup, so
         # this fails closed: assume the evidence exists.
         return True
-    return name in finished.stdout.split()
+    # Only a successful listing can establish that the container is absent.
+    return finished.returncode != 0 or name in finished.stdout.split()
 
 
 def _ours(kind: str, list_argv: list[str]) -> list[tuple[str, str, int]]:

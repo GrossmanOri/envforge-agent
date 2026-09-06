@@ -173,8 +173,9 @@ nothing yet decides what that behaviour means.
     check stops it deleting the work of a second envforge running right now, which labels
     its objects identically and cannot be asked whether it is alive.
 
-    Containers are never swept, and that is invariant 32 winning an argument with this
-    one. The tension does not go away, and pretending otherwise is the failure mode:
+    Containers are never removed by the sweep, and that is invariant 32 winning an
+    argument with this one. The tension does not go away, and pretending otherwise is
+    the failure mode:
     this invariant recommends `docker container prune` for the containers a crashed run
     leaves, and that command destroys exactly the evidence invariant 32 depends on. Run
     it when no run is waiting to resume, which is almost always, and know that it is the
@@ -196,14 +197,21 @@ nothing yet decides what that behaviour means.
     proof that the attempt already executed, and a resumed run that finds one refuses to
     execute again and reports the attempt as interrupted rather than producing a verdict.
     This holds with a durable checkpointer; `InMemorySaver` loses the state with the
-    process, so there is no resume to protect.
+    process, so there is no resume to protect. The production CLI does not configure a
+    checkpointer or expose resume.
+
+    A failed container lookup is not evidence of absence. Both existence and running
+    checks fail closed on a nonzero Docker exit status, a timeout or an OS error. The
+    graph refuses execution and, when the container may be running, attempts to stop it
+    without removing it. This can refuse a fresh attempt during a daemon failure; it
+    does not prove that a container existed or that the stop succeeded.
 
     It held for only an hour until a review measured it. The sweep collected another
     run's containers, so a run resumed later found no evidence, executed the sample again
     and reported an ordinary verdict, which is the worst output this tool has: not an
-    error, a confident wrong answer. The sweep no longer touches containers at all. That
-    is this invariant winning against 30 on purpose, and the reasoning is written in both
-    so neither can be read alone and believed.
+    error, a confident wrong answer. The sweep attempts to stop old containers but does
+    not remove them. That is this invariant winning against 30 on purpose, and the
+    reasoning is written in both so neither can be read alone and believed.
 
 Invariants 4 and 5 are asserted against the argv that `sandbox.py` actually builds, so
 dropping a flag from the code fails a test rather than passing review.

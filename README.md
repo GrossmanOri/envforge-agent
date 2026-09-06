@@ -27,6 +27,11 @@ one of its own refuses to execute the sample a second time. Two ambiguous outcom
 and the daemon's `State.Error` tells an image that could not start its command apart from a
 script that chose 126 to look like one.
 
+If Docker cannot answer whether an attempt's container exists or is running, the agent
+refuses execution and attempts to stop any possible running container without deleting
+it. A failed lookup is not proof that the container is absent. The CLI does not yet
+configure durable checkpoints or support resuming a run after a process crash.
+
 **The model layer**, `envforge/llm.py`, 200 lines of what a framework does not do.
 `make_llm("provider:model")` returns a LangChain chat model: `ChatAnthropic` for
 Anthropic, `ChatOpenAI` for OpenAI and for Groq through its own base url. What stays ours
@@ -115,7 +120,7 @@ What the model does not get is any influence over the run. It chooses what to re
 does not choose whether an attempt is spent, whether the gate runs, or whether anything is
 built.
 
-368 tests, 350 of which need neither Docker nor an API key. The rest skip
+384 tests, 366 of which need neither Docker nor an API key. The rest skip
 automatically when no daemon is present. Both suites run on every push
 and every pull request.
 
