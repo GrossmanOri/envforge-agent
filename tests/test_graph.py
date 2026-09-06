@@ -444,6 +444,38 @@ def test_a_replayed_run_refuses_to_execute_the_sample_twice():
     assert result.run is None
 
 
+@pytest.mark.parametrize("exists_fails", [True, False],
+                         ids=["existence-unknown", "running-unknown"])
+def test_a_failed_container_lookup_stops_and_preserves_without_running(monkeypatch,
+                                                                     exists_fails):
+    """Keep the real lookup and cleanup adapters; only the Docker process is fake."""
+    import subprocess
+    import envforge.sandbox as sandbox_module
+
+    name = "envforge-r1-attempt1"
+    commands = []
+
+    def docker(argv, **kwargs):
+        if argv[1] == "ps":
+            if "-a" in argv and not exists_fails:
+                return subprocess.CompletedProcess(argv, 0, name + "\n", "")
+            return subprocess.CompletedProcess(argv, 1, "", "daemon unavailable")
+        commands.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(sandbox_module.subprocess, "run", docker)
+    sandbox, events = FakeSandbox(), []
+    run(FakeModel(submits()), sandbox=sandbox, events=events,
+        exists=sandbox_module.container_exists, running=sandbox_module.container_running,
+        stop=sandbox_module.force_stop, remove=sandbox_module.remove_container)
+
+    assert sandbox.ran_as == []
+    assert commands == [["docker", "kill", name]]
+    result = outcome_of(events)
+    assert result.kind == "failed"
+    assert result.run is None
+
+
 def test_a_build_is_replayed_without_complaint():
     """The easy half. The tag is derived from the run and the attempt, so a rebuild after
     a crash produces the same tag and buildkit serves what it already has."""

@@ -530,6 +530,39 @@ def test_the_parser_drops_a_row_whose_started_label_is_not_a_number(monkeypatch)
     assert sandbox_module._ours("container", ["docker", "ps"]) == [("id1", "run-a", 100)]
 
 
+@pytest.mark.parametrize("lookup", ["container_exists", "container_running"])
+@pytest.mark.parametrize("returncode, stdout, expected", [
+    (0, "envforge-test\n", True),
+    (0, "", False),
+    (0, "envforge-test-other\n", False),
+    (1, "", True),
+    (125, "envforge-test-other\n", True),
+])
+def test_container_lookup_requires_a_successful_answer(monkeypatch, lookup,
+                                                     returncode, stdout, expected):
+    """Ignoring a failed command would turn an unknown state into permission to run."""
+    import envforge.sandbox as sandbox_module
+
+    def finished(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, returncode, stdout, "")
+
+    monkeypatch.setattr(sandbox_module.subprocess, "run", finished)
+    assert getattr(sandbox_module, lookup)("envforge-test") is expected
+
+
+@pytest.mark.parametrize("lookup", ["container_exists", "container_running"])
+@pytest.mark.parametrize("error", [OSError("unavailable"),
+                                  subprocess.TimeoutExpired("docker", 20)])
+def test_container_lookup_without_an_answer_fails_closed(monkeypatch, lookup, error):
+    import envforge.sandbox as sandbox_module
+
+    def unavailable(argv, **kwargs):
+        raise error
+
+    monkeypatch.setattr(sandbox_module.subprocess, "run", unavailable)
+    assert getattr(sandbox_module, lookup)("envforge-test") is True
+
+
 def test_the_sweep_says_nothing_when_docker_is_not_there(monkeypatch):
     """The sweep runs at the start of every run, so an unguarded call here made the
     suite the README calls "needs no daemon" die with FileNotFoundError."""
