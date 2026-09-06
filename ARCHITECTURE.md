@@ -342,6 +342,10 @@ and `looked` carry `None` where a body used to be. Nothing is lost that anything
 because the trace module was never built, and the honest state is that raw provider
 bodies are not preserved anywhere today.
 
+The `looked.result` field does carry the actual bounded, labelled ToolMessage content.
+Restored 2026-09-06 after it was found to contain an empty string on every inspection.
+This is the tool's answer, not a raw provider body; its authors remain INPUT and TOOL.
+
 That is a real gap for a trace, and the note it leaves for whoever builds one: the
 messages are in graph state, which is checkpointed, so a trace can read a run's
 conversation from the checkpointer rather than from an event stream. That is a better

@@ -25,11 +25,34 @@ model and the graph binds tools to it in one place.
 Not built: the verdict and the trace. The command line reports what a script did and what
 it cost; nothing yet decides what that behaviour means.
 
-384 tests, 366 of which need neither Docker nor an API key. The rest skip
+385 tests, 367 of which need neither Docker nor an API key. The rest skip
 automatically when no daemon is present. Both suites run on every push
 and every pull request.
 
+## A look carries the text the tool returned, 2026-09-06
+
+`looked.result` was always empty even though the model received the tool's answer. A
+consumer could learn which tool was called but not what it returned. The event now carries
+the most recent ToolMessage content, which the single-call inspection route just appended.
+The tools remain responsible for bounding and framing their answers; emission does not
+read the script again or reconstruct the answer. INPUT and TOOL provenance is unchanged.
+
+A real-graph test drives two different reads with a search between them and checks each
+complete event result against literal expected text. It failed with three empty strings
+before the fix. Five isolated mutations were caught by assertions: empty result, reuse of
+the first answer, opening-prompt text instead of the answer, removal of the untrusted
+label, and loss of INPUT provenance. The non-Docker suite passed 367 tests; 18 Docker
+tests were deselected. No new Docker or live-provider run was performed for this change.
+
+This prepares the event stream for a trace; no trace writer, CLI flag or durable resume
+has been implemented.
+
 ## A failed lookup is not an absent container, 2026-09-06
+
+Merged as PR #28 at `07be4a2`. CI verified 366 non-Docker tests and 18 tests against a
+real Docker daemon. The next work is to define a bounded event trace, with gaps in emitted
+data made explicit before treating the record as evidence. No trace implementation is
+included in this change.
 
 `container_exists` and `container_running` already returned True on a timeout or an OS
 error. A Docker command that returned a nonzero status was different: both functions

@@ -341,7 +341,8 @@ def counted_inspect(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
     _emit(runtime, Event("looked",
                          f"attempt {state['attempt']}: the model called "
                          f"{call.get('name')} with {call.get('args')}",
-                         {"tool": call.get("name"), "call": None, "result": "",
+                         {"tool": call.get("name"), "call": None,
+                          "result": state["messages"][-1].content,
                           "run_id": state["run_id"]}))
     if seen == MAX_LOOKS:
         _emit(runtime, Event("tool_capped",
