@@ -273,6 +273,9 @@ class Usage:
     # earning their place: a run where this is always zero is a run where the tools
     # exist and nothing uses them, which is worth knowing before it is worth defending.
     looks: int = 0
+    # Calls for which one or both token counts were unavailable. Reported totals
+    # remain useful, but are not a complete bill when this is nonzero.
+    unreported_calls: int = 0
 
     @property
     def tokens(self) -> int:
@@ -292,11 +295,8 @@ class Outcome:
     value is invisible to anything that does not drive it by hand, and a graph engine
     will not reproduce that shape.
 
-    Totals rather than payloads. This used to hold every `Call`, and a `Call` holds the
-    full request and response JSON. At four small calls that was harmless; a tool loop
-    makes it megabytes on the one event every consumer has to hold. The bodies ride the
-    event stream instead, where each is consumed and released, and `run_id` is what ties
-    them back to this summary.
+    Totals and the final bounded build/run results, not raw provider bodies or a
+    conversation. The event trace serializes these fields and labels their sources.
     """
 
     ok: bool

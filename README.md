@@ -120,7 +120,7 @@ What the model does not get is any influence over the run. It chooses what to re
 does not choose whether an attempt is spent, whether the gate runs, or whether anything is
 built.
 
-385 tests, 367 of which need neither Docker nor an API key. The rest skip
+405 tests, 387 of which need neither Docker nor an API key. The rest skip
 automatically when no daemon is present. Both suites run on every push
 and every pull request.
 
@@ -151,8 +151,42 @@ exactly as it found it.
 
 ## What is designed and not built
 
-The verdict and the trace. The command line reports what the script did and what it cost;
-nothing yet decides what that behaviour *means*, which is the verdict's job.
+Behavioral observation and the advisory verdict are not built. The command line reports
+the exit code, bounded output and reported token usage. These are not proof of safety.
+
+## Save a run record
+
+    python -m envforge examples/deep_dependency.py --trace run.jsonl
+
+`--trace PATH` creates a new JSONL file with owner-only permissions. Without the flag,
+no trace file is created. Existing files and symlinks are refused. Choose a trusted
+parent directory. `--check` cannot be combined with `--trace`.
+
+The file contains a header, emitted events and an end record, each with schema version
+1, one run ID, sequence number, UTC recording time and elapsed seconds. Events preserve
+structured data and per-field `possible_authors`. Labels describe possible sources for that
+event kind, not a precise attribution of every character. Tool answers can contain script
+excerpts; output can contain sensitive text. The trace is not a secret-redaction system.
+It does not snapshot source files or collect environment variables, model clients, raw
+HTTP bodies or the complete model conversation. A tool answer or output can nevertheless
+contain a whole small script. Treat the record as potentially sensitive.
+
+Strings are limited to 16,384 characters, lists to 64 entries, and the whole file to
+4 MiB. `truncated_fields` identifies cuts made by the writer. Build/run `truncated` flags
+describe earlier output cuts; tool answers carry their own truncation notices. The final
+outcome contains the most recent build/run results, not every earlier attempt's full log.
+Token totals include reported usage; `unreported_calls` identifies incomplete accounting.
+
+`complete: true` means the invocation ended with an outcome, including a failed script
+or unavailable provider. It does not mean success, full text coverage, or a safety verdict.
+Missing end records, invalid JSON or gaps in sequence mean a partial file. Interruptions
+and engine failures have `complete: false`. Exit 8 means recording failed, even if an
+end record is visible. The writer uses an unbuffered file; there is no power-loss durability
+guarantee, durable checkpoint or resume support.
+
+Failure to create the file stops before provider or Docker work. A write failure stops
+the graph before its next action, with existing cleanup paths still active. Exit codes
+4, 8 and 130 mean an engine error, trace error and keyboard interruption respectively.
 
 `ARCHITECTURE.md` holds the design. `STATUS.md` says where the build actually is, including
 which hardening flags are asserted in the argv but not yet verified by observation.

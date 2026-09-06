@@ -62,8 +62,8 @@ check Groq has.
 
 Token counts come off the reply's `usage_metadata`, which is the same shape on every
 provider. Raw request and response bodies are not preserved anywhere: they used to ride
-the event stream for a trace module that was never built, and ADR-013 records why losing
-them is acceptable and where a trace would read a conversation from instead.
+the event stream before the provider migration. The opt-in trace records emitted events,
+not a full conversation; ADR-013 and ADR-021 describe the limits.
 
 ## How the Dockerfile is produced
 A forced strict tool call with a single `dockerfile` string field, plus `base_image`

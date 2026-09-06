@@ -439,7 +439,7 @@ def test_a_replayed_run_refuses_to_execute_the_sample_twice():
     assert sandbox.ran_as == []                        # nothing was executed
     result = outcome_of(events)
     assert not result.ok and result.kind == "failed"
-    assert "second time" in result.reason
+    assert "may already have run" in result.reason
     # And it did not invent a verdict about a script it never watched.
     assert result.run is None
 
@@ -584,7 +584,7 @@ def test_a_container_found_still_running_is_stopped_but_not_removed():
         running=lambda name: True, stop=stopped.append)
     assert stopped == ["envforge-r1-attempt1"]
     assert removed == []
-    assert "second time" in outcome_of(events).reason
+    assert "may already have run" in outcome_of(events).reason
 
 
 def test_a_container_already_stopped_is_not_stopped_again():

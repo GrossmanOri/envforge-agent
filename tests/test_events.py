@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from envforge import agent
+from envforge import graph
 from envforge.events import VOCABULARY, Event, Provenance
 
 
@@ -32,16 +32,8 @@ def emitted_kinds(module) -> set[str]:
 
 
 def test_the_table_is_exactly_what_the_engine_emits():
-    """Both modules, because the engine moved and this test did not follow it.
-
-    It read `agent` alone, which was the engine when it was written. The graph is the
-    engine now, and a kind emitted only from there would have made the table look
-    incomplete while the code was fine, or worse, let a new kind go undeclared while
-    this stayed green. Whichever module emits, the union has to equal the table.
-    """
-    from envforge import graph
-
-    assert emitted_kinds(agent) | emitted_kinds(graph) == set(VOCABULARY)
+    """The graph is the sole emitter; agent.py only holds shared data and prompts."""
+    assert emitted_kinds(graph) == set(VOCABULARY)
 
 
 def test_an_unknown_kind_is_refused():

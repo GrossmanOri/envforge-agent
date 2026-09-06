@@ -23,8 +23,8 @@ Dockerfile is a tool the graph routes on rather than executes.
 could loop passes one counter. Every repaired Dockerfile re-enters the same gate before
 any build.
 
-The verdict is not built. The command line reports what a script did and what it cost;
-nothing yet decides what that behaviour means.
+Behavioral observation and the verdict are not built. The command line reports exit code,
+bounded output and reported token usage; an opt-in trace persists emitted events.
 
 ## Invariants
 
@@ -61,7 +61,8 @@ nothing yet decides what that behaviour means.
 14. A refusal by the model never spends a repair attempt; it has its own counter and then
     a fallback we wrote.
 15. A language not in the table is refused before the model is consulted at all.
-16. Only the workspace handles a path. Everything downstream receives names and contents.
+16. Only the workspace reads input paths. Everything downstream receives names and contents.
+    The CLI's explicit trace destination is an output path, never a model-selected input.
 17. No file in a build context may be named something the build itself interprets. A
     context file called `Dockerfile` replaces the gated one, and the container then runs
     instructions nothing checked.
@@ -338,19 +339,16 @@ It carries a `Usage` of counts and token totals plus a full UUID `run_id`.
 The second half of this decision no longer holds and is retired rather than reworded. The
 wire bodies rode the `wrote` event so a trace module could pick them up, and there is no
 `Call` any more: the graph talks to a chat model and holds LangChain messages, so `wrote`
-and `looked` carry `None` where a body used to be. Nothing is lost that anything reads,
-because the trace module was never built, and the honest state is that raw provider
-bodies are not preserved anywhere today.
+and `looked` carry `None` where a body used to be. Raw provider bodies are not preserved
+anywhere today. The event trace does not attempt to reconstruct them.
 
 The `looked.result` field does carry the actual bounded, labelled ToolMessage content.
 Restored 2026-09-06 after it was found to contain an empty string on every inspection.
 This is the tool's answer, not a raw provider body; its authors remain INPUT and TOOL.
 
-That is a real gap for a trace, and the note it leaves for whoever builds one: the
-messages are in graph state, which is checkpointed, so a trace can read a run's
-conversation from the checkpointer rather than from an event stream. That is a better
-source than the one this ADR was protecting, and it is the reason losing the bodies is
-acceptable rather than a regression.
+Messages exist in graph state, but production does not configure a durable checkpointer.
+The trace in ADR-021 deliberately records events, not that conversation. A full transcript
+would need a separate retention and privacy contract.
 
 `Usage.calls` counts every request sent to the model, and since invariant 18 its token
 totals count every reply that reported a usage, a refusal included, rather than successes
@@ -633,6 +631,36 @@ nothing here prunes it. That is deliberate, because pruning it is what would mak
 repair attempt pay full price, and it means a finished run does not leave the machine as
 it found it. Invariant 31 says so, because the honest failure of a cleanup policy is
 someone reading "cleanup" and believing more than it does.
+
+### ADR-021: an explicit event record, with failure in the execution path
+Decided 2026-09-06. `--trace PATH` writes schema-versioned JSONL through a synchronous
+event sink before the graph's stream writer. A disk failure therefore prevents the next
+node action instead of being discovered later by a display consumer. Closing the CLI's
+generator also runs the agent's image cleanup on early returns.
+
+The CLI owns the output path and creates it exclusively with mode 0600. No flag means
+no record. The parent directory is operator-controlled. The trace never inspects a model
+client, environment or checkpoint. Arbitrary payload objects are refused rather than
+stringified. Known result dataclasses retain structured fields and conservative
+`possible_authors` labels, whose union is defined per event kind. A provider failure is
+one possible source of a finished event, not proof that a container ran.
+
+Every row has the run UUID, a contiguous sequence and UTC/monotonic recording times.
+Strings and lists are bounded with explicit field paths, and the file has a 4 MiB ceiling.
+The header states coverage: emitted events only. Previous build logs and complete model
+messages cannot be reconstructed from it. Existing source-side truncation flags and tool
+notices remain separate from the writer's truncation metadata.
+
+An end record separates CLI exit status from the existence of an outcome. Completion
+does not mean script success, full text capture or safety. Missing/broken end records
+are partial; keyboard interruption and engine failure explicitly mark incomplete results.
+Exit 8 invalidates recording success even if an end record preceded a close error.
+Unbuffered writes do not promise power-loss durability and the file is never a resume
+checkpoint. The run UUID shared with the graph is correlation, not replay protection.
+
+Failed provider calls count before the final outcome is emitted. Token totals stay
+reported totals, with `unreported_calls` exposing missing usage rather than calling it
+zero cost. Engine failures use exit 4, and keyboard interruption uses 130.
 
 ## What crosses each boundary
 

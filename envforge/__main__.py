@@ -29,6 +29,7 @@ from .llm import (MissingKey, ProviderUnavailable, classify, make_llm,
                   supports_strict)
 from .sandbox import DockerSandbox, SandboxError, daemon_error
 from .workspace import WorkspaceError, gather
+from .trace import Trace, TraceError
 
 DEFAULT_SPEC = "anthropic:claude-sonnet-5"
 
@@ -44,6 +45,9 @@ EXIT_NO_DOCKER = 5
 EXIT_NO_IMAGE = 6
 # Our own request was refused. Not the provider being down, so retrying is wrong.
 EXIT_BAD_REQUEST = 7
+EXIT_ENGINE = 4
+EXIT_TRACE = 8
+EXIT_INTERRUPTED = 130
 
 
 # The only variables a `.env` may set. An allowlist, like the gate, and for the same
@@ -211,6 +215,9 @@ def report(outcome: Outcome) -> None:
     print(f"attempts {outcome.attempts}, "
           f"{outcome.usage.calls} model call(s), {outcome.usage.looks} of them "
           f"looking at the script, {outcome.usage.tokens} tokens")
+    if outcome.usage.unreported_calls:
+        print(f"token totals are incomplete: usage unavailable for "
+              f"{outcome.usage.unreported_calls} call(s)")
     if outcome.used_fallback:
         print("the Dockerfile came from us, not from the model")
 
@@ -300,14 +307,56 @@ def build_parser() -> argparse.ArgumentParser:
                         help="override the language inferred from the extension")
     parser.add_argument("--arg", action="append", default=[], metavar="ARG",
                         help="an argument for the script, repeatable")
+    parser.add_argument("--trace", type=Path, metavar="PATH",
+                        help="write a new bounded JSONL run record (may contain script "
+                             "excerpts and output); never overwrite an existing file")
     return parser
 
 
 def main(argv: Sequence[str] | None = None, environ=None) -> int:
-    import os
-    environ = os.environ if environ is None else environ
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.trace and (args.check or args.script is None):
+        print("--trace requires a script and cannot be used with --check", file=sys.stderr)
+        return EXIT_USAGE
+    trace = None
+    try:
+        if args.trace:
+            trace = Trace(args.trace)
+        status = "stopped"
+        try:
+            code = _run(args, parser, trace)
+            if trace and trace.has_outcome:
+                status = "finished"
+        except KeyboardInterrupt:
+            print("run interrupted; no complete result is available", file=sys.stderr)
+            code, status = EXIT_INTERRUPTED, "interrupted"
+        except EngineFailure as exc:
+            print(f"engine failure: {printable(str(exc))}", file=sys.stderr)
+            code, status = EXIT_ENGINE, "engine_error"
+        except TraceError:
+            raise
+        except Exception:
+            # Do not serialize arbitrary exceptions or claim the script failed.
+            print("internal engine error; no complete result is available", file=sys.stderr)
+            code, status = EXIT_ENGINE, "engine_error"
+        if trace:
+            trace.finish(code, status)
+    except TraceError as exc:
+        print(f"trace failed: {printable(str(exc))}; record may be partial", file=sys.stderr)
+        code = EXIT_TRACE
+    finally:
+        if trace:
+            try:
+                trace.close()
+            except TraceError as exc:
+                print(f"trace failed: {printable(str(exc))}; record may be partial",
+                      file=sys.stderr)
+                code = EXIT_TRACE
+    return code
+
+
+def _run(args, parser, trace: Trace | None) -> int:
     # No argument. Passing `Path.cwd()` here is what defeated this function's own
     # protection: the parameter won, `PROJECT_ROOT` was never used in production,
     # and a sample's directory was read exactly as before. The parameter exists for
@@ -363,10 +412,13 @@ def main(argv: Sequence[str] | None = None, environ=None) -> int:
     sandbox = DockerSandbox()
     # Strict where the provider promises a grammar, which is where `make_llm`
     # says it does rather than wherever the flag happens to be accepted.
-    agent = Agent(llm, sandbox, check, strict=supports_strict(args.model))
+    agent = Agent(llm, sandbox, check, strict=supports_strict(args.model),
+                  event_sink=trace.event if trace else None)
     outcome = None
+    stream = agent.run(workspace, language, tuple(args.arg),
+                       run_id=trace.run_id if trace else None)
     try:
-        for event in agent.run(workspace, language, tuple(args.arg)):
+        for event in stream:
             print(render(event), flush=True)
             if event.kind == "build_failed":
                 # The pre-flight probe only proves Docker was up when we started. A
@@ -402,13 +454,15 @@ def main(argv: Sequence[str] | None = None, environ=None) -> int:
         # reported the script as having run and failed.
         print(f"\ncannot reach Docker: {printable(str(exc))}", file=sys.stderr)
         return EXIT_NO_DOCKER
+    finally:
+        stream.close()
     # Nothing to clean up here any more. The images an attempt builds belong to the run
     # that made them, and the agent removes them in its own `finally`, so a run driven by
     # anything other than this command line is cleaned up too. It was here, and that is
     # exactly why the graph leaked an image per attempt until somebody asked.
     if outcome is None:                     # the generator cannot end without one
         print("the run ended without an outcome", file=sys.stderr)
-        return EXIT_RUN_FAILED
+        return EXIT_ENGINE
     report(outcome)
     return exit_code_for(outcome)
 
