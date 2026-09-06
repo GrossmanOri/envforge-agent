@@ -1835,5 +1835,21 @@ moment the README's claims change, which is the weakest kind of guard this proje
 providers have been in `llm.py` since 23 August; 30 August is only when a command line
 existed to choose between them.
 
-`langgraph-port`, the two-engine branch, stays as a read-only reference. `langgraph` and
-its worktree are redundant now and are kept until they are deliberately removed.
+`langgraph-port`, the two-engine branch, was kept as a read-only reference for about an
+hour and then deleted along with `langgraph` and its worktree. The repository is one
+branch now.
+
+`langgraph` cost nothing: PR #25 squashed all of it into `93455e2`, so the only thing lost
+was the unsquashed history, at `5e0d4ea`. `langgraph-port` was different. Its tip,
+`7f7ee48`, was on no other ref, and thirteen files and about 1,700 lines went with it,
+`tests/test_engines.py` among them: the contract test that ran the same scripted model
+against the loop and the graph and asserted they emitted the same events.
+
+That branch is the record of a mistake worth being able to point at. The work was briefed
+as porting the agent to LangGraph, and what got built was two engines behind one seam,
+which is a comparison nobody asked for. It was thrown away and restarted from `main`.
+Deleting it is defensible, because a reference branch nobody reads is a branch that rots
+and then misleads, and this file already holds the account. It is written down
+here because the branch can no longer be opened: GitHub restores a deleted branch for a
+while and the local reflog holds the commit for about ninety days, and after that the only
+surviving description is this paragraph.
