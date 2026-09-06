@@ -70,8 +70,8 @@ nothing yet decides what that behaviour means.
     charged only for successes could be walked past by a loop that never succeeds.
 19. Every event an engine yields is one of a closed set, and every string it carries has
     its authors declared. An engine cannot invent a kind, and no record reaches a reader
-    without saying whether we wrote it. A test reads both engine modules and fails if the
-    union of what they emit is not exactly the table.
+    without saying whether we wrote it. A test reads every module that emits and fails if
+    the union of what they emit is not exactly the table.
 20. A run that cannot reach the model ends with `ok` false and never falls back to a
     Dockerfile we wrote. It is not a finding about the script, and a verdict no judgment
     went into must not be reported as a success.

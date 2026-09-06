@@ -1,8 +1,8 @@
 # envforge-agent
 
 Takes a script you do not trust, has an LLM write a Dockerfile for it, builds and runs it
-in a hardened container, repairs the Dockerfile when the run fails, and reports what the
-script tried to do while it ran. Python and Bash, one script at a time, plus the few
+in a hardened container, repairs the Dockerfile when the run fails, and reports the exit
+code and the bounded output of that run. Python and Bash, one script at a time, plus the few
 sibling files that language declares, such as a `requirements.txt` found beside it. A
 language it does not handle is refused before the model is consulted.
 

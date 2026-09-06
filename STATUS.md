@@ -9,7 +9,7 @@ decision log. This file is the record of how those got that way, including the p
 were wrong first. Nothing here is tidied after the fact: where a fix was the wrong shape,
 the wrong shape is still described, because that is the part worth reading.
 
-Updated 2026-09-02.
+Updated 2026-09-06.
 
 ## Where this is
 Built and tested: the sandbox that holds the untrusted script, the model layer, the
@@ -1798,3 +1798,42 @@ and response JSON that ADR-013 had already retired.
 Invariant 27 also credited its own argument to invariant 23, which does not make it. The
 argument lives in `route_model`'s comment, which is exactly why it was applied to one
 channel and not the other.
+
+## Merged, and the five sentences that were still over-claiming, 2026-09-06
+Squash-merged as `93455e2`. `main` is the graph now: there is no second engine, no
+`--engine` flag, and no hand-written provider path anywhere in the tree.
+
+The claim that had gone stale was outside the repository, in the one place the
+retire-a-claim rule does not reach by grepping: the GitHub description said the agent
+"reports what the script actually did". That is the verdict's promise, and the verdict is
+not built. It now says it reports the exit code and the bounded output.
+
+The first draft of this entry then said the records inside the repository needed nothing,
+because they had been rewritten with the branch. The cold review checked instead of
+believing it and found `CLAUDE.md` still saying every container is "named and
+force-removed in a `finally`". That commit is the one that stopped removing them: a
+container is now killed and kept, because it is the only evidence an attempt already ran.
+So the merge falsified a sentence and left it standing, which is the precise failure the
+rule exists for, in the same pull request whose log entry claimed it had not happened.
+
+Three more went with it, all the same promise the description was corrected for.
+`CLAUDE.md` and `README.md` both said the tool reports what the script tried to do, and
+`CLAUDE.md` stated the verdict as something produced today while `ARCHITECTURE.md` said it
+is not built. Invariant 19 also said a test reads "both engine modules", written in the
+commit that left one engine.
+
+Worth naming, because the gap is structural rather than careless. A record is only
+checkable where a test or a grep can reach it, and repository metadata is neither: it is
+not in the tree, so `test_records.py` cannot see it and no rewrite of the records touches
+it. It is also the copy most people read first, and the only one they read without cloning.
+
+No test covers it now either. Checking it would mean a network call to GitHub from a suite
+that deliberately needs no key and no daemon, so this stays a thing to remember at the
+moment the README's claims change, which is the weakest kind of guard this project has.
+
+`openai` and `groq` were added as topics, which listed `anthropic` alone. All three
+providers have been in `llm.py` since 23 August; 30 August is only when a command line
+existed to choose between them.
+
+`langgraph-port`, the two-engine branch, stays as a read-only reference. `langgraph` and
+its worktree are redundant now and are kept until they are deliberately removed.
